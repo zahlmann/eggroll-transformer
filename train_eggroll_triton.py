@@ -23,7 +23,7 @@ N_HEADS = 2
 N_LAYERS = 1
 CONTEXT_LEN = 128
 BATCH_SIZE = 128
-EPOCHS = 20
+EPOCHS = 30
 SEED = 42
 
 # === EGGROLL hyperparameters ===
