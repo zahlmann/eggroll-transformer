@@ -207,21 +207,22 @@ Columns: `commit\tloss\tperplexity\ttraining_time_s\tpeak_memory_mb\tstatus\tdes
 
 ### What the numbers actually show
 
-**Fair comparison (matched compute):**
+**Fair comparison (10 epochs, no warmup, both tuned):**
 
 | Method | val_loss | ppl | Time | Notes |
 |--------|----------|-----|------|-------|
-| Backprop (cosine LR, 200ep) | **2.59** | **13.3** | **12.4s** | properly tuned |
-| Backprop (vanilla, 10ep) | 3.59 | 36.1 | 6.1s | under-tuned baseline |
+| Backprop (LR=2e-2 decay=0.80) | **2.70** | **14.9** | **1.3s** | best 10ep backprop |
+| Backprop (LR=1e-2 decay=0.80) | 2.84 | 17.2 | 1.3s | |
+| Backprop (vanilla LR=3e-4) | 3.59 | 36.1 | 6.1s | under-tuned baseline |
 | EGGROLL bf16 pop=2048 | 2.83 | 17.0 | 270s | best EGGROLL quality |
 | EGGROLL bf16 pop=512 | 2.95 | 19.0 | 79s | best speed/quality |
 
-Backprop reaches EGGROLL's quality (val_loss ~2.95) at epoch 20 in ~3 seconds.
+Tuned backprop beats EGGROLL on both quality AND speed. 208x faster, 0.13 lower loss.
 
 ### Where the initial comparison was misleading
-1. **Under-tuned backprop baseline**: vanilla SGD with LR=3e-4 and no scheduling. With cosine LR, backprop is both faster AND better quality than EGGROLL.
-2. **"Same epochs" is misleading**: EGGROLL does 2048 forward passes per batch (10 epochs × 2048 = 20,480 forward-pass-equivalents), while backprop does 1 forward + 1 backward (10 epoch-equivalents). Comparing by epochs instead of compute heavily favors EGGROLL.
-3. **Label smoothing + temperature help EGGROLL but hurt backprop** (3.59 → 3.87). Using them only for EGGROLL inflates its apparent advantage.
+1. **Severely under-tuned backprop baseline**: LR=3e-4 when optimal is LR=2e-2. This single mistake made EGGROLL appear to beat backprop. With proper LR tuning (same exponential decay schedule EGGROLL uses), backprop wins on both axes.
+2. **"Same epochs" masks a 2048x compute gap**: EGGROLL does 2048 forward passes per batch. This is not "cheating" but means each EGGROLL epoch costs 2048x the compute.
+3. **Label smoothing + temperature help EGGROLL but hurt backprop** (3.59 → 3.87). Legitimate for ES, but makes the comparison misleading if you don't also tune backprop.
 
 ### Genuine contributions
 - First demonstration (to our knowledge) that EGGROLL can train a transformer
