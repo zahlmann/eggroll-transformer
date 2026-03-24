@@ -27,17 +27,17 @@ EPOCHS = 10
 SEED = 42
 
 # === EGGROLL hyperparameters ===
-HALF_POP = 1024
+HALF_POP = 4096
 SIGMA_START = 0.04
 SIGMA_DECAY = 0.998
-LR_START = 0.012
-LR_DECAY = 0.92
+LR_START = 0.020
+LR_DECAY = 0.95
 ALPHA = 0.50
 TEMPERATURE = 2.0
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.5
-N_ACCUM = 2
+N_ACCUM = 1
 
 
 def winsorized_zscore(fitness_diffs):
@@ -90,10 +90,13 @@ def train():
         def one_es_round(carry, _):
             key_r = carry
             key_r, vec_key = jax.random.split(key_r)
-            # QR orthogonalization
-            raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
-            Q, _ = jnp.linalg.qr(raw)
-            vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
+            # Orthogonal vectors via QR when possible, else Gaussian
+            if HALF_POP <= total_vec_dim:
+                raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
+                Q, _ = jnp.linalg.qr(raw)
+                vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
+            else:
+                vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
             # Fused Triton kernel: all perturbations + both signs in one launch
             ce_pos, ce_neg = fused_transformer_ce_both(
