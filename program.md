@@ -10,12 +10,12 @@ run experiments, log results, and keep going without stopping to ask for permiss
 ## Current State (2026-03-24)
 
 **Phase 1 (working): DONE.** EGGROLL trains a transformer from scratch.
-**Phase 2 (quality): val_loss=2.63 vs backprop 2.45.** Gap=0.18. Improved from 0.22.
-**Phase 3 (speed): 119s (10ep) / 433s (20ep) vs 1.3s.** 4.5x speedup via Triton kernel.
+**Phase 2 (quality): val_loss=2.55 vs backprop 2.45 (10ep).** Gap=0.10. Improved from 0.22.
+**Phase 3 (speed): 119s (10ep) vs 1.3s.** 4.5x speedup via Triton kernel (was 540s).
 
-Best EGGROLL config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020,
-LR_DECAY=0.95, momentum=0.5, alpha=0.50, bf16, Gaussian vectors (no QR since pop>vec_dim),
-N_ACCUM=1, 20 epochs. Uses fused Triton kernel for the full forward pass + CE loss.
+Best EGGROLL config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.010,
+LR_DECAY=0.95, momentum=0.7, alpha=0.50, bf16, Gaussian vectors (no QR since pop>vec_dim),
+N_ACCUM=1, 50 epochs. Uses fused Triton kernel for the full forward pass + CE loss.
 
 ---
 
@@ -76,7 +76,9 @@ was 1000x below optimal.**
 | triton, pop=2048, LR=0.012, decay=0.92, 10ep | 2.67 | 14.50 | 119s | kernel validated, matches JAX |
 | triton, pop=8192, LR=0.012, decay=0.92, 10ep | 2.67 | 14.43 | 219s | higher pop, Gaussian vecs |
 | triton, pop=8192, LR=0.020, decay=0.95, 10ep | **2.64** | **14.04** | 220s | higher LR + slower decay |
-| triton, pop=8192, LR=0.020, decay=0.95, **20ep** | **2.63** | **13.84** | **433s** | **best EGGROLL** |
+| triton, pop=8192, LR=0.020, decay=0.95, 20ep | 2.63 | 13.84 | 433s | more epochs helps |
+| triton, pop=8192, **mom=0.7**, LR=0.010, decay=0.95, 30ep | 2.57 | 13.10 | 647s | higher momentum + lower LR |
+| triton, pop=8192, mom=0.7, LR=0.010, decay=0.95, **50ep** | **2.55** | **12.79** | **1078s** | **best EGGROLL** |
 
 ### Speed vs quality tradeoff (bf16, alpha=0.20, no momentum, no accum)
 
@@ -175,7 +177,14 @@ Profiling showed forward passes are 99% of training time. The kernel eliminates 
 intermediate HBM writes (~100MB per forward pass × 4096 passes per round = ~400GB
 bandwidth savings per round). Validated against JAX: max relative error 0.01%.
 
-### 11. More epochs (20 instead of 10) — additional −0.04 loss
+### 12. Higher momentum (0.7) with reduced LR — −0.04 loss, eliminates oscillation
+With the Triton kernel enabling pop=8192 (cleaner gradients), momentum=0.7 works where
+momentum=0.9 previously failed at pop=4096. The key: reduce base LR from 0.020 to 0.010
+to compensate for the higher effective LR from momentum. Effective LR = LR/(1-beta),
+so beta=0.7 gives 3.3x effective LR vs beta=0.5 giving 2x. Result: monotonically
+decreasing val_loss with zero oscillation from epoch 1 to 50.
+
+### 11. More epochs (20→50 instead of 10) — additional −0.08 loss
 With the kernel speedup, 20 epochs costs 433s (same time budget as old 10-epoch run).
 The model is still improving monotonically at epoch 20, suggesting even more epochs
 would help if time permits.
@@ -228,6 +237,11 @@ simultaneous transformer forward passes due to memory bandwidth saturation.
 ### 8. Temperature T=3.0
 Too smooth — the gradient signal becomes too weak. val_loss=3.14 vs 2.70 with T=2.0.
 The fitness landscape becomes nearly flat and ES can't estimate useful gradients.
+
+### 11. Cosine LR schedule (vs exponential decay)
+Cosine gives nearly identical final results to exponential decay (2.608 vs 2.607).
+Higher peak LR with cosine (0.035) is worse (2.664) because the high initial LR
+causes oscillation. Exponential decay with LR_DECAY=0.95 is the best schedule.
 
 ### 10. Adam-like adaptive LR (second moment scaling)
 Maintaining per-parameter running variance of ES gradients and dividing updates by
