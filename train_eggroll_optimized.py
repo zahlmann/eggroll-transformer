@@ -28,16 +28,17 @@ EPOCHS = 10
 SEED = 42
 
 # === EGGROLL hyperparameters ===
-HALF_POP = 256
+HALF_POP = 1024
 POP_CHUNK = 16
 SIGMA_START = 0.04
 SIGMA_DECAY = 0.998
-LR_START = 0.020
-LR_DECAY = 0.85
+LR_START = 0.012
+LR_DECAY = 0.92
 ALPHA = 0.20
 TEMPERATURE = 2.0
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
+MOMENTUM = 0.5
 
 
 def build_param_spec(params):
@@ -165,8 +166,8 @@ def train():
         else: lr_scale_arr.append(0.7)
     lr_scale_arr = jnp.array(lr_scale_arr)
 
-    def train_one_batch(params, key, x, y, sigma, lr):
-        """One batch: fitness evaluation + gradient + update."""
+    def train_one_batch(params, momentum_buf, key, x, y, sigma, lr):
+        """One batch: fitness evaluation + gradient + momentum update."""
         def fitness_chunk(carry, chunk_vecs):
             def fitness_pair(vec):
                 pos = forward_fn(carry, vec, sigma, x, y, ALPHA)
@@ -187,6 +188,7 @@ def train():
         scale = 1.0 / (2.0 * sigma * HALF_POP)
 
         new_params = {}
+        new_momentum = {}
         for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
             v = vecs[:, offset:offset + vec_dim]
             lr_s = lr_scale_arr[idx]
@@ -195,24 +197,15 @@ def train():
                 grad = scale * (v[:, :m] * shaped[:, None]).T @ v[:, m:]
             else:
                 grad = scale * (v * shaped[:, None]).sum(axis=0)
-            new_params[pkey] = params[pkey] - lr * lr_s * grad
+            # momentum SGD: v = beta * v + grad; params -= lr * v
+            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + grad
+            new_params[pkey] = params[pkey] - lr * lr_s * new_momentum[pkey]
 
-        return new_params, key, jnp.mean(fitness_pos)
+        return new_params, new_momentum, key, jnp.mean(fitness_pos)
 
     @jax.jit
-    def train_epoch(params, key, shuffled_x, shuffled_y, sigma, lr):
-        """One full epoch via nested lax.scan (no Python dispatch per batch)."""
-        bx = shuffled_x[:n_batches * BATCH_SIZE].reshape(n_batches, BATCH_SIZE, CONTEXT_LEN)
-        by = shuffled_y[:n_batches * BATCH_SIZE].reshape(n_batches, BATCH_SIZE, CONTEXT_LEN)
-
-        def batch_step(carry, batch_data):
-            params, key = carry
-            x, y = batch_data
-            params, key, ploss = train_one_batch(params, key, x, y, sigma, lr)
-            return (params, key), ploss
-
-        (params, key), losses = lax.scan(batch_step, (params, key), (bx, by))
-        return params, key, jnp.mean(losses)
+    def train_batch(params, momentum_buf, key, x, y, sigma, lr):
+        return train_one_batch(params, momentum_buf, key, x, y, sigma, lr)
 
     @jax.jit
     def eval_loss(params, x, y):
@@ -220,12 +213,13 @@ def train():
         logits = transformer_forward_batch(params, config, x)
         return cross_entropy_loss(logits, y)
 
-    # warmup (compiles the nested scan for one full epoch)
+    # init momentum buffer
+    momentum_buf = jax.tree.map(jnp.zeros_like, params)
+
+    # warmup
     print("Warming up JIT...")
     t0 = time.perf_counter()
-    key, sk = jax.random.split(key)
-    perm = jax.random.permutation(sk, len(data["train_x"]))
-    _, _, wl = train_epoch(params, key, train_x[perm], train_y[perm], SIGMA_START, LR_START)
+    _, _, _, wl = train_batch(params, momentum_buf, key, train_x[:BATCH_SIZE], train_y[:BATCH_SIZE], SIGMA_START, LR_START)
     wl.block_until_ready()
     jit_time = time.perf_counter() - t0
     print(f"JIT warmup: {jit_time:.2f}s")
@@ -240,8 +234,13 @@ def train():
         sigma, lr = sigmas[epoch], lrs_sched[epoch]
         key, sk = jax.random.split(key)
         perm = jax.random.permutation(sk, len(data["train_x"]))
-        params, key, eloss = train_epoch(params, key, train_x[perm], train_y[perm], sigma, lr)
-        eloss = float(eloss)
+        sx, sy = train_x[perm], train_y[perm]
+        eloss = 0.0
+        for bi in range(n_batches):
+            s = bi * BATCH_SIZE
+            params, momentum_buf, key, pl = train_batch(params, momentum_buf, key, sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
+            eloss += float(pl)
+        eloss /= n_batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={eloss:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
