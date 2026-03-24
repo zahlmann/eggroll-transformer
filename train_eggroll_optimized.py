@@ -166,7 +166,7 @@ def train():
         else: lr_scale_arr.append(0.7)
     lr_scale_arr = jnp.array(lr_scale_arr)
 
-    N_ACCUM = 2  # gradient accumulation rounds
+    N_ACCUM = 2  # gradient accumulation rounds (effective pop = HALF_POP * N_ACCUM * 2)
 
     def train_one_batch(params, momentum_buf, key, x, y, sigma, lr):
         """One batch: N_ACCUM rounds of ES gradient -> average -> momentum update."""
@@ -181,7 +181,11 @@ def train():
         def one_es_round(carry, _):
             key_r = carry
             key_r, vec_key = jax.random.split(key_r)
-            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+            raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
+            # QR orthogonalization: gives HALF_POP orthogonal vectors in R^total_vec_dim
+            # Since HALF_POP < total_vec_dim, Q.T gives perfectly orthogonal rows
+            Q, _ = jnp.linalg.qr(raw)
+            vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))  # rescale to match Gaussian norm
             vc = vecs.reshape(n_chunks, POP_CHUNK, -1)
             _, (fp, fn) = lax.scan(fitness_chunk, params, vc)
             fp, fn = fp.reshape(-1), fn.reshape(-1)
