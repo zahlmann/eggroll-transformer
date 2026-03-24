@@ -10,12 +10,12 @@ run experiments, log results, and keep going without stopping to ask for permiss
 ## Current State (2026-03-24)
 
 **Phase 1 (working): DONE.** EGGROLL trains a transformer from scratch.
-**Phase 2 (quality): val_loss=2.55 vs backprop 2.45 (10ep).** Gap=0.10. Improved from 0.22.
+**Phase 2 (quality): val_loss=2.51 vs backprop 2.45 (10ep).** Gap=0.06. Down from 0.22.
 **Phase 3 (speed): 119s (10ep) vs 1.3s.** 4.5x speedup via Triton kernel (was 540s).
 
-Best EGGROLL config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.010,
-LR_DECAY=0.95, momentum=0.7, alpha=0.50, bf16, Gaussian vectors (no QR since pop>vec_dim),
-N_ACCUM=1, 50 epochs. Uses fused Triton kernel for the full forward pass + CE loss.
+Best EGGROLL config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.012,
+LR_DECAY=0.97, momentum=0.7, alpha=0.50, bf16, Gaussian vectors (no QR since pop>vec_dim),
+N_ACCUM=1, 100 epochs. Uses fused Triton kernel for the full forward pass + CE loss.
 
 ---
 
@@ -78,7 +78,8 @@ was 1000x below optimal.**
 | triton, pop=8192, LR=0.020, decay=0.95, 10ep | **2.64** | **14.04** | 220s | higher LR + slower decay |
 | triton, pop=8192, LR=0.020, decay=0.95, 20ep | 2.63 | 13.84 | 433s | more epochs helps |
 | triton, pop=8192, **mom=0.7**, LR=0.010, decay=0.95, 30ep | 2.57 | 13.10 | 647s | higher momentum + lower LR |
-| triton, pop=8192, mom=0.7, LR=0.010, decay=0.95, **50ep** | **2.55** | **12.79** | **1078s** | **best EGGROLL** |
+| triton, pop=8192, mom=0.7, LR=0.010, decay=0.95, 50ep | 2.55 | 12.79 | 1078s | still improving |
+| triton, pop=8192, mom=0.7, LR=0.012, decay=0.97, **100ep** | **2.51** | **12.30** | **2149s** | **best EGGROLL** |
 
 ### Speed vs quality tradeoff (bf16, alpha=0.20, no momentum, no accum)
 
