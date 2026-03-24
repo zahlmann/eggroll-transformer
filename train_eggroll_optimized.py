@@ -166,8 +166,10 @@ def train():
         else: lr_scale_arr.append(0.7)
     lr_scale_arr = jnp.array(lr_scale_arr)
 
+    N_ACCUM = 2  # gradient accumulation rounds
+
     def train_one_batch(params, momentum_buf, key, x, y, sigma, lr):
-        """One batch: fitness evaluation + gradient + momentum update."""
+        """One batch: N_ACCUM rounds of ES gradient -> average -> momentum update."""
         def fitness_chunk(carry, chunk_vecs):
             def fitness_pair(vec):
                 pos = forward_fn(carry, vec, sigma, x, y, ALPHA)
@@ -176,32 +178,38 @@ def train():
             fp, fn = jax.vmap(fitness_pair)(chunk_vecs)
             return carry, (fp, fn)
 
-        key, vec_key = jax.random.split(key)
-        vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
-        vecs_chunked = vecs.reshape(n_chunks, POP_CHUNK, -1)
-        _, (fitness_pos, fitness_neg) = lax.scan(fitness_chunk, params, vecs_chunked)
-        fitness_pos = fitness_pos.reshape(-1)
-        fitness_neg = fitness_neg.reshape(-1)
+        def one_es_round(carry, _):
+            key_r = carry
+            key_r, vec_key = jax.random.split(key_r)
+            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+            vc = vecs.reshape(n_chunks, POP_CHUNK, -1)
+            _, (fp, fn) = lax.scan(fitness_chunk, params, vc)
+            fp, fn = fp.reshape(-1), fn.reshape(-1)
+            diffs = fp - fn
+            shaped = winsorized_zscore(diffs)
+            scale = 1.0 / (2.0 * sigma * HALF_POP)
+            round_grads = {}
+            for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
+                v = vecs[:, offset:offset + vec_dim]
+                if is_2d:
+                    m, n = shape
+                    round_grads[pkey] = scale * (v[:, :m] * shaped[:, None]).T @ v[:, m:]
+                else:
+                    round_grads[pkey] = scale * (v * shaped[:, None]).sum(axis=0)
+            return key_r, (round_grads, jnp.mean(fp))
 
-        fitness_diffs = fitness_pos - fitness_neg
-        shaped = winsorized_zscore(fitness_diffs)
-        scale = 1.0 / (2.0 * sigma * HALF_POP)
+        key, (all_grads, all_losses) = lax.scan(one_es_round, key, None, length=N_ACCUM)
 
+        # average gradients across accumulation rounds
         new_params = {}
         new_momentum = {}
         for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
-            v = vecs[:, offset:offset + vec_dim]
+            avg_grad = jnp.mean(all_grads[pkey], axis=0)
             lr_s = lr_scale_arr[idx]
-            if is_2d:
-                m, n = shape
-                grad = scale * (v[:, :m] * shaped[:, None]).T @ v[:, m:]
-            else:
-                grad = scale * (v * shaped[:, None]).sum(axis=0)
-            # momentum SGD: v = beta * v + grad; params -= lr * v
-            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + grad
+            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + avg_grad
             new_params[pkey] = params[pkey] - lr * lr_s * new_momentum[pkey]
 
-        return new_params, new_momentum, key, jnp.mean(fitness_pos)
+        return new_params, new_momentum, key, jnp.mean(all_losses)
 
     @jax.jit
     def train_batch(params, momentum_buf, key, x, y, sigma, lr):
