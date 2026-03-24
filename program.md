@@ -193,3 +193,38 @@ Never stop to ask if you should continue. The cost of a failed run is seconds.
 Tab-separated, one row per run, NOT committed to git.
 
 Columns: `commit\tloss\tperplexity\ttraining_time_s\tpeak_memory_mb\tstatus\tdescription`
+
+---
+
+## Results & Honest Assessment (2026-03-24)
+
+### What worked
+- EGGROLL **can** train a decoder-only transformer from scratch (Phase 1 complete)
+- Constant label smoothing (alpha=0.15-0.20, NO decay) is critical for transformer ES — unlike MNIST where adaptive decay was best. Transformers overfit with ES's noisy gradients if regularization is removed.
+- bf16 forward passes act as implicit regularization for ES (noise helps noisy gradients). Does NOT help backprop.
+- Per-layer LR scaling (3x for small params, 0.7x for large FFN layers)
+- Rank-1 perturbation gives 28.8x compression (2306 random values vs 66K params)
+
+### What the numbers actually show
+
+**Fair comparison (matched compute):**
+
+| Method | val_loss | ppl | Time | Notes |
+|--------|----------|-----|------|-------|
+| Backprop (cosine LR, 200ep) | **2.59** | **13.3** | **12.4s** | properly tuned |
+| Backprop (vanilla, 10ep) | 3.59 | 36.1 | 6.1s | under-tuned baseline |
+| EGGROLL bf16 pop=2048 | 2.83 | 17.0 | 270s | best EGGROLL quality |
+| EGGROLL bf16 pop=512 | 2.95 | 19.0 | 79s | best speed/quality |
+
+Backprop reaches EGGROLL's quality (val_loss ~2.95) at epoch 20 in ~3 seconds.
+
+### Where the initial comparison was misleading
+1. **Under-tuned backprop baseline**: vanilla SGD with LR=3e-4 and no scheduling. With cosine LR, backprop is both faster AND better quality than EGGROLL.
+2. **"Same epochs" is misleading**: EGGROLL does 2048 forward passes per batch (10 epochs × 2048 = 20,480 forward-pass-equivalents), while backprop does 1 forward + 1 backward (10 epoch-equivalents). Comparing by epochs instead of compute heavily favors EGGROLL.
+3. **Label smoothing + temperature help EGGROLL but hurt backprop** (3.59 → 3.87). Using them only for EGGROLL inflates its apparent advantage.
+
+### Genuine contributions
+- First demonstration (to our knowledge) that EGGROLL can train a transformer
+- bf16 as ES regularization is a novel, generalizable finding
+- Constant alpha (no decay) for transformer ES is a novel finding that differs from MNIST
+- The rank-1 perturbation approach scales to attention + FFN architectures
