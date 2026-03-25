@@ -107,6 +107,36 @@ that degrades quality beyond this threshold is rejected.
 - **Per-batch float() sync removal**: No speed gain (XLA handles pipelining through data deps).
 - **VOCAB_PAD reduction** (128→80): Triton requires power-of-2 arange sizes. Can't reduce.
 
+## What Did NOT Work (Speed Session 2026-03-25 part 2)
+
+- **Triton FlashAttention via tl.gather** (308ms vs 285ms baseline, SLOWER): Triton 3.6
+  supports tl.ravel + tl.gather + tl.reshape to extract KV tile rows from register-resident
+  tensors. BLOCK_KV=64 gave 278ms isolated kernel benchmark but 181s full training (worse
+  than 176s baseline). The gather operation compiles to cross-thread register shuffles that
+  add more overhead than the register pressure reduction saves.
+- **Tiled output projection** (287ms vs 285ms, no improvement): Tiling the (128,128) logits
+  matrix with online log-sum-exp for CE loss. Loop overhead negates register savings.
+- **FFN pipelining** (tl.range num_stages=2): 545ms, much slower. Dynamic loop with
+  pipelining doesn't work for the FFN body structure.
+- **HALF_POP=3072 HP search** (val_loss 2.56 3-seed avg, FAIL): Searched sigma
+  [0.012-0.025], lr [0.008-0.015], alpha [0.4-0.6], sigma_decay [0.995-1.0], LR schedules
+  (cosine, warmup+cosine). Best single-seed was 2.4946 (sigma=0.018) but 3-seed avg is
+  2.5638. Population reduction not viable without algorithmic changes.
+- **CUDA kernel (scalar FP32)** (3860ms vs 271ms Triton, 14x SLOWER): Full CUDA kernel
+  with FlashAttention via shared memory. Correctness validated (max diff 0.0004). But
+  without WMMA tensor cores, scalar FP32 can't compete with Triton's bf16 tensor cores.
+
+## What IS Ready (for next session)
+
+- **CUDA kernel infrastructure**: Full kernel in `kernels/cuda/fused_transformer_ce.cu`
+  (664 lines), JAX XLA custom_call binding in `kernels/cuda/wrapper.py`. Builds, runs,
+  produces correct output. Only missing WMMA tensor cores for the big matmuls.
+  - Build: `make -C kernels/cuda/`
+  - Test: `uv run python -c "..."` (see test_kernel.py)
+  - Uses: PyCapsule for custom_call registration, scalars packed in opaque struct
+  - Key fix: scalars (sigma, alpha, temperature) must be in opaque struct, NOT as
+    separate GPU buffer operands (XLA 0.9.2 can't handle scalar GPU buffers)
+
 ---
 
 ## What to Try Next (SPEED — reduce the 43x gap)
@@ -115,18 +145,39 @@ that degrades quality beyond this threshold is rejected.
 (register pressure from the 128×128 attention matrix). Focus on reducing register
 pressure or changing the computation structure.
 
-### HIGH PRIORITY: CUDA C++ kernel with FlashAttention tiling
+### HIGH PRIORITY: Add WMMA tensor cores to the CUDA kernel
 
-**The CUDA C++ scaffolding is ready.** A skeleton kernel, Makefile, Python wrapper,
-and test script are in `kernels/cuda/`. The Triton kernel cannot do FlashAttention
-because Triton lacks shared memory control and can't slice register-resident 2D
-tensors. CUDA C++ solves both problems.
+**The CUDA kernel is COMPLETE and CORRECT but needs tensor cores for speed.**
+The scalar FP32 kernel (3860ms) is 14x slower than Triton (271ms). The JAX binding
+works. The only missing piece is WMMA for the big matmuls.
 
-**How to implement the CUDA kernel:**
+**Current state:** `kernels/cuda/fused_transformer_ce.cu` (664 lines) has the full
+forward pass with FlashAttention tiling via shared memory. Validated against Triton
+(max diff 0.0004). Build: `make -C kernels/cuda/`. JAX binding in `wrapper.py` uses
+stablehlo.custom_call with PyCapsule + scalars in opaque struct.
 
-1. **Start without FlashAttention** — port the Triton kernel logic to CUDA C++ line
-   by line. Use `kernels/fused_transformer_ce.py` as reference. Get the test passing
-   (`uv run kernels/cuda/test_kernel.py` compares CUDA vs Triton output).
+**How to add WMMA:**
+
+1. **Identify the hot matmuls** — These account for ~80% of compute:
+   - QKV projection: h_norm @ W = (128,64) × (64,32) per head, 6 total
+   - FFN up: h_norm2 @ W_up = (128,64) × (64,32) per tile, 8 tiles
+   - FFN down: act @ W_down = (128,32) × (32,64) per tile, 8 tiles
+   - Output proj: h_final @ W_out = (128,64) × (64,128)
+
+2. **WMMA tile: 16×16×16 bf16** — For (128,64) × (64,32):
+   - M_tiles=8, K_tiles=4, N_tiles=2 → 64 WMMA operations
+   - 4 warps handle 16 operations each
+   - Input must be in shared memory (h_norm bf16: 16KB, weight tile: 4KB)
+   - Output: WMMA fragment registers → store to shared memory → load per-thread
+
+3. **Shared memory budget** — 48KB target for 2 blocks/SM occupancy:
+   - h_norm bf16 (128×64×2=16KB) + weight tile (4KB) + K/V (32KB) = 52KB
+   - Tight but feasible. Process QKV sequentially, reuse h_norm space after.
+   - Or: use bf16 for K/V in shared memory (saves 16KB)
+
+4. **Keep FlashAttention scalar** — The attention score computation (Q @ K_tile^T)
+   and V accumulation (scores @ V_tile) are small (32×32 tiles) and can stay scalar.
+   The online softmax (max, exp, sum) must be scalar anyway.
 
 2. **Add FlashAttention** — replace the full (128, 128) attention score computation:
    - Compute K, V for the full sequence → store to shared memory (32KB per head)
