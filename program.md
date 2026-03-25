@@ -106,58 +106,63 @@ that degrades quality beyond this threshold is rejected.
 
 ## What to Try Next (SPEED — reduce the 43x gap)
 
-### Kernel optimizations (highest impact)
+**The kernel is at ~47% of bf16 tensor core peak.** The gap is due to low occupancy
+(register pressure from the 128×128 attention matrix). Focus on reducing register
+pressure or changing the computation structure.
 
-1. **FP8 tensor cores**: The matmuls in the kernel (Q/K/V projections, FFN, output proj)
-   currently use bf16. FP8 (float8e4nv) gives 2x throughput on Ada Lovelace tensor cores.
-   The MNIST kernel already uses FP8 for L2 and L3 matmuls — copy that pattern.
-   Expected: ~1.5-2x speedup on kernel compute time.
+### HIGH PRIORITY: FlashAttention-style attention tiling
 
-2. **Kernel autotuning**: Current kernel uses num_warps=8, num_stages=1. Try:
-   - num_warps=4 (less register pressure, more blocks per SM)
-   - num_stages=2 (software pipelining for memory loads)
-   - Different BLOCK_K for FFN tiling (32 vs 64 vs 128)
+1. **Tile attention over query positions**: Instead of computing full (128, 128) attention
+   scores, compute (BLOCK_Q, 128) tiles. Use online softmax for each query block.
+   Reduces attention tensor from 16K to ~4K elements = ~48 fewer registers/thread.
 
-3. **Batch tiling in kernel**: Currently one thread block per (perturbation, sequence).
-   Grid = (HALF_POP, BATCH, 2) = 2M+ blocks. Could process multiple sequences per block
-   to reduce grid overhead and improve data reuse of weight matrices.
+   **Challenge**: Q, K, V are computed on-the-fly from register-resident h_norm.
+   Tiling requires either: (a) storing h_norm to shared memory and loading tiles,
+   or (b) recomputing QKV per tile (wastes compute but reduces registers).
 
-4. **Fused gradient computation**: Currently the kernel outputs partial CE sums, then
-   Python/JAX computes the gradient (v^T @ shaped matmul). Could fuse the gradient
-   accumulation into the kernel or a second fused kernel.
+   The MNIST kernel doesn't have attention, so no reference implementation exists.
+   Study FlashAttention papers (Dao et al. 2022) for the online softmax algorithm.
 
-### Population reduction (directly reduces forward pass count)
+2. **Tile attention over key/value positions**: Alternative tiling axis. Process
+   (128, BLOCK_KV) attention blocks with online softmax. Requires K, V to be
+   available in tiles — need shared memory or recomputation.
 
-5. **Lower population with maintained quality**: The current pop=16384 is conservative.
-   Try pop=8192 or 4096 with the Adam+sigma=0.02 config — Adam might maintain quality
-   at lower pop. Each halving = 2x speedup on the kernel.
+### MEDIUM PRIORITY: Batch tiling (non-unrolled)
 
-6. **Adaptive population**: Start with high pop, reduce as training progresses and
-   the Adam v-buffer accumulates useful statistics.
+3. **Batch tiling with dynamic loop**: The `tl.static_range(2)` attempt caused Triton
+   compile timeout because the unrolled code was too large. Try instead:
+   - Use Triton's `tl.range()` (non-unrolled loop) if available
+   - Or write a C++/CUDA kernel wrapper that handles the batch loop
+   - Or use Pallas (JAX native Triton alternative) which may have cheaper JIT
 
-### Compilation and overhead reduction
+### LOWER PRIORITY
 
-7. **All-in-one JIT**: Wrap the entire epoch (all batches) in a lax.scan so XLA
-   compiles one mega-kernel. Previous attempt failed with the JAX vmap approach
-   (32s JIT, no speed gain), but with the Triton kernel it might be different.
+4. **Split kernel into attention + FFN**: Separate the fused kernel into two smaller
+   kernels. Trade HBM traffic for better occupancy. The intermediate (h after attention)
+   is 128×64×4 = 32KB per perturbation member. With 4096 members × 2 signs × 32KB =
+   256MB through HBM. At 700 GB/s, that's ~0.4ms per batch — potentially worth it
+   if the occupancy improvement is significant.
 
-8. **Skip QR decomposition**: QR orthogonalization costs ~6ms per batch. With pop=16384
-   > vec_dim=2306, we already use Gaussian vectors. Confirm QR is skipped.
+5. **Population reduction below 4096**: All attempts failed quality threshold (3-seed
+   avg ≤ 2.50). Best was HALF_POP=3072+sigma=0.015 at 2.506. Could revisit with:
+   - Different optimizer (e.g., AdaGrad, RMSProp)
+   - Gradient accumulation across batches
+   - Better fitness shaping (rank-based, top-k selection)
 
-9. **Overlap data shuffling with training**: Use a background thread to shuffle and
-   transfer data to GPU while training runs (like MNIST does).
+6. **All-in-one JIT via lax.scan**: Wrap all epochs and batches in a single JIT.
+   Python loop overhead is only ~6ms total (negligible). Main benefit would be if
+   XLA can optimize kernel scheduling or overlap operations.
 
-10. **Disable XLA Triton GEMM autotuner**: Already done via XLA_FLAGS. Verify it's
-    working — saves ~0.5s of JIT autotuning.
+### ALREADY ELIMINATED
 
-### Architecture-level speed tricks
-
-11. **Reduce context length for speed experiment**: Try context_len=64 to test if
-    kernel scales well (attention is O(seq²), so halving seq = 4x less attention work).
-    NOTE: this changes the locked constant, so only for profiling, not for final results.
-
-12. **Pre-compile the Triton kernel**: Use AOT compilation to avoid re-compiling the
-    kernel on each run. Saves JIT warmup time.
+These have been tried and don't work — don't repeat:
+- FP8 tensor cores (slower + quality loss)
+- num_warps=2 (much slower), num_warps=8 (baseline), num_warps=16 (slower)
+- BLOCK_K=64 (baseline), BLOCK_K=32 (current, marginal improvement)
+- VOCAB_PAD<128 (Triton requires power-of-2 arange)
+- CPU pre-shuffle (no speed gain)
+- Per-batch float() sync removal (no speed gain)
+- Adaptive HALF_POP (quality fails on seed 7)
 
 ---
 
@@ -167,7 +172,7 @@ that degrades quality beyond this threshold is rejected.
 - Constant label smoothing alpha=0.50
 - Adam optimizer (β1=0.9, β2=0.999, eps=1e-6) with bias correction
 - Sigma=0.02, LR=0.010, no LR decay
-- Fused Triton kernel (Grid: HALF_POP × BATCH × 2)
+- Fused Triton kernel (Grid: HALF_POP × BATCH × 2, num_warps=4, BLOCK_K=32)
 - Per-subgroup Winsorized z-score (K=8, clip ±2.0)
 - Rank-1 perturbation compression (vec_dim=2306, 28.8x compression)
 
