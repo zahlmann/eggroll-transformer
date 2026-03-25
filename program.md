@@ -27,11 +27,11 @@ only pursue them if a speed optimization opens a quality opportunity for free.**
 
 ## Current State (2026-03-25)
 
-**Quality:** EGGROLL val_loss=2.44 (3-seed avg ~2.48) vs backprop+Adam 1.84.
+**Quality:** EGGROLL val_loss=2.41 (3-seed avg ~2.48) vs backprop+Adam 1.84.
 Gap = 0.64 to backprop+Adam. Beats vanilla SGD backprop (2.44 vs 2.45).
 
-**Speed: 175s for 10 epochs (was 444s).** 2.5x speedup achieved.
-Backprop+Adam takes 4.1s. Speed gap is 43x (was 108x).
+**Speed: 156s for 10 epochs (was 175s, was 444s).** 2.85x total speedup achieved.
+Backprop+Adam takes 4.1s. Speed gap is 38x (was 43x, was 108x).
 
 **Memory: 70MB (was 113MB).** Lower due to reduced population.
 
@@ -40,10 +40,10 @@ Backprop+Adam takes 4.1s. Speed gap is 43x (was 108x).
 ## Speed Budget Breakdown
 
 Profiling shows 99% of time is in forward passes (the Triton kernel).
-Current: 175s for 10 epochs = 17.5s/epoch. Each epoch has 61 batches.
-Per batch: ~287ms. Per batch, kernel processes 8192 perturbation members (4096 pairs × 2 signs).
+Current: 156s for 10 epochs = 15.6s/epoch. Each epoch has 61 batches.
+Per batch: ~243ms. Per batch, kernel processes 8192 perturbation members (4096 pairs × 2 signs).
 
-The Triton kernel runs in ~285ms per call (HALF_POP=4096, num_warps=4).
+The Triton kernel runs in ~243ms per call (HALF_POP=4096, num_warps=4, FFN dynamic loop).
 Gradient computation + Adam update: ~0.2ms (negligible after JIT).
 QR decomposition: skipped (HALF_POP=4096 > vec_dim=2306, uses Gaussian).
 
@@ -102,6 +102,12 @@ that degrades quality beyond this threshold is rejected.
 3. **BLOCK_K 64→32** (180s→176s, 2%): Smaller FFN tiles = less register pressure per
    iteration. Marginal improvement.
 
+4. **FFN dynamic loop tl.range** (175s→156s, 10.6%): Changed FFN K-tiling loop from
+   `tl.static_range` to `tl.range`. Prevents compiler from unrolling 8 iterations,
+   reducing register pressure from 255 regs + 340 bytes spill to 255 regs + 0 spill.
+   Quality maintained (3-seed avg 2.48). Head loop dynamic range helps speed marginally
+   (→153s) but fails 3-seed quality threshold by 0.004-0.008.
+
 ## What Did NOT Work (Speed Session 2026-03-25)
 
 - **FP8 tensor cores** (260s, slower): Register pressure from casts outweighs tensor
@@ -135,6 +141,29 @@ that degrades quality beyond this threshold is rejected.
   with FlashAttention via shared memory. Correctness validated (max diff 0.0004). But
   without WMMA tensor cores, scalar FP32 can't compete with Triton's bf16 tensor cores.
 
+## What Did NOT Work (Speed Session 2026-03-25 part 3)
+
+- **fp16/bf16 output projection accumulator** (175.8s, no improvement): out_dtype in tl.dot
+  doesn't meaningfully reduce register pressure since the result is immediately cast to f32.
+  bf16 not supported as out_dtype; fp16 works but no speed gain.
+- **Dynamic head loop tl.range** (153s but 3-seed avg 2.504-2.508, QUALITY FAIL by 0.004-0.008):
+  Marginal speed gain but just barely fails quality. HP tuning (sigma=0.022/0.025, lr=0.012)
+  could not compensate.
+- **HALF_POP=3072 with adaptive alpha schedule** (133-134s, val_loss 2.69-2.84, FAIL):
+  MNIST-inspired adaptive alpha (decay 0.5/epoch and 0.9/epoch) doesn't transfer to transformer.
+  At HALF_POP=3072, quality fails regardless of alpha schedule or HP combination.
+- **num_warps=8 with FFN dynamic loop** (197.1s, much slower): Lower per-thread register
+  count from more threads doesn't help — thread overhead dominates.
+- **BLOCK_K=16 with FFN dynamic loop** (171.9s, slower than BK=32 at 156s): Smaller tiles
+  reduce tensor core efficiency and increase loop iterations.
+- **BLOCK_K=64 with FFN dynamic loop** (168.7s, slower): Larger tiles increase per-iteration
+  register pressure despite fewer iterations.
+- **maxnreg=248/232** (256.1ms/252.6ms vs baseline 243ms, SLOWER): Properly monkey-patched
+  jax_triton to pass maxnreg to Triton compiler. Compiles and runs but spill overhead
+  outweighs any occupancy benefit. Kernel is too compute-bound for spill-induced occupancy.
+- **Fewer batches per epoch** (48 batches: 123s but 2.56 val_loss; 56 batches: 144s but 2.51):
+  Reducing gradient updates degrades quality faster than it saves time.
+
 ## What IS Ready (for next session)
 
 - **CUDA kernel infrastructure**: Full kernel in `kernels/cuda/fused_transformer_ce.cu`
@@ -148,37 +177,50 @@ that degrades quality beyond this threshold is rejected.
 
 ---
 
-## What to Try Next (SPEED — reduce the 43x gap)
+## What to Try Next (SPEED — reduce the 38x gap)
 
-**The kernel is at ~47% of bf16 tensor core peak.** The gap is due to low occupancy
-(register pressure from the 128×128 attention matrix). Focus on reducing register
-pressure or changing the computation structure.
+**The kernel is at ~47% of bf16 tensor core peak.** 255 regs/thread, 0 spills, 1 block/SM.
+Forced spilling (maxnreg) makes things worse — the kernel is too compute-bound.
+The only path to 2 blocks/SM is reducing ACTUAL register usage, not capping it.
 
-## What to Try Next — CUDA Kernel Optimization (for next agent)
+**Key constraint:** The (128, 128) attention score matrix uses 128 regs/thread (50% of budget).
+Triton can't slice register-resident tensors (no row indexing), so tiling Q requires
+computing everything from scratch per tile. tl.gather was already tried and adds 8% overhead.
+
+## What to Try Next — Triton Kernel (for next agent)
 
 ### Profiling Commands (run these first!)
 ```bash
 # Kernel time breakdown
 uv run profile_triton.py   # shows kernel/gradient/vecgen split
 
-# Triton register usage (look for num_regs, spill_stores, spill_loads):
-TRITON_CACHE_DIR=/tmp/triton_debug uv run benchmark.py
-# Then: find /tmp/triton_debug -name "*.json" | xargs grep num_regs
+# Register & occupancy via nsys (ncu not installed):
+nsys profile --stats=true -o /tmp/eggroll_profile uv run benchmark.py
+# Then query the sqlite:
+python -c "
+import sqlite3; conn = sqlite3.connect('/tmp/eggroll_profile.sqlite')
+c = conn.cursor()
+c.execute('SELECT registersPerThread, blockX, dynamicSharedMemory, localMemoryPerThread, (end-start)/1e6 FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY (end-start) DESC LIMIT 3')
+for r in c.fetchall(): print(f'regs={r[0]} threads={r[1]} smem={r[2]} local={r[3]} ms={r[4]:.1f}')
+"
+
+# Monkey-patch maxnreg (properly invalidates cache):
+# See "What Did NOT Work part 3" for the working monkey-patch code.
+# TL;DR: patch cb.CUDABackend.parse_options + clear tl._COMPILED_KERNEL_CACHE
 
 # CUDA kernel profiling:
 make -C kernels/cuda/
-# Register usage:
 nvcc -O3 -arch=sm_89 --ptxas-options=-v -c kernels/cuda/fused_transformer_ce.cu -o /dev/null 2>&1
-# GPU profiling:
-ncu --target-processes all uv run python -c "..." 2>&1 | head -50
 ```
 
 ### Bottleneck Analysis
 
-The Triton kernel at 274ms processes 1,048,576 blocks (4096×128×2).
-- 80 SMs on RTX 4080 SUPER, likely 1 block/SM occupancy → 13,107 waves
-- Per wave: 274ms/13107 ≈ 21μs (matches compute estimates)
-- 255 registers/thread (at the max), with 340 bytes spill
+The Triton kernel at 243ms processes 1,048,576 blocks (4096×128×2).
+- 80 SMs on RTX 4080 SUPER, 1 block/SM occupancy → 13,107 waves
+- Per wave: 243ms/13107 ≈ 18.5μs
+- 255 registers/thread (at hardware max), 0 bytes spill (FFN dynamic loop eliminated spilling)
+- 20,992 bytes dynamic shared memory per block
+- Achieving 2 blocks/SM requires ≤248 regs/thread but forced spilling (maxnreg) hurts more than helps
 
 **Two (128, 128) matrices cause register pressure:**
 1. Attention scores: Q(128,32) @ K(128,32)^T = (128,128) → softmax → (128,128) weights
@@ -193,7 +235,7 @@ The attention matrix alone uses 50% of the 255-register budget.
 - O projection: 1.0M (5.3%)
 - FFN up+down: 8.4M (44.6%)
 - Output projection: 2.1M (11.1%)
-Total: 18.9M FLOPs. At 204.9 TFLOPS peak: theoretical 97ms. Actual 274ms = 35% utilization.
+Total: 18.9M FLOPs. At 204.9 TFLOPS peak: theoretical 97ms. Actual 243ms = 40% utilization.
 
 ### CUDA Kernel Infrastructure (READY TO USE)
 
@@ -222,37 +264,58 @@ from kernels.cuda.wrapper import fused_transformer_ce_both_cuda as cuda_kernel
 
 ### Creative Approaches for the Next Agent
 
-1. **Use PTX inline assembly for matmuls** instead of WMMA. PTX `mma.sync` instructions
-   give more control over data movement. Can keep data in registers (no shared memory
-   staging). Study: NVIDIA PTX ISA guide, `mma.sync.aligned.m16n8k16.row.col.f32.bf16`.
+**Approach 1 — Sequence-tiled kernel (HIGHEST POTENTIAL, ~1.5x speedup)**
 
-2. **Use CUTLASS templates** (install CUTLASS first: `pip install nvidia-cutlass` or
-   clone from github). CUTLASS provides optimized matmul templates that handle register
-   allocation, shared memory tiling, and tensor core usage. Can be integrated into a
-   fused kernel via CUTLASS's "epilogue fusion" API.
+Rewrite the kernel to process 64 positions at a time instead of 128. This halves
+ALL position-dependent matrices and crucially reduces attention scores from (128,128)
+= 128 regs to (64,64) = 16 regs per thread.
 
-3. **Persistent kernel in Triton** with global memory K/V scratch:
-   - Launch 160-256 blocks (2 per SM)
-   - Each block processes multiple (perturbation, batch, sign) items sequentially
-   - Store K/V to a per-block scratch buffer (160 × 32KB = 5MB in L2 cache)
-   - Load K/V tiles for FlashAttention from L2-cached scratch
-   - This avoids the tl.gather overhead that killed the Triton FlashAttention attempt
+Requires a new grid structure: (HALF_POP, BATCH, 2, 2) where dim 3 is seq tile.
+- Tile 0 (pos 0-63): standard causal attention within tile
+- Tile 1 (pos 64-127): needs K/V from tile 0 via global memory scratch
+  - Scratch per block: 64×32×4bytes×2heads×2(K,V) = 32KB
+  - Challenge: tile 0 and tile 1 are SEPARATE blocks; tile 1 must wait for tile 0
+  - Solution A: two-kernel approach (kernel 1 = tile 0 + store K/V, kernel 2 = tile 1)
+  - Solution B: same kernel but tile 1 RECOMPUTES K/V for positions 0-63 (~30% extra
+    FLOPs but no cross-block sync needed)
 
-4. **Triton cooperative kernel** (tl.range with warp_specialize=True):
-   - Triton 3.6 has experimental warp specialization
-   - Assign 2 warps to matmul (tensor cores) and 2 warps to non-matmul (scalar)
-   - Requires Blackwell GPU (SM 100+) — NOT available on Ada SM 89
+Register savings estimate: scores 128→16, h/h_norm 64→32 each, logits 128→32.
+Could enable 2 blocks/SM → ~1.5x speedup.
 
-5. **Reduce the two (128,128) matrices** by restructuring computation:
-   - For attention: already tried FlashAttention via tl.gather (8% slower due to gather)
-   - For output proj: already tried tiled CE with online log-sum-exp (no improvement)
-   - Untried: compute output projection in bf16 accumulator (output_dtype=tl.bfloat16
-     in tl.dot) to halve register footprint. The CE loss needs f32 but could convert
-     after the matmul.
+**Approach 2 — Persistent kernel in Triton**
 
-6. **Different thread mapping**: Instead of 128 threads per block processing one
-   (perturbation, batch, sign), try 256 threads processing two batch elements.
-   This shares perturbation vector loads across 2 sequences.
+Launch exactly N_SM×2 = 160 blocks. Each block uses an atomic work counter to
+claim (perturbation, batch, sign) items and processes them sequentially.
+- Scratch buffer: 160 blocks × 32KB = 5MB (fits in L2 cache)
+- Each block processes one item, stores K/V to its scratch slot, then processes
+  the attention using its own K/V data from scratch (for sequence tiling)
+- Key advantage: scratch is indexed by block ID, not by work item → bounded memory
+- Must use `tl.atomic_add` for work counter, `tl.inline_asm` for smid if needed
+
+**Approach 3 — CUDA kernel with PTX mma.sync**
+
+The CUDA kernel infrastructure in `kernels/cuda/` is working but slow due to
+WMMA shared memory staging. PTX `mma.sync.aligned.m16n8k16.row.col.f32.bf16`
+keeps data in registers, avoiding the shared memory roundtrip. This is the only
+way to match Triton's register-resident tensor core usage from raw CUDA.
+
+Steps:
+1. Replace WMMA calls with inline PTX `mma.sync` in the .cu file
+2. Map register fragments to thread layout (each thread holds specific elements)
+3. Use `__shfl_sync` for cross-thread data sharing instead of shared memory
+4. Study: NVIDIA PTX ISA 8.x, "Matrix Multiply-Accumulate Instructions"
+
+**Approach 4 — CUTLASS fused kernel**
+
+Use CUTLASS's `CollectiveMma` + epilogue fusion to build a fused kernel that
+handles tensor core matmuls with optimal register allocation. CUTLASS manages
+the complex register/shared memory tiling automatically.
+
+**Approach 5 — Merge +σ/-σ into one block (minor optimization)**
+
+Current grid has dim 2 for sign. Merging into one block that computes both signs
+sequentially halves perturbation vector loads (9.2KB each). Kernel is compute-bound
+so savings are small, but it reduces grid overhead for 500K→250K blocks.
 
 ### ALREADY ELIMINATED (don't repeat)
 
@@ -272,10 +335,21 @@ These have ALL been tried and don't work:
 - LR schedules (cosine, warmup+cosine) at HALF_POP=3072 (no quality improvement)
 - Rank-based fitness shaping (gradient scaling issues, diverged)
 - maxnreg via monkey-patched jax_triton (doesn't affect compilation due to caching)
+- maxnreg=232/248 via proper monkey-patch (compiles but spill overhead > occupancy gain: 253-256ms vs 243ms baseline)
 - bf16 attention weights (no speed improvement)
+- fp16 output projection accumulator (out_dtype=tl.float16, no speed improvement)
+- fp16 attention score accumulator (out_dtype=tl.float16, no speed improvement alone)
 - num_stages=1/2/3 (no difference, kernel is compute-bound)
 - CUDA scalar kernel (14x slower without tensor cores)
 - CUDA WMMA kernel (11x slower, shared memory staging overhead + scalar non-matmul code)
+- Dynamic head loop tl.range (153s speed but 3-seed avg 2.504-2.508, fails quality by 0.004-0.008)
+- Dynamic head loop + fp16 attn + sigma/LR tuning (can't compensate for quality loss)
+- Adaptive alpha schedule (0.5/epoch decay) at HALF_POP=3072 (val_loss 2.84, total fail)
+- Gentle alpha schedule (0.9/epoch decay) at HALF_POP=3072 (val_loss 2.69, still fails)
+- BLOCK_K=16 with dynamic FFN loop (171.9s, slower than BLOCK_K=32 at 156s)
+- BLOCK_K=64 with dynamic FFN loop (168.7s, slower, larger tiles increase register pressure)
+- num_warps=8 with dynamic FFN loop (197.1s, much slower)
+- Fewer batches per epoch (48: quality fails; 56: borderline fail at 2.51 3-seed)
 
 ---
 
@@ -285,7 +359,7 @@ These have ALL been tried and don't work:
 - Constant label smoothing alpha=0.50
 - Adam optimizer (β1=0.9, β2=0.999, eps=1e-6) with bias correction
 - Sigma=0.02, LR=0.010, no LR decay
-- Fused Triton kernel (Grid: HALF_POP × BATCH × 2, num_warps=4, BLOCK_K=32)
+- Fused Triton kernel (Grid: HALF_POP × BATCH × 2, num_warps=4, BLOCK_K=32, FFN tl.range)
 - Per-subgroup Winsorized z-score (K=8, clip ±2.0)
 - Rank-1 perturbation compression (vec_dim=2306, 28.8x compression)
 
@@ -340,7 +414,8 @@ Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 | Triton, pop=8192, SGD+mom | 2.64 | 14.0 | 220s | |
 | Triton, pop=8192, Adam, σ=0.02 | 2.50 | 12.2 | 220s | Adam breakthrough |
 | Triton, pop=16384, Adam, σ=0.02 | 2.37 | 10.7 | 444s | previous best |
-| **Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32** | **2.44** | **11.4** | **175s** | **current best** |
+| Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32 | 2.44 | 11.4 | 175s | previous best |
+| **Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32, FFN tl.range** | **2.41** | **11.1** | **156s** | **current best** |
 
 ---
 
