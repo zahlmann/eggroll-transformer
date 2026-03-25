@@ -12,9 +12,10 @@ You work autonomously — run experiments, log results, and keep going.*
 **Goal: match backprop+Adam val_loss (1.84) at 10 epochs, same architecture.**
 **Best EGGROLL 10ep: val_loss=2.37 (3-seed avg).** Gap = 0.53 to backprop+Adam.
 
-Best config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020, LR_DECAY=0.95,
-momentum=0.5, alpha=0.50, Gaussian vectors, N_ACCUM=1.
+Best config: `train_eggroll_triton.py` with HALF_POP=8192, Adam (β1=0.9, β2=0.999),
+LR=0.010, sigma=0.02, alpha=0.50, Gaussian vectors, N_ACCUM=1.
 Uses fused Triton kernel for the full forward pass + CE loss (4.7x speedup over JAX vmap).
+Backprop+Adam baseline: `train_backprop_adam.py` with LR=3e-3.
 
 ---
 
