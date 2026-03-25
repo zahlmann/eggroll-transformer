@@ -76,15 +76,8 @@ def train(seed=42):
     val_x = jnp.array(data["val_x"])
     val_y = jnp.array(data["val_y"])
 
-    # per-layer LR scales
-    lr_scale_arr = []
-    for pkey, shape, _, _, _ in spec:
-        n_p = int(np.prod(shape))
-        if n_p < 256: lr_scale_arr.append(3.0)
-        elif n_p < 4096: lr_scale_arr.append(1.5)
-        elif n_p < 8192: lr_scale_arr.append(1.0)
-        else: lr_scale_arr.append(0.7)
-    lr_scale_arr = jnp.array(lr_scale_arr)
+    # uniform LR scaling (Adam handles per-param adaptation)
+    lr_scale_arr = jnp.ones(len(spec))
 
     from kernels.fused_transformer_ce import fused_transformer_ce_both
 
