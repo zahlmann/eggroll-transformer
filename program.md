@@ -177,29 +177,40 @@ that degrades quality beyond this threshold is rejected.
 
 ---
 
-## What to Try Next (SPEED — reduce the 43x gap)
+## What to Try Next (SPEED — reduce the 38x gap)
 
-**The kernel is at ~47% of bf16 tensor core peak.** The gap is due to low occupancy
-(register pressure from the 128×128 attention matrix). Focus on reducing register
-pressure or changing the computation structure.
+**The kernel is at ~47% of bf16 tensor core peak.** 255 regs/thread, 0 spills, 1 block/SM.
+Forced spilling (maxnreg) makes things worse — the kernel is too compute-bound.
+The only path to 2 blocks/SM is reducing ACTUAL register usage, not capping it.
 
-## What to Try Next — CUDA Kernel Optimization (for next agent)
+**Key constraint:** The (128, 128) attention score matrix uses 128 regs/thread (50% of budget).
+Triton can't slice register-resident tensors (no row indexing), so tiling Q requires
+computing everything from scratch per tile. tl.gather was already tried and adds 8% overhead.
+
+## What to Try Next — Triton Kernel (for next agent)
 
 ### Profiling Commands (run these first!)
 ```bash
 # Kernel time breakdown
 uv run profile_triton.py   # shows kernel/gradient/vecgen split
 
-# Triton register usage (look for num_regs, spill_stores, spill_loads):
-TRITON_CACHE_DIR=/tmp/triton_debug uv run benchmark.py
-# Then: find /tmp/triton_debug -name "*.json" | xargs grep num_regs
+# Register & occupancy via nsys (ncu not installed):
+nsys profile --stats=true -o /tmp/eggroll_profile uv run benchmark.py
+# Then query the sqlite:
+python -c "
+import sqlite3; conn = sqlite3.connect('/tmp/eggroll_profile.sqlite')
+c = conn.cursor()
+c.execute('SELECT registersPerThread, blockX, dynamicSharedMemory, localMemoryPerThread, (end-start)/1e6 FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY (end-start) DESC LIMIT 3')
+for r in c.fetchall(): print(f'regs={r[0]} threads={r[1]} smem={r[2]} local={r[3]} ms={r[4]:.1f}')
+"
+
+# Monkey-patch maxnreg (properly invalidates cache):
+# See "What Did NOT Work part 3" for the working monkey-patch code.
+# TL;DR: patch cb.CUDABackend.parse_options + clear tl._COMPILED_KERNEL_CACHE
 
 # CUDA kernel profiling:
 make -C kernels/cuda/
-# Register usage:
 nvcc -O3 -arch=sm_89 --ptxas-options=-v -c kernels/cuda/fused_transformer_ce.cu -o /dev/null 2>&1
-# GPU profiling:
-ncu --target-processes all uv run python -c "..." 2>&1 | head -50
 ```
 
 ### Bottleneck Analysis
@@ -224,7 +235,7 @@ The attention matrix alone uses 50% of the 255-register budget.
 - O projection: 1.0M (5.3%)
 - FFN up+down: 8.4M (44.6%)
 - Output projection: 2.1M (11.1%)
-Total: 18.9M FLOPs. At 204.9 TFLOPS peak: theoretical 97ms. Actual 274ms = 35% utilization.
+Total: 18.9M FLOPs. At 204.9 TFLOPS peak: theoretical 97ms. Actual 243ms = 40% utilization.
 
 ### CUDA Kernel Infrastructure (READY TO USE)
 
@@ -253,37 +264,58 @@ from kernels.cuda.wrapper import fused_transformer_ce_both_cuda as cuda_kernel
 
 ### Creative Approaches for the Next Agent
 
-1. **Use PTX inline assembly for matmuls** instead of WMMA. PTX `mma.sync` instructions
-   give more control over data movement. Can keep data in registers (no shared memory
-   staging). Study: NVIDIA PTX ISA guide, `mma.sync.aligned.m16n8k16.row.col.f32.bf16`.
+**Approach 1 — Sequence-tiled kernel (HIGHEST POTENTIAL, ~1.5x speedup)**
 
-2. **Use CUTLASS templates** (install CUTLASS first: `pip install nvidia-cutlass` or
-   clone from github). CUTLASS provides optimized matmul templates that handle register
-   allocation, shared memory tiling, and tensor core usage. Can be integrated into a
-   fused kernel via CUTLASS's "epilogue fusion" API.
+Rewrite the kernel to process 64 positions at a time instead of 128. This halves
+ALL position-dependent matrices and crucially reduces attention scores from (128,128)
+= 128 regs to (64,64) = 16 regs per thread.
 
-3. **Persistent kernel in Triton** with global memory K/V scratch:
-   - Launch 160-256 blocks (2 per SM)
-   - Each block processes multiple (perturbation, batch, sign) items sequentially
-   - Store K/V to a per-block scratch buffer (160 × 32KB = 5MB in L2 cache)
-   - Load K/V tiles for FlashAttention from L2-cached scratch
-   - This avoids the tl.gather overhead that killed the Triton FlashAttention attempt
+Requires a new grid structure: (HALF_POP, BATCH, 2, 2) where dim 3 is seq tile.
+- Tile 0 (pos 0-63): standard causal attention within tile
+- Tile 1 (pos 64-127): needs K/V from tile 0 via global memory scratch
+  - Scratch per block: 64×32×4bytes×2heads×2(K,V) = 32KB
+  - Challenge: tile 0 and tile 1 are SEPARATE blocks; tile 1 must wait for tile 0
+  - Solution A: two-kernel approach (kernel 1 = tile 0 + store K/V, kernel 2 = tile 1)
+  - Solution B: same kernel but tile 1 RECOMPUTES K/V for positions 0-63 (~30% extra
+    FLOPs but no cross-block sync needed)
 
-4. **Triton cooperative kernel** (tl.range with warp_specialize=True):
-   - Triton 3.6 has experimental warp specialization
-   - Assign 2 warps to matmul (tensor cores) and 2 warps to non-matmul (scalar)
-   - Requires Blackwell GPU (SM 100+) — NOT available on Ada SM 89
+Register savings estimate: scores 128→16, h/h_norm 64→32 each, logits 128→32.
+Could enable 2 blocks/SM → ~1.5x speedup.
 
-5. **Reduce the two (128,128) matrices** by restructuring computation:
-   - For attention: already tried FlashAttention via tl.gather (8% slower due to gather)
-   - For output proj: already tried tiled CE with online log-sum-exp (no improvement)
-   - Untried: compute output projection in bf16 accumulator (output_dtype=tl.bfloat16
-     in tl.dot) to halve register footprint. The CE loss needs f32 but could convert
-     after the matmul.
+**Approach 2 — Persistent kernel in Triton**
 
-6. **Different thread mapping**: Instead of 128 threads per block processing one
-   (perturbation, batch, sign), try 256 threads processing two batch elements.
-   This shares perturbation vector loads across 2 sequences.
+Launch exactly N_SM×2 = 160 blocks. Each block uses an atomic work counter to
+claim (perturbation, batch, sign) items and processes them sequentially.
+- Scratch buffer: 160 blocks × 32KB = 5MB (fits in L2 cache)
+- Each block processes one item, stores K/V to its scratch slot, then processes
+  the attention using its own K/V data from scratch (for sequence tiling)
+- Key advantage: scratch is indexed by block ID, not by work item → bounded memory
+- Must use `tl.atomic_add` for work counter, `tl.inline_asm` for smid if needed
+
+**Approach 3 — CUDA kernel with PTX mma.sync**
+
+The CUDA kernel infrastructure in `kernels/cuda/` is working but slow due to
+WMMA shared memory staging. PTX `mma.sync.aligned.m16n8k16.row.col.f32.bf16`
+keeps data in registers, avoiding the shared memory roundtrip. This is the only
+way to match Triton's register-resident tensor core usage from raw CUDA.
+
+Steps:
+1. Replace WMMA calls with inline PTX `mma.sync` in the .cu file
+2. Map register fragments to thread layout (each thread holds specific elements)
+3. Use `__shfl_sync` for cross-thread data sharing instead of shared memory
+4. Study: NVIDIA PTX ISA 8.x, "Matrix Multiply-Accumulate Instructions"
+
+**Approach 4 — CUTLASS fused kernel**
+
+Use CUTLASS's `CollectiveMma` + epilogue fusion to build a fused kernel that
+handles tensor core matmuls with optimal register allocation. CUTLASS manages
+the complex register/shared memory tiling automatically.
+
+**Approach 5 — Merge +σ/-σ into one block (minor optimization)**
+
+Current grid has dim 2 for sign. Merging into one block that computes both signs
+sequentially halves perturbation vector loads (9.2KB each). Kernel is compute-bound
+so savings are small, but it reduces grid overhead for 500K→250K blocks.
 
 ### ALREADY ELIMINATED (don't repeat)
 

@@ -5,7 +5,7 @@ Training a small transformer with **EGGROLL** (Evolution Strategies with low-ran
 ## Quick Start
 
 ```bash
-uv run train_eggroll.py          # EGGROLL training (175s, val_loss ~2.44)
+uv run train_eggroll.py          # EGGROLL training (156s, val_loss ~2.41)
 uv run train_backprop.py         # Backprop+Adam baseline (4s, val_loss ~1.84)
 uv run benchmark.py              # Side-by-side comparison
 uv run validate.py               # 3-seed quality validation
@@ -46,6 +46,6 @@ program.md                    agent instructions
 
 | Method | val_loss | Time | Memory |
 |--------|----------|------|--------|
-| EGGROLL (Triton kernel) | 2.44 | 175s | 70MB |
+| EGGROLL (Triton kernel) | 2.41 | 156s | 70MB |
 | Backprop+Adam | 1.84 | 4.1s | 160MB |
 | Backprop+SGD | 2.45 | 1.3s | 300MB |
