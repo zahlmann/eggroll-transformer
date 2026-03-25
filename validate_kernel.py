@@ -7,9 +7,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+import jax.lax as lax
 from data import prepare_data
-from model import init_transformer, count_params
-from train_eggroll_optimized import build_param_spec, make_perturbed_forward
+from model import init_transformer, count_params, transformer_forward_batch, cross_entropy_loss
+from train_eggroll import build_param_spec
 
 D_MODEL = 64
 N_HEADS = 2
@@ -44,14 +45,29 @@ def main():
     vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
     # === JAX reference: compute CE for each perturbation ===
-    forward_fn = make_perturbed_forward(params, config, spec)
+    @jax.jit
+    def jax_forward(params, vec, sigma_val, x, y):
+        p = {}
+        for key, shape, offset, vec_dim, is_2d in spec:
+            v = lax.dynamic_slice(vec, (offset,), (vec_dim,))
+            if is_2d:
+                m, n = shape
+                p[key] = (params[key] + sigma_val * jnp.outer(v[:m], v[m:])).astype(jnp.bfloat16)
+            else:
+                p[key] = (params[key] + sigma_val * v).astype(jnp.bfloat16)
+        logits = transformer_forward_batch(p, config, x)
+        scaled = logits / TEMPERATURE
+        log_sm = jax.nn.log_softmax(scaled, axis=-1)
+        one_hot = jax.nn.one_hot(y, config["vocab_size"])
+        smooth = (1 - ALPHA) * one_hot + ALPHA / config["vocab_size"]
+        return -jnp.sum(smooth * log_sm) / (x.shape[0] * x.shape[1])
 
     print("Computing JAX reference...")
     jax_ce_pos = []
     jax_ce_neg = []
     for i in range(HALF_POP):
-        ce_p = forward_fn(params, vecs[i], SIGMA, train_x, train_y, ALPHA)
-        ce_n = forward_fn(params, vecs[i], -SIGMA, train_x, train_y, ALPHA)
+        ce_p = jax_forward(params, vecs[i], SIGMA, train_x, train_y)
+        ce_n = jax_forward(params, vecs[i], -SIGMA, train_x, train_y)
         jax_ce_pos.append(float(ce_p))
         jax_ce_neg.append(float(ce_n))
     jax_ce_pos = np.array(jax_ce_pos)

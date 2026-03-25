@@ -9,7 +9,7 @@ import numpy as np
 
 from data import prepare_data
 from model import init_transformer
-from train_eggroll_optimized import build_param_spec
+from train_eggroll import build_param_spec
 from kernels.fused_transformer_ce import fused_transformer_ce_both
 
 D_MODEL = 64
@@ -118,35 +118,12 @@ def main():
     t_grad = (time.perf_counter() - t0) / 20
     print(f"  Gradient: {t_grad*1000:.1f}ms")
 
-    # --- Profile: full batch (as in training) ---
-    print("\nProfiling full training batch (gen + kernel + grad + adam)...")
-    from train_eggroll_triton import train_one_batch, winsorized_zscore, MOMENTUM, ADAM_BETA2, ADAM_EPS, LR_START
-    momentum_buf = jax.tree.map(jnp.zeros_like, params)
-    v_buf = jax.tree.map(jnp.zeros_like, params)
-    step = jnp.int32(0)
-    lr_scale_arr = jnp.ones(len(spec))
-
-    @jax.jit
-    def train_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
-        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr)
-
-    # warmup
-    out = train_batch(params, momentum_buf, v_buf, step, key, x, y, SIGMA, LR_START)
-    jax.block_until_ready(out)
-    t0 = time.perf_counter()
-    for _ in range(10):
-        out = train_batch(params, momentum_buf, v_buf, step, key, x, y, SIGMA, LR_START)
-        jax.block_until_ready(out)
-    t_batch = (time.perf_counter() - t0) / 10
-    print(f"  Full batch: {t_batch*1000:.1f}ms")
-    print(f"  Breakdown: kernel={t_kernel*1000:.0f}ms + grad={t_grad*1000:.0f}ms + gen={t_gen*1000:.0f}ms = {(t_kernel+t_grad+t_gen)*1000:.0f}ms (vs {t_batch*1000:.0f}ms total)")
-    print(f"  Overhead: {(t_batch - t_kernel - t_grad - t_gen)*1000:.0f}ms")
-
     n_batches = 61
+    t_batch = t_kernel + t_grad + t_gen
     print(f"\n=== SUMMARY (estimated for 10 epochs) ===")
-    print(f"  Kernel:   {t_kernel*n_batches*10:.1f}s ({t_kernel*n_batches*10/(t_batch*n_batches*10)*100:.0f}%)")
-    print(f"  Gradient: {t_grad*n_batches*10:.1f}s ({t_grad*n_batches*10/(t_batch*n_batches*10)*100:.0f}%)")
-    print(f"  Vec gen:  {t_gen*n_batches*10:.1f}s ({t_gen*n_batches*10/(t_batch*n_batches*10)*100:.0f}%)")
+    print(f"  Kernel:   {t_kernel*n_batches*10:.1f}s ({t_kernel/t_batch*100:.0f}%)")
+    print(f"  Gradient: {t_grad*n_batches*10:.1f}s ({t_grad/t_batch*100:.0f}%)")
+    print(f"  Vec gen:  {t_gen*n_batches*10:.1f}s ({t_gen/t_batch*100:.0f}%)")
     print(f"  Total:    {t_batch*n_batches*10:.1f}s")
 
 if __name__ == "__main__":

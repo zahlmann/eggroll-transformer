@@ -38,7 +38,7 @@ def main():
     # Run EGGROLL
     print("\n--- Running EGGROLL ---")
     result = subprocess.run(
-        ["uv", "run", "train_eggroll_triton.py", "--seed", "42"],
+        ["uv", "run", "train_eggroll.py", "--seed", "42"],
         capture_output=True, text=True, timeout=600,
     )
     if result.returncode != 0:

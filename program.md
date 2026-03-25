@@ -9,6 +9,19 @@ autonomously — run experiments, log results, and keep going.*
 **Your priority is SPEED OPTIMIZATION. Quality improvements are secondary —
 only pursue them if a speed optimization opens a quality opportunity for free.**
 
+**MANDATORY CLEANUP RULES (before every merge to main):**
+1. **One train_eggroll.py** — the best EGGROLL implementation. No duplicates.
+2. **One train_backprop.py** — the Adam baseline. No SGD variant, no sweeps.
+3. **Delete failed experiments** — HP sweeps, test scripts for approaches that
+   didn't work, intermediate/scratch files. Document what failed in this file
+   under "ALREADY ELIMINATED", then delete the code.
+4. **No sweep/search scripts on main** — run them on branches, record results
+   in this file, delete the scripts before merging.
+5. **Kernel code** — only the working fused Triton kernel in `kernels/`. Experimental
+   kernel variants (CUDA, split kernel, etc.) live on branches only.
+6. **Keep**: data.py, model.py, benchmark.py, validate.py, profile_triton.py,
+   validate_kernel.py, results.tsv, program.md, README.md
+
 ---
 
 ## Current State (2026-03-25)
@@ -40,22 +53,17 @@ Key metric: **time per batch** and **kernel time**.
 ## Files
 
 ```
-program.md                    — this file (read first)
-validate.py                   — LOCKED 3-seed validation (checks locked constants)
-benchmark.py                  — fast single-seed comparison (EGGROLL vs backprop+Adam)
-data.py                       — char-level Shakespeare dataset (65 vocab, 7842 train seqs)
-model.py                      — decoder-only transformer (d=64, 1 layer, 2 heads, 66K params)
-train_backprop.py             — backprop SGD baseline (LR=0.30, val_loss=2.45)
-train_backprop_adam.py        — backprop Adam baseline (LR=3e-3, val_loss=1.84)
-train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL (speed target)
-train_eggroll_optimized.py    — JAX vmap EGGROLL (slower reference)
-kernels/fused_transformer_ce.py — Triton kernel: full transformer forward + CE loss
-kernels/cuda/                 — CUDA C++ kernel scaffolding (see below)
-kernels/cuda/fused_transformer_ce.cu — CUDA kernel skeleton (TODO: implement body)
-kernels/cuda/wrapper.py       — Python/JAX binding for CUDA kernel
-kernels/cuda/test_kernel.py   — correctness test: CUDA vs Triton output
-kernels/cuda/Makefile          — build: make -C kernels/cuda/
-validate_kernel.py            — validates Triton kernel output vs JAX forward pass
+program.md                      — this file (read first)
+README.md                       — project overview
+train_eggroll.py                — EGGROLL training (speed target)
+train_backprop.py               — backprop+Adam baseline (LR=3e-3, val_loss=1.84)
+benchmark.py                    — single-seed comparison (EGGROLL vs backprop)
+validate.py                     — 3-seed quality validation (checks locked constants)
+data.py                         — char-level Shakespeare dataset (65 vocab, 7842 train seqs)
+model.py                        — decoder-only transformer (d=64, 1 layer, 2 heads, 66K params)
+kernels/fused_transformer_ce.py — fused Triton kernel: full forward + CE loss
+profile_triton.py               — kernel time breakdown profiler
+validate_kernel.py              — validates Triton kernel output vs JAX forward pass
 benchmark_kernel.py           — benchmarks Triton vs JAX vmap speed
 profile_triton.py             — time breakdown profiler (kernel vs gradient vs vec gen)
 cuda_kernels_docs/            — Triton + jax-triton + CUDA C++ documentation

@@ -1,7 +1,7 @@
 """
 validate.py — LOCKED. Do not modify.
 
-Runs train_eggroll_triton.py with 3 seeds, checks locked constants,
+Runs train_eggroll.py with 3 seeds, checks locked constants,
 reports pass/fail. Also runs backprop baseline for fair comparison.
 
 Usage: uv run validate.py
@@ -48,7 +48,7 @@ def parse_block(output: str, block_name: str) -> dict:
 def run_seed(seed: int) -> dict | None:
     print(f"\n--- seed {seed} ---")
     result = subprocess.run(
-        ["uv", "run", "train_eggroll_triton.py", "--seed", str(seed)],
+        ["uv", "run", "train_eggroll.py", "--seed", str(seed)],
         capture_output=True, text=True, timeout=1200,
     )
 
