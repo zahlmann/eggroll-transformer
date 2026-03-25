@@ -41,7 +41,7 @@ _D_HEAD   = tl.constexpr(32)
 _D_FF     = tl.constexpr(256)
 _VOCAB    = tl.constexpr(65)
 _VOCAB_PAD = tl.constexpr(128)
-_BLOCK_K  = tl.constexpr(64)
+_BLOCK_K  = tl.constexpr(32)
 
 
 @triton.jit
@@ -297,6 +297,6 @@ def fused_transformer_ce_both(
         grid=(HALF_POP, BATCH, 2),
         HALF_POP=HALF_POP,
         BATCH=BATCH,
-        num_warps=8,
+        num_warps=4,
         num_stages=1,
     )
