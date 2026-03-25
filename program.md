@@ -10,7 +10,7 @@ You work autonomously — run experiments, log results, and keep going.*
 ## Current State (2026-03-25)
 
 **Goal: match backprop val_loss (2.45) at 10 epochs, same architecture.**
-**Best EGGROLL 10ep: val_loss=2.60.** Gap = 0.15.
+**Best EGGROLL 10ep: val_loss=2.50 (3-seed avg).** Gap = 0.05.
 
 Best config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020, LR_DECAY=0.95,
 momentum=0.5, alpha=0.50, Gaussian vectors, N_ACCUM=1.
@@ -92,9 +92,11 @@ results.tsv                   — experiment log (tab-separated)
 | bf16, pop=4096 (accum=2), ortho QR | 2.67 | 14.4 | 540s | best JAX vmap |
 | triton kernel, pop=2048 | 2.67 | 14.5 | 119s | 4.5x kernel speedup |
 | triton, pop=8192, LR=0.020, decay=0.95 | 2.64 | 14.0 | 220s | best SGD+momentum |
-| triton, pop=8192, **Adam** (β1=0.6, β2=0.99), LR=0.006, σ=0.03 | **2.60** | **13.5** | **219s** | **best 10ep** |
+| triton, pop=8192, Adam (β1=0.6, β2=0.99), LR=0.006, σ=0.03 | 2.60 | 13.5 | 219s | Adam works |
+| triton, pop=8192, Adam (β1=0.6, β2=0.99), σ=0.02 | 2.51 | 12.3 | 219s | lower sigma helps |
+| triton, pop=8192, **Adam (0.9, 0.999)**, σ=0.02, LR=0.010 | **2.50** | **12.2** | **220s** | **best 10ep (3-seed)** |
 
-**Current gap: 2.60 − 2.45 = 0.15**
+**Current gap: 2.50 − 2.45 = 0.05 (3-seed validated)**
 
 ### What did NOT work (at more epochs — invalid approach)
 
