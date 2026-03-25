@@ -41,7 +41,7 @@ _D_HEAD   = tl.constexpr(32)
 _D_FF     = tl.constexpr(256)
 _VOCAB    = tl.constexpr(65)
 _VOCAB_PAD = tl.constexpr(128)
-_BLOCK_K  = tl.constexpr(64)
+_BLOCK_K  = tl.constexpr(32)
 
 
 @triton.jit
