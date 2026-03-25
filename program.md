@@ -2,20 +2,50 @@
 
 *You are an AI researcher. Your job: train a small decoder-only transformer using
 EGGROLL (Evolution Strategies with low-rank perturbations) instead of backprop.
-Make it as fast as possible while matching backprop accuracy. You work autonomously,
-run experiments, log results, and keep going without stopping to ask for permission.*
+Match backprop val_loss at the same number of epochs while minimizing time and memory.
+You work autonomously — run experiments, log results, and keep going.*
 
 ---
 
-## Current State (2026-03-24)
+## Current State (2026-03-25)
 
-**Phase 1 (working): DONE.** EGGROLL trains a transformer from scratch.
-**Phase 2 (quality): val_loss=2.51 vs backprop 2.45 (10ep).** Gap=0.06. Down from 0.22.
-**Phase 3 (speed): 119s (10ep) vs 1.3s.** 4.5x speedup via Triton kernel (was 540s).
+**Goal: match backprop val_loss (2.45) at 10 epochs, same architecture.**
+**Best EGGROLL 10ep: val_loss=2.64.** Gap = 0.19.
 
-Best EGGROLL config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.012,
-LR_DECAY=0.97, momentum=0.7, alpha=0.50, bf16, Gaussian vectors (no QR since pop>vec_dim),
-N_ACCUM=1, 100 epochs. Uses fused Triton kernel for the full forward pass + CE loss.
+Best config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020, LR_DECAY=0.95,
+momentum=0.5, alpha=0.50, Gaussian vectors, N_ACCUM=1.
+Uses fused Triton kernel for the full forward pass + CE loss (4.7x speedup over JAX vmap).
+
+---
+
+## Fairness Rules (ENFORCED by validate.py)
+
+These constants are LOCKED. Changing them makes the comparison unfair.
+
+```python
+D_MODEL = 64       # model width
+N_HEADS = 2        # attention heads
+N_LAYERS = 1       # transformer layers
+CONTEXT_LEN = 128  # sequence length
+BATCH_SIZE = 128   # training batch size
+EPOCHS = 10        # LOCKED — same as backprop baseline
+TEMPERATURE = 2.0  # CE temperature
+```
+
+**What counts as cheating:**
+- Changing EPOCHS (more epochs = more gradient steps = unfair)
+- Changing architecture (d_model, n_layers, n_heads, d_ff)
+- Changing batch size (affects effective learning)
+- Subsetting data or changing sequence length
+- Different eval methodology
+
+**What is allowed:**
+- Any ES algorithm change (population, perturbation strategy, gradient estimation)
+- Hyperparameter tuning (LR, sigma, alpha, momentum, etc.)
+- Kernel optimizations (Triton, fusion, fp8, etc.)
+- Per-layer LR scaling
+- Different perturbation structures (orthogonal, guided, etc.)
+- Cross-batch state (momentum) — essential for transformer ES
 
 ---
 
@@ -23,288 +53,144 @@ N_ACCUM=1, 100 epochs. Uses fused Triton kernel for the full forward pass + CE l
 
 ```
 program.md                    — this file (read first)
-data.py                       — char-level Shakespeare dataset (65 vocab, 7842 train sequences)
+validate.py                   — LOCKED 3-seed validation with locked constants check
+benchmark.py                  — fast single-seed comparison (EGGROLL vs backprop)
+data.py                       — char-level Shakespeare dataset (65 vocab, 7842 train seqs)
 model.py                      — decoder-only transformer (d=64, 1 layer, 2 heads, 66K params)
-train_backprop.py             — backprop baseline (vanilla SGD, LR=3e-4, under-tuned)
-train_eggroll.py              — fp32 EGGROLL (no momentum, no bf16 — superseded)
-train_eggroll_optimized.py    — JAX vmap EGGROLL (bf16, momentum, orthogonal vecs, accum)
-train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL (4.5x faster)
-kernels/fused_transformer_ce.py — Triton kernel: full forward pass + CE loss fused
-validate_kernel.py            — validates Triton kernel against JAX forward pass
+train_backprop.py             — backprop baseline (SGD, LR=0.30, val_loss=2.45 at 10ep)
+train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL
+train_eggroll_optimized.py    — JAX vmap EGGROLL (slower, reference implementation)
+train_eggroll.py              — fp32 EGGROLL (superseded)
+kernels/fused_transformer_ce.py — Triton kernel: full transformer forward + CE loss
+validate_kernel.py            — validates Triton kernel output vs JAX forward pass
 benchmark_kernel.py           — benchmarks Triton vs JAX vmap speed
-profile_eggroll.py            — profiles time breakdown (forward=99%, QR=1%, grad=0%)
-benchmark.py                  — runs backprop vs eggroll comparison
-cuda_kernels_docs/            — Triton + jax-triton documentation (from MNIST project)
+profile_eggroll.py            — time breakdown (forward=99%, QR=1%, grad=0%)
+cuda_kernels_docs/            — Triton + jax-triton documentation
+results.tsv                   — experiment log (tab-separated)
 ```
 
 ---
 
-## Results — Complete History
+## Results — Complete History (10 epochs only)
 
-### Backprop baselines (10 epochs, same architecture, no warmup)
+### Backprop baselines
 
-| LR | Decay | val_loss | ppl | Time | Notes |
-|----|-------|----------|-----|------|-------|
-| 3e-4 | 1.0 | 3.59 | 36.1 | 6.1s | initial under-tuned baseline |
-| 1e-3 | 0.92 | 3.37 | 28.9 | 1.3s | first tuning |
-| 2e-2 | 0.80 | 2.70 | 14.9 | 1.3s | what we initially compared against |
-| 5e-2 | 0.90 | 2.54 | 12.7 | 1.3s | |
-| 1e-1 | 0.90 | 2.50 | 12.2 | 1.3s | |
-| **3e-1** | **0.90** | **2.45** | **11.6** | **1.3s** | **best backprop (ceiling)** |
-| 5e-1 | 0.85 | 2.45 | 11.6 | 1.3s | saturated |
+| LR | val_loss | ppl | Time | Notes |
+|----|----------|-----|------|-------|
+| 3e-4 | 3.59 | 36.1 | 6.1s | initial under-tuned |
+| 2e-2 | 2.70 | 14.9 | 1.3s | |
+| 1e-1 | 2.50 | 12.2 | 1.3s | |
+| **3e-1** | **2.45** | **11.6** | **1.3s** | **ceiling — target to match** |
 
-**Lesson: backprop with vanilla SGD tolerates VERY high LR (0.3!) for this tiny transformer.
-Always sweep backprop LR aggressively (1e-4 to 1.0) before comparing. The initial LR=3e-4
-was 1000x below optimal.**
-
-### EGGROLL results (10 epochs, all bf16 unless noted)
+### EGGROLL results (10 epochs, bf16)
 
 | Config | val_loss | ppl | Time | Key change |
 |--------|----------|-----|------|-----------|
-| fp32, pop=512, alpha decaying | 3.94 | 51.4 | 148s | first working version |
-| fp32, pop=2048, alpha=0.15 const | 3.70 | 40.6 | 501s | constant alpha discovery |
-| **bf16**, pop=2048, alpha=0.20 | 2.83 | 17.0 | 270s | bf16 breakthrough |
-| bf16, pop=2048, alpha=0.20, **momentum=0.5** | 2.80 | 16.5 | 270s | momentum eliminates oscillation |
-| bf16, pop=2048, **alpha=0.50**, momentum=0.5 | 2.70 | 14.8 | 270s | high alpha sweet spot |
-| bf16, pop=4096 (accum=2), alpha=0.50, mom=0.5 | 2.69 | 14.7 | 540s | gradient accumulation |
-| bf16, pop=4096, alpha=0.50, mom=0.5, **ortho QR** | **2.67** | **14.4** | **540s** | **best EGGROLL** |
+| fp32, pop=512 | 3.94 | 51.4 | 148s | first working |
+| bf16, pop=2048, alpha=0.20 | 2.83 | 17.0 | 270s | bf16 breakthrough |
+| bf16, pop=2048, alpha=0.50, mom=0.5 | 2.70 | 14.8 | 270s | alpha+momentum |
+| bf16, pop=4096 (accum=2), ortho QR | 2.67 | 14.4 | 540s | best JAX vmap |
+| triton kernel, pop=2048 | 2.67 | 14.5 | 119s | 4.5x kernel speedup |
+| triton, pop=8192, LR=0.020, decay=0.95 | **2.64** | **14.0** | **220s** | **best 10ep** |
 
-### EGGROLL with Triton kernel (fused forward+CE, no vmap)
+**Current gap: 2.64 − 2.45 = 0.19**
 
-| Config | val_loss | ppl | Time | Key change |
-|--------|----------|-----|------|-----------|
-| triton, pop=2048, LR=0.012, decay=0.92, 10ep | 2.67 | 14.50 | 119s | kernel validated, matches JAX |
-| triton, pop=8192, LR=0.012, decay=0.92, 10ep | 2.67 | 14.43 | 219s | higher pop, Gaussian vecs |
-| triton, pop=8192, LR=0.020, decay=0.95, 10ep | **2.64** | **14.04** | 220s | higher LR + slower decay |
-| triton, pop=8192, LR=0.020, decay=0.95, 20ep | 2.63 | 13.84 | 433s | more epochs helps |
-| triton, pop=8192, **mom=0.7**, LR=0.010, decay=0.95, 30ep | 2.57 | 13.10 | 647s | higher momentum + lower LR |
-| triton, pop=8192, mom=0.7, LR=0.010, decay=0.95, 50ep | 2.55 | 12.79 | 1078s | still improving |
-| triton, pop=8192, mom=0.7, LR=0.012, decay=0.97, **100ep** | **2.51** | **12.30** | **2149s** | **best EGGROLL** |
+### What did NOT work (at more epochs — invalid approach)
 
-### Speed vs quality tradeoff (bf16, alpha=0.20, no momentum, no accum)
-
-| Pop | val_loss | ppl | Time | Speed gap |
-|-----|----------|-----|------|-----------|
-| 64 | 3.74 | 42.2 | 16s | 12x |
-| 128 | 3.25 | 25.9 | 25s | 19x |
-| 256 | 3.05 | 21.2 | 43s | 33x |
-| 512 | 2.95 | 19.0 | 79s | 61x |
-| 2048 | 2.83 | 17.0 | 270s | 208x |
+Running 20/30/50/100 epochs reaches 2.51 but this is cheating: you could give backprop
+the same extra epochs and it would improve too (backprop at 30ep reaches 2.17). The
+comparison must be at the SAME epoch count (10). Do not increase EPOCHS.
 
 ---
 
 ## What Worked (apply from day 1)
 
-### 1. bf16 forward passes — the single biggest quality win (-0.87 loss)
-Cast all perturbed params to bf16 before the forward pass. Keep perturbation math
-and gradient estimation in fp32. The bf16 quantization noise acts as implicit
-regularization for ES's already-noisy gradient estimates. **Does NOT help backprop**
-(tested: backprop gets same val_loss in bf16 vs fp32). This is ES-specific.
+### 1. bf16 forward passes — biggest quality win (−0.87 loss)
+Cast perturbed params to bf16, keep perturbation/gradient math in fp32. bf16 noise
+acts as implicit regularization for ES. Does NOT help backprop.
 
-### 2. Constant label smoothing, alpha=0.50 — second biggest win (-0.13 loss)
-**Unlike MNIST where adaptive alpha decay was best**, transformers need CONSTANT
-high alpha. Higher alpha = smoother fitness landscape = better ES gradient estimation.
-The smoothing also provides strong regularization against overfitting.
+### 2. Constant label smoothing alpha=0.50 (−0.13 loss)
+Unlike MNIST (adaptive decay), transformers need CONSTANT high alpha. Smoothing creates
+a softer fitness landscape that ES can estimate well. Label smoothing HURTS backprop.
 
-Sweep results: alpha=0.10→2.86, 0.20→2.80, 0.25→2.77, 0.30→2.73, 0.35→2.72,
-0.40→2.71, **0.50→2.70**, 0.60→2.70. Saturates around 0.50.
+### 3. Momentum beta=0.5 (−0.03 loss)
+ES gradients have high variance; momentum smooths across batches. beta=0.9 explodes
+(effective LR = LR/(1-beta) = 10x). Sweet spot: beta=0.5.
 
-**Label smoothing HURTS backprop** (3.59→3.87 with alpha=0.20, T=2.0). This is
-because backprop gets exact gradients — smoothing just makes the target less precise.
-For ES, smoothing makes the landscape estimable with finite perturbations.
+### 4. Per-layer LR scaling
+Small params (<256): 3.0x, attention (<4096): 1.5x, medium: 1.0x, large FFN (>8192): 0.7x.
 
-### 3. Momentum (beta=0.5) — eliminates oscillation (-0.03 loss)
-ES gradient estimates have high variance. Momentum averages across batches, smoothing
-out the noise. Without momentum, val_loss oscillates ±0.15 between epochs. With
-momentum, it decreases monotonically.
+### 5. Orthogonal QR vectors (−0.02 loss)
+QR-orthogonalize perturbation vectors when HALF_POP ≤ vec_dim (2306).
 
-**Momentum=0.9 explodes.** The effective LR with momentum beta is LR/(1-beta), so
-beta=0.9 gives 10x effective LR. For ES with noisy gradients this is catastrophic.
-Sweet spot: beta=0.5 (2x effective LR, manageable).
+### 6. Temperature T=2.0 in smoothed CE loss
+T=1.0 too sharp, T=3.0 too flat. T=2.0 is the sweet spot.
 
-Note: momentum technically violates the MNIST "no cross-batch state" rule, but for
-transformer training it's essential. The rule was designed for MNIST where ES gradients
-were less noisy (higher pop/params ratio).
+### 7. Fused Triton kernel — 4.7x speedup
+Full transformer forward pass + CE fused into one kernel. Grid: (HALF_POP, BATCH, 2).
+Eliminates all HBM intermediate writes. Validated: max rel error 0.01%.
 
-### 4. Per-layer LR scaling — stable from the start
-Small params (biases, layer norms, <256 elements): 3.0x LR — they get excellent
-gradient estimates because few parameters share few perturbation directions.
-Small matrices (attention Q/K/V/O, <4096 elements): 1.5x LR.
-Medium matrices (embeddings, output proj): 1.0x LR.
-Large matrices (FFN up/down, >8192 elements): 0.7x LR — gradient quality is worst
-for the largest layers.
+### 8. Per-subgroup Winsorized z-score
+K=8 subgroups, clip ±2.0. Same as MNIST.
 
-### 5. Orthogonal perturbation vectors via QR — (-0.02 loss)
-Instead of i.i.d. Gaussian random vectors, orthogonalize them:
-```python
-raw = jax.random.normal(key, (total_vec_dim, HALF_POP))
-Q, _ = jnp.linalg.qr(raw)
-vecs = Q.T * jnp.sqrt(total_vec_dim)
-```
-Since HALF_POP=1024 < total_vec_dim=2306, this gives 1024 perfectly orthogonal
-vectors with zero redundancy. Standard Gaussian vectors have significant random overlap.
-**Contradicts the MNIST finding** that "structured perturbations add JIT overhead" —
-for transformers, the quality gain outweighs the small QR cost.
-
-### 6. Temperature T=2.0 in the smoothed CE loss
-Softens logits, makes the fitness landscape smoother. T=1.0 is too sharp (hard to
-estimate gradient), T=3.0 is too flat (gradient signal too weak). T=2.0 is the sweet
-spot (tested T=1.0, 2.0, 3.0).
-
-### 7. Gradient accumulation (N_ACCUM=2)
-Run 2 rounds of ES gradient estimation per batch with independent random vectors,
-average the gradients, then apply one momentum+update step. Effective population
-doubles (2048→4096) without increasing memory. Costs 2x time.
-Diminishing returns: N_ACCUM=3 gave only 0.005 more improvement over N_ACCUM=2.
-
-### 8. Rank-1 perturbation compression
-For a (m,n) weight matrix, perturb with σ*outer(b,a) using m+n random values instead
-of m*n. Total vec_dim=2306 vs 66K full params = 28.8x compression. This is the core
-EGGROLL technique — confirmed it works for transformers (attention + FFN + embeddings).
-
-### 10. Fused Triton kernel — 4.7x speedup on forward pass
-Replaced the vmap+lax.scan approach with a single Triton kernel that processes ALL
-perturbation members in parallel via the CUDA grid. Grid: (HALF_POP, BATCH, 2).
-Each thread block handles one perturbation × one batch sequence × one sign direction.
-
-Key techniques:
-- Full transformer forward pass fused (embedding→LN→attention→FFN→output→CE)
-- Perturbations applied on-the-fly via rank-1 decomposition (no materialized perturbed weights)
-- K-tiled FFN (BLOCK_K=64) to manage register pressure for D_FF=256
-- Full (128,128) attention scores in-register (num_warps=8 for enough registers)
-- bf16 matmuls with f32 accumulation for softmax/LN precision
-
-Profiling showed forward passes are 99% of training time. The kernel eliminates ALL
-intermediate HBM writes (~100MB per forward pass × 4096 passes per round = ~400GB
-bandwidth savings per round). Validated against JAX: max relative error 0.01%.
-
-### 12. Higher momentum (0.7) with reduced LR — −0.04 loss, eliminates oscillation
-With the Triton kernel enabling pop=8192 (cleaner gradients), momentum=0.7 works where
-momentum=0.9 previously failed at pop=4096. The key: reduce base LR from 0.020 to 0.010
-to compensate for the higher effective LR from momentum. Effective LR = LR/(1-beta),
-so beta=0.7 gives 3.3x effective LR vs beta=0.5 giving 2x. Result: monotonically
-decreasing val_loss with zero oscillation from epoch 1 to 50.
-
-### 11. More epochs (20→50 instead of 10) — additional −0.08 loss
-With the kernel speedup, 20 epochs costs 433s (same time budget as old 10-epoch run).
-The model is still improving monotonically at epoch 20, suggesting even more epochs
-would help if time permits.
-
-### 9. Per-subgroup Winsorized z-score (from MNIST, works here too)
-K=8 subgroups, clip ±2.0. Split fitness differences into groups, normalize each
-independently, clip outliers. Same as MNIST — no need to change.
+### 9. Higher population with kernel speed
+Kernel enables pop=8192 in 220s (was 540s for pop=4096 without kernel). Larger pop
+gives −0.03 loss at 10 epochs.
 
 ---
 
-## What Did NOT Work for Transformer ES
+## What Did NOT Work
 
-### 1. Adaptive alpha decay (MNIST lesson that DOESN'T transfer)
-MNIST used alpha starting at 0.30 decaying by 0.50 per epoch. For the transformer,
-this causes val_loss to improve for 1-2 epochs then oscillate wildly as alpha drops.
-The transformer needs CONSTANT alpha for consistent regularization throughout training.
-
-### 2. Higher sigma (σ=0.06 vs σ=0.04)
-Higher sigma makes gradient estimates noisier, not better. σ=0.04 gave val_loss=2.80,
-σ=0.06 gave 2.90. Unlike the MNIST finding "higher sigma at lower pop," for
-transformers the default σ=0.04 is already good.
-
-### 3. High momentum (beta=0.9)
-Effective LR becomes ~10x, causes divergence (val_loss→5.5). Beta=0.5 is the sweet
-spot. Beta=0.6 gives similar results to 0.5.
-
-### 4. Weight tying (output_proj = token_emb.T)
-Saves 4160 params but HURTS quality for both backprop (3.59→3.83) and EGGROLL.
-The embedding init scale (0.02) is wrong for the output projection role. Not worth
-the complexity.
-
-### 5. Vectorized base+correction forward pass
-Tried restructuring the forward pass to compute base x@W once and apply rank-1
-corrections per perturbation across the chunk dimension. XLA could NOT optimize the
-complex computation graph efficiently — 3x SLOWER (765s training, 287s JIT) than
-the straightforward vmap approach. The extra dimensions (chunk, batch, seq, d_model)
-and einsum operations create worse memory access patterns.
-
-### 6. Nested lax.scan for entire epoch
-Wrapping the batch loop in a lax.scan (so one JIT compiles the whole epoch) gave
-NO speed improvement (263s vs 265s). Python dispatch overhead for 610 batch
-iterations is negligible (~1ms total). But JIT time increased from 5s to 32s because
-of the larger computation graph. **Not worth it.**
-
-### 7. Larger POP_CHUNK (32 or 64 instead of 16)
-More perturbations vmapped simultaneously = more memory pressure. POP_CHUNK=32 and
-64 were both SLOWER than POP_CHUNK=16. The GPU can't efficiently process 32+
-simultaneous transformer forward passes due to memory bandwidth saturation.
-
-### 8. Temperature T=3.0
-Too smooth — the gradient signal becomes too weak. val_loss=3.14 vs 2.70 with T=2.0.
-The fitness landscape becomes nearly flat and ES can't estimate useful gradients.
-
-### 11. Cosine LR schedule (vs exponential decay)
-Cosine gives nearly identical final results to exponential decay (2.608 vs 2.607).
-Higher peak LR with cosine (0.035) is worse (2.664) because the high initial LR
-causes oscillation. Exponential decay with LR_DECAY=0.95 is the best schedule.
-
-### 10. Adam-like adaptive LR (second moment scaling)
-Maintaining per-parameter running variance of ES gradients and dividing updates by
-sqrt(variance) (like Adam) causes catastrophic divergence. The v buffer starts at
-zero, making 1/sqrt(v+eps) enormous in early training. Even with eps=1e-8, the
-effective LR in the first batch is ~10000x the base LR. Would need warm-up or
-non-zero initialization, but fundamentally ES gradient variance is too high for
-Adam-style scaling.
-
-### 9. Low alpha with momentum (alpha=0.10, momentum=0.5)
-Momentum alone isn't enough regularization. Still need high alpha for smooth fitness
-landscape. alpha=0.10 with momentum: 2.86. alpha=0.50 with momentum: 2.70.
+1. **Adaptive alpha decay** — oscillation, transformer needs constant alpha
+2. **Higher sigma (0.06)** — noisier gradients, worse quality
+3. **Momentum beta=0.9** — diverges (10x effective LR)
+4. **Weight tying** — hurts both backprop and EGGROLL
+5. **Vectorized base+correction forward** — 3x slower, XLA can't optimize
+6. **Nested lax.scan for epoch** — 32s JIT, no speed gain
+7. **Large POP_CHUNK** — memory saturation at >16
+8. **T=3.0** — gradient signal too weak
+9. **Adam-like adaptive LR** — catastrophic divergence (v starts at zero)
+10. **Cosine LR schedule** — no improvement over exponential decay
+11. **More epochs** — invalid comparison; backprop also improves with more epochs
 
 ---
 
-## Differences from MNIST That Matter
+## What to Try Next (Quality — close the 0.19 gap)
 
-| MNIST | Transformer | Why |
-|-------|------------|-----|
-| Adaptive alpha decay | Constant alpha=0.50 | Transformer overfits with decaying regularization |
-| No momentum | Momentum beta=0.5 essential | Higher gradient noise needs temporal smoothing |
-| Pop=1680 for 118K params (70:1 ratio) | Pop=2048 for 66K params (32:1 ratio) | Attention creates more complex loss landscape |
-| Fused Triton kernel = main speedup | No Triton kernel yet | Attention makes fusion much harder |
-| Structured perturbations hurt JIT | Orthogonal QR helps quality | Quality is bottleneck, not JIT time |
-| 1.44x backprop time | 415x backprop time | Without kernel fusion, ES can't compete on speed |
+These are the remaining ideas to improve gradient quality at 10 epochs:
 
----
+1. **Within-batch guided perturbations**: Split population — use first 25% for rough
+   gradient estimate, bias remaining 75% toward that direction. Better gradient quality
+   from the same total population.
 
-## What to Try Next (Remaining Opportunities)
+2. **Natural gradient / Fisher information**: Scale the ES gradient by an estimate of
+   the inverse Fisher information matrix. This accounts for the curvature of the loss
+   landscape and can dramatically improve convergence.
 
-### Quality improvements (to close the 0.22 gap to backprop)
-1. **Within-batch guided perturbations**: Split population — use first 256 perturbations
-   for rough gradient, bias remaining 768 toward that direction. Single-batch version
-   of Guided ES (no cross-batch state needed). Research suggests this can significantly
-   improve gradient quality.
-2. **Higher population**: Pop=8192 or 16384. Each doubling costs ~2x time but should
-   give diminishing-returns quality improvement. We went 2048→4096 and got -0.02.
-3. **Scale up architecture**: d_model=128 or 2 layers. More params but also more
-   expressive — might close the gap if the bottleneck is model capacity, not ES quality.
-4. **Adam-like adaptive LR**: Maintain per-parameter running variance of ES gradients,
-   use it to scale updates (like Adam's second moment). This is cross-batch state but
-   momentum already crosses that line.
-5. **Cosine LR schedule**: Tested briefly, similar results to exponential. Worth
-   trying more carefully with the current momentum+alpha setup.
+3. **Antithetic Gaussian with variance reduction**: Instead of plain antithetic pairs,
+   use control variates or importance sampling to reduce variance of gradient estimates.
 
-### Speed improvements (to close the 415x gap)
-1. **Fused Triton kernel for FFN+CE**: The FFN (64→256→64) + output (64→65) + CE loss
-   is structurally identical to the MNIST 3-layer MLP kernel. This is the most tractable
-   Triton kernel to write. The attention part stays in JAX.
-2. **Full Triton kernel**: Fuse the entire forward pass including attention. Extremely
-   complex — attention creates (128,128) intermediate per head that doesn't fit in
-   registers. Would need tiled attention (Flash Attention style) within the kernel.
-3. **Reduce population with better gradients**: Guided ES or adaptive methods could
-   maintain quality at lower pop, directly reducing forward pass count.
-4. **fp8 for matmuls inside bf16 forward pass**: Use fp8 tensor cores for the linear
-   layers (Q/K/V, FFN, output proj). Keeps perturbation math in bf16/fp32.
+4. **Higher-rank perturbations**: Currently rank-1 (outer(b,a)). Try rank-2 or rank-4
+   perturbations for richer gradient information per evaluation.
 
-### Experimental ideas (uncertain payoff)
-- Learned perturbation directions (train a small network to generate perturbation vectors)
-- Sparse perturbation for embeddings (only perturb embedding rows that appear in the batch)
-- Different loss functions (InfoNCE, contrastive, mutual information)
-- Curriculum learning (easier sequences first)
+5. **Population scheduling**: Start with high pop (good exploration) and reduce over
+   epochs (exploitation). Invest compute where it matters most.
+
+6. **Gradient clipping on ES updates**: Clip the ES gradient norm before the momentum
+   step. May prevent occasional bad updates from high-variance estimates.
+
+7. **Learned perturbation directions**: Use a small auxiliary network or running
+   statistics to generate perturbation vectors biased toward productive directions.
+
+8. **Sparse perturbation for embeddings**: Only perturb token_emb rows that appear
+   in the current batch. Concentrates perturbation signal on relevant parameters.
+
+### Speed/memory improvements
+
+1. **FP8 tensor cores in kernel**: Use fp8 for matmuls (Q/K/V, FFN). 2x throughput.
+2. **Reduce population with better gradients**: If guided ES improves quality,
+   maintain val_loss at lower pop = directly faster.
+3. **Kernel autotuning**: Try different num_warps, num_stages, block sizes.
 
 ---
 
@@ -312,47 +198,29 @@ landscape. alpha=0.10 with momentum: 2.86. alpha=0.50 with momentum: 2.70.
 
 ```
 Model: decoder-only transformer
-d_model: 64
-n_heads: 2 (d_head=32)
-n_layers: 1
-d_ff: 256 (4x d_model)
-context_len: 128
-vocab_size: 65 (character-level)
+d_model: 64, n_heads: 2 (d_head=32), n_layers: 1, d_ff: 256
+context_len: 128, vocab_size: 65 (character-level Shakespeare)
 Parameters: 66,368
-Perturbation vec_dim: 2306 (28.8x compression)
+Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 ```
-
-Parameter breakdown:
-- token_emb (65, 64) = 4,160
-- pos_emb (128, 64) = 8,192
-- layer0.ln1 scale+bias = 128
-- layer0.attn Q/K/V/O (64, 64) × 4 = 16,384
-- layer0.ln2 scale+bias = 128
-- layer0.ffn.up (64, 256) + bias = 16,640
-- layer0.ffn.down (256, 64) + bias = 16,448
-- ln_final scale+bias = 128
-- output_proj (64, 65) = 4,160
-
-Data: tiny Shakespeare, 7842 train sequences × 128 tokens, 871 val sequences.
 
 ---
 
-## Best EGGROLL Hyperparameters
+## Best EGGROLL Hyperparameters (10 epochs)
 
 ```python
-HALF_POP = 1024         # antithetic pairs -> 2048 per round
-POP_CHUNK = 16          # vmap chunk size (16 is optimal for RTX 4080 SUPER)
-N_ACCUM = 2             # gradient accumulation -> effective pop=4096
+HALF_POP = 4096         # antithetic pairs -> pop=8192
 SIGMA_START = 0.04      # perturbation scale
 SIGMA_DECAY = 0.998     # per epoch
-LR_START = 0.012        # learning rate
-LR_DECAY = 0.92         # per epoch (exponential)
-ALPHA = 0.50            # label smoothing (CONSTANT, no decay)
-TEMPERATURE = 2.0       # CE temperature scaling
-MOMENTUM = 0.5          # SGD momentum for noisy ES gradients
+LR_START = 0.020        # learning rate
+LR_DECAY = 0.95         # per epoch (exponential)
+ALPHA = 0.50            # label smoothing (CONSTANT)
+TEMPERATURE = 2.0       # CE temperature
+MOMENTUM = 0.5          # SGD momentum
 N_SUBGROUPS = 8         # Winsorized z-score groups
 CLIP_RANGE = 2.0        # z-score clipping
-# Orthogonal perturbation vectors via QR decomposition
+N_ACCUM = 1             # gradient accumulation rounds
+# Gaussian vectors (QR when HALF_POP <= vec_dim)
 # Per-layer LR scaling: 3x small, 1.5x attn, 1.0x medium, 0.7x FFN
 ```
 
@@ -361,36 +229,32 @@ CLIP_RANGE = 2.0        # z-score clipping
 ## Setup
 
 1. `git checkout -b autoresearch/$(date +%Y%m%d-%H%M%S)`
-2. Read this file and `../eggroll_mnist/mnist_eggroll_optimized.py`
-3. Set up the project: `uv init --bare && uv add jax jaxlib numpy`
-4. Implement backprop baseline first (establishes the accuracy target)
-5. Implement EGGROLL training
-6. Begin the experiment loop
-
-**Important:** Always commit and push work to the autoresearch branch regularly.
+2. Read this file and `../eggroll_mnist/program.md` for reference
+3. `uv run benchmark.py` to get current baseline numbers
+4. Begin the experiment loop
 
 ---
 
 ## Experiment Loop
 
 ```
-1. Pick an idea (architecture change, hyperparameter, kernel optimization)
-2. Implement it
-3. git add -A && git commit -m "description" && git push
-4. uv run benchmark.py > run.log 2>&1
-5. Check results: loss, time, memory
+1. Pick an idea from "What to Try Next"
+2. Implement it in train_eggroll_triton.py (or kernels/)
+3. git add -A && git commit -m "description"
+4. uv run benchmark.py
+5. Check: did val_loss improve? Did time/memory stay reasonable?
 6. If crashed: fix and retry
-7. If improved: keep. If not: git reset --hard HEAD~1
-8. Log to results.tsv
+7. If improved: git push, update this file
+8. If not improved: git reset --hard HEAD~1, document in "What Did NOT Work"
 9. Go to step 1
 ```
 
-Never stop to ask if you should continue. The cost of a failed run is seconds.
+Never stop to ask. The cost of a failed run is ~4 minutes. Keep experimenting.
 
 ---
 
 ## Logging (results.tsv)
 
-Tab-separated, one row per run, NOT committed to git.
+Tab-separated, one row per run, append-only.
 
-Columns: `commit\tloss\tperplexity\ttraining_time_s\tpeak_memory_mb\tstatus\tdescription`
+Columns: `timestamp commit seed val_loss perplexity training_time_s peak_memory_mb status description`

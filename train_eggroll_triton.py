@@ -2,11 +2,14 @@
 
 Replaces vmap+scan with a single kernel launch per ES round that processes
 ALL perturbation members in parallel via the CUDA grid.
+
+Usage: uv run train_eggroll_triton.py [--seed SEED]
 """
 
 import os
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
+import argparse
 import time
 import jax
 import jax.numpy as jnp
@@ -17,26 +20,30 @@ from data import prepare_data
 from model import init_transformer, count_params
 from train_eggroll_optimized import build_param_spec
 
-# === architecture ===
+# ══════════════════════════════════════════════════════════════
+# LOCKED CONSTANTS — do not change. Validated by validate.py.
+# Changing these makes the comparison to backprop unfair.
+# ══════════════════════════════════════════════════════════════
 D_MODEL = 64
 N_HEADS = 2
 N_LAYERS = 1
 CONTEXT_LEN = 128
 BATCH_SIZE = 128
-EPOCHS = 100
-SEED = 42
+EPOCHS = 10          # LOCKED — same as backprop baseline
+TEMPERATURE = 2.0
 
-# === EGGROLL hyperparameters ===
+# ══════════════════════════════════════════════════════════════
+# TUNABLE HYPERPARAMETERS — optimize these freely
+# ══════════════════════════════════════════════════════════════
 HALF_POP = 4096
 SIGMA_START = 0.04
 SIGMA_DECAY = 0.998
-LR_START = 0.012
-LR_DECAY = 0.97
+LR_START = 0.020
+LR_DECAY = 0.95
 ALPHA = 0.50
-TEMPERATURE = 2.0
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
-MOMENTUM = 0.7
+MOMENTUM = 0.5
 N_ACCUM = 1
 
 
@@ -50,22 +57,18 @@ def winsorized_zscore(fitness_diffs):
     return z.reshape(-1)
 
 
-def train():
-    print("Preparing data...")
+def train(seed=42):
     data = prepare_data(context_len=CONTEXT_LEN)
     vocab_size = data["vocab_size"]
-    print(f"Vocab: {vocab_size}, Train: {data['train_x'].shape}, Val: {data['val_x'].shape}")
 
-    key = jax.random.key(SEED)
+    key = jax.random.key(seed)
     key, init_key = jax.random.split(key)
     params, config = init_transformer(
         init_key, vocab_size, d_model=D_MODEL, n_heads=N_HEADS,
         n_layers=N_LAYERS, context_len=CONTEXT_LEN,
     )
-    n_params = count_params(params)
     spec, total_vec_dim = build_param_spec(params)
     n_batches = len(data["train_x"]) // BATCH_SIZE
-    print(f"Params: {n_params:,}, Vec dim: {total_vec_dim}, Pop: {HALF_POP*2}, Batches: {n_batches}")
 
     train_x = jnp.array(data["train_x"])
     train_y = jnp.array(data["train_y"])
@@ -85,12 +88,9 @@ def train():
     from kernels.fused_transformer_ce import fused_transformer_ce_both
 
     def train_one_batch(params, momentum_buf, key, x, y, sigma, lr):
-        """One batch: N_ACCUM rounds of ES gradient -> average -> momentum update."""
-
         def one_es_round(carry, _):
             key_r = carry
             key_r, vec_key = jax.random.split(key_r)
-            # Orthogonal vectors via QR when possible, else Gaussian
             if HALF_POP <= total_vec_dim:
                 raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
                 Q, _ = jnp.linalg.qr(raw)
@@ -98,7 +98,6 @@ def train():
             else:
                 vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
-            # Fused Triton kernel: all perturbations + both signs in one launch
             ce_pos, ce_neg = fused_transformer_ce_both(
                 params["token_emb"], params["pos_emb"],
                 params["layer0.ln1.scale"], params["layer0.ln1.bias"],
@@ -109,14 +108,11 @@ def train():
                 params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
                 params["ln_final.scale"], params["ln_final.bias"],
                 params["output_proj"],
-                vecs, x, y,
-                sigma, ALPHA, TEMPERATURE,
+                vecs, x, y, sigma, ALPHA, TEMPERATURE,
             )
 
-            # Reduce: mean over batch
-            fp = ce_pos.sum(axis=1) / x.shape[0]  # (HALF_POP,)
+            fp = ce_pos.sum(axis=1) / x.shape[0]
             fn = ce_neg.sum(axis=1) / x.shape[0]
-
             diffs = fp - fn
             shaped = winsorized_zscore(diffs)
             scale = 1.0 / (2.0 * sigma * HALF_POP)
@@ -153,21 +149,24 @@ def train():
         logits = transformer_forward_batch(params, config, x)
         return cross_entropy_loss(logits, y)
 
+    # Print locked constants for validate.py
+    print("=== CONSTANTS ===")
+    print(f"D_MODEL: {D_MODEL}")
+    print(f"N_HEADS: {N_HEADS}")
+    print(f"N_LAYERS: {N_LAYERS}")
+    print(f"CONTEXT_LEN: {CONTEXT_LEN}")
+    print(f"BATCH_SIZE: {BATCH_SIZE}")
+    print(f"EPOCHS: {EPOCHS}")
+    print(f"TEMPERATURE: {TEMPERATURE}")
+    print("=" * 20)
+
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
 
-    # warmup
-    print("Warming up JIT...")
-    t0 = time.perf_counter()
-    _, _, _, wl = train_batch(params, momentum_buf, key, train_x[:BATCH_SIZE], train_y[:BATCH_SIZE], SIGMA_START, LR_START)
-    wl.block_until_ready()
-    jit_time = time.perf_counter() - t0
-    print(f"JIT warmup: {jit_time:.2f}s")
+    # Training (JIT warmup happens on first batch — included in timing)
+    t_start = time.perf_counter()
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
-
-    print("\nTraining...")
-    t_start = time.perf_counter()
 
     for epoch in range(EPOCHS):
         sigma, lr = sigmas[epoch], lrs_sched[epoch]
@@ -186,22 +185,28 @@ def train():
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={eloss:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
 
-    total = time.perf_counter() - t_start
     vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
     vl.block_until_ready()
     total = time.perf_counter() - t_start
     ppl = float(jnp.exp(vl))
-    print(f"\nFinal val_loss={float(vl):.4f}  ppl={ppl:.2f}")
-    print(f"Training: {total:.2f}s  (with JIT: {total+jit_time:.2f}s)")
+    val_loss = float(vl)
 
-    from train_backprop import generate_sample
-    generate_sample(params, config, data, key)
-    return float(vl), ppl, total + jit_time
+    # Measure peak memory
+    mem_stats = jax.local_devices()[0].memory_stats()
+    peak_mb = mem_stats["peak_bytes_in_use"] / 1e6 if mem_stats else 0.0
+
+    print("=== RESULTS ===")
+    print(f"val_loss: {val_loss:.4f}")
+    print(f"perplexity: {ppl:.2f}")
+    print(f"training_time_s: {total:.1f}")
+    print(f"peak_memory_mb: {peak_mb:.0f}")
+    print("=" * 20)
+
+    return val_loss, ppl, total
 
 
 if __name__ == "__main__":
-    loss, ppl, t = train()
-    import subprocess
-    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
-    with open("results.tsv", "a") as f:
-        f.write(f"{commit}\t{loss:.4f}\t{ppl:.2f}\t{t:.2f}\t0\tok\teggroll_triton fused kernel pop={HALF_POP*2} accum={N_ACCUM}\n")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    train(seed=args.seed)
