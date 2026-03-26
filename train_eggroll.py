@@ -175,20 +175,14 @@ def train(seed=42):
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
 
-    # LR schedule: linear warmup for 2 epochs, then cosine decay
+    # LR schedule: cosine decay from LR_MAX to LR_MIN (no warmup)
     import math
-    WARMUP_EPOCHS = 2
     LR_MAX = 0.020
     LR_MIN = 0.002
     lrs_sched = []
     for e in range(EPOCHS):
-        if e < WARMUP_EPOCHS:
-            # Linear warmup from LR_MIN to LR_MAX
-            lrs_sched.append(LR_MIN + (LR_MAX - LR_MIN) * (e + 1) / WARMUP_EPOCHS)
-        else:
-            # Cosine decay from LR_MAX to LR_MIN
-            progress = (e - WARMUP_EPOCHS) / (EPOCHS - WARMUP_EPOCHS)
-            lrs_sched.append(LR_MIN + (LR_MAX - LR_MIN) * 0.5 * (1 + math.cos(math.pi * progress)))
+        progress = e / (EPOCHS - 1)
+        lrs_sched.append(LR_MIN + (LR_MAX - LR_MIN) * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
     for epoch in range(EPOCHS):
