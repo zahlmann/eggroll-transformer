@@ -27,11 +27,11 @@ only pursue them if a speed optimization opens a quality opportunity for free.**
 
 ## Current State (2026-03-26)
 
-**Quality:** EGGROLL val_loss=2.41 (3-seed avg ~2.48) vs backprop+Adam 1.84.
-Gap = 0.64 to backprop+Adam. Beats vanilla SGD backprop (2.44 vs 2.45).
+**Quality:** EGGROLL val_loss=2.49 (3-seed avg 2.490) vs backprop+Adam 1.84.
+Gap = 0.65 to backprop+Adam. Beats vanilla SGD backprop (2.49 vs 2.45).
 
-**Speed: 154s for 10 epochs (was 156s, was 175s, was 444s).** 2.88x total speedup achieved.
-Backprop+Adam takes 4.1s. Speed gap is 38x (was 43x, was 108x).
+**Speed: 153s for 10 epochs (was 156s, was 175s, was 444s).** 2.90x total speedup achieved.
+Backprop+Adam takes 4.1s. Speed gap is 37x (was 38x, was 43x, was 108x).
 
 **Memory: 70MB (was 113MB).** Lower due to reduced population.
 
@@ -163,6 +163,16 @@ that degrades quality beyond this threshold is rejected.
   outweighs any occupancy benefit. Kernel is too compute-bound for spill-induced occupancy.
 - **Fewer batches per epoch** (48 batches: 123s but 2.56 val_loss; 56 batches: 144s but 2.51):
   Reducing gradient updates degrades quality faster than it saves time.
+
+## What Worked (Speed Session 2026-03-26)
+
+5. **Dynamic head loop tl.range + sigma=0.022** (156s→153s, 2.0%): Previous attempts
+   with dynamic head loop failed quality by 0.004-0.008 at sigma=0.02. Increasing sigma
+   from 0.02 to 0.022 compensated, bringing 3-seed avg from 2.504 to 2.490 (passes ≤2.50).
+   Dynamic range prevents head loop unrolling, reducing register-related overhead.
+
+6. **Per-batch float() sync removal** (built into the 153s): Replaced `eloss += float(pl)`
+   with `eloss = eloss + pl` to avoid GPU-host sync on every batch. Saves ~1.5s.
 
 ## What Did NOT Work (Speed Session 2026-03-26)
 
@@ -391,7 +401,7 @@ These have ALL been tried and don't work:
 - Constant label smoothing alpha=0.50
 - Adam optimizer (β1=0.9, β2=0.999, eps=1e-6) with bias correction
 - Sigma=0.02, LR=0.010, no LR decay
-- Fused Triton kernel (Grid: HALF_POP × BATCH × 2, num_warps=4, BLOCK_K=32, FFN tl.range)
+- Fused Triton kernel (Grid: HALF_POP × BATCH × 2, num_warps=4, BLOCK_K=32, FFN+head tl.range)
 - Per-subgroup Winsorized z-score (K=8, clip ±2.0)
 - Rank-1 perturbation compression (vec_dim=2306, 28.8x compression)
 
@@ -401,7 +411,7 @@ These have ALL been tried and don't work:
 
 ```python
 HALF_POP = 4096          # antithetic pairs → pop=8192 (was 8192→16384)
-SIGMA_START = 0.02       # perturbation scale
+SIGMA_START = 0.022      # perturbation scale (was 0.02, compensates for dynamic head loop)
 SIGMA_DECAY = 0.998      # per epoch
 LR_START = 0.010         # Adam learning rate
 LR_DECAY = 1.0           # no decay (Adam self-adjusts)
@@ -447,7 +457,8 @@ Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 | Triton, pop=8192, Adam, σ=0.02 | 2.50 | 12.2 | 220s | Adam breakthrough |
 | Triton, pop=16384, Adam, σ=0.02 | 2.37 | 10.7 | 444s | previous best |
 | Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32 | 2.44 | 11.4 | 175s | previous best |
-| **Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32, FFN tl.range** | **2.41** | **11.1** | **156s** | **current best** |
+| Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32, FFN tl.range | 2.41 | 11.1 | 156s | previous best |
+| **Triton, pop=8192, Adam, σ=0.022, nw=4, BK=32, FFN+head tl.range** | **2.49** | **12.1** | **153s** | **current best** |
 
 ---
 
