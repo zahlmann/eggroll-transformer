@@ -48,7 +48,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
-HALF_POP = 8192
+HALF_POP = 16384
 SIGMA_START = 0.008
 SIGMA_DECAY = 0.998
 LR_START = 0.005
@@ -171,7 +171,7 @@ def train(seed=42):
     step = jnp.int32(0)
 
     # Backprop warmup epoch (gives EGGROLL a better starting point)
-    BACKPROP_WARMUP = 5
+    BACKPROP_WARMUP = 7
     BP_LR = 3e-3
 
     @jax.jit
