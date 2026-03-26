@@ -405,6 +405,15 @@ These have ALL been tried and don't work:
 - AdamW weight decay=0.01 with α=0.30: 2.51, no improvement
 - Smaller init scale 0.5x: 2.60, model learns slower from flat region
 - Hybrid backprop warmup: REJECTED by user — pure EGGROLL only
+- At HALF_POP=7168: sigma=0.018 (2.48), sigma=0.022 (2.35), sigma=0.025 (2.46) — 0.020 is optimal
+- At HALF_POP=7168: LR=0.008 (2.44), LR=0.012 (2.40) — 0.010 still optimal
+- At HALF_POP=7168: N_SUBGROUPS=4 (2.32), N_SUBGROUPS=16 (2.32) — insensitive
+- EMA parameter averaging (decay=0.99, 0.999): both worse — trajectory still descending
+- SWA last-3-epochs averaging: worse (2.34 vs 2.31) — trajectory still descending
+- Adam beta2=0.9999: same as 0.999, no impact
+- Adam eps=1e-8: slightly worse than 1e-6
+- HALF_POP=3584 with 2x data passes: 2.42, worse than 7168×1 (gradient quality > quantity)
+- HALF_POP=8192 at sigma=0.020: 2.41 at 314s (over budget and seed-noisy)
 
 ---
 
