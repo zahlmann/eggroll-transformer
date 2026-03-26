@@ -311,14 +311,15 @@ The model starts from random initialization. Better init might give EGGROLL a he
 - **Fixup init**: scale residual connections to prevent gradient explosion
 - **Smaller init scale**: ES works better when the loss landscape is smoother (smaller weights)
 
-### Approach 8 — Hybrid Training
+### Approach 8 — Hybrid Training — REJECTED
 
-Use backprop for the FIRST epoch (4.1s) to get a good starting point, then switch to
-EGGROLL for epochs 2-10. This gives EGGROLL a massive head start on structure learning.
+**DO NOT USE hybrid backprop warmup.** User explicitly rejected this approach. The goal is
+pure EGGROLL (evolution strategies) quality, not backprop-assisted training.
 
-**Fairness concern**: This uses backprop, which technically defeats the purpose. But if the
-goal is "best quality with mostly ES training," a 1-epoch backprop warmup is a valid strategy.
-Document clearly if used.
+Tested results (for reference): 5 BP warmup + 5 EGGROLL at HALF_POP=8192 achieved
+3-seed avg 2.204 (vs pure EGGROLL 2.49). But the improvement came from backprop, not
+from EGGROLL improving — EGGROLL actually degraded the BP-trained model before partially
+recovering. This approach is off-limits.
 
 ### Approach 9 — Adam Hyperparameter Tuning
 
@@ -384,6 +385,20 @@ These have ALL been tried and don't work:
 - HALF_POP=3840/3968/4032 with dynamic head + sigma 0.022-0.028 (3-seed avg 2.51-2.53, FAIL)
 - Adaptive label smoothing α_decay=0.70 (val_loss 2.72, quality destroyed)
 - Adaptive label smoothing α_decay=0.95 (val_loss 2.47 at seed=42, worse than constant α=0.50)
+- Constant alpha=0.20 (2.56), alpha=0.25 (2.53), alpha=0.35 (2.52) — all worse than α=0.50 baseline
+- Constant alpha=0.30 (2.49) — matches baseline, no improvement
+- LR=0.015 constant (2.64 with oscillation), LR=0.005 constant (2.55 still declining) — 0.010 is optimal
+- Warmup+cosine LR schedule (LR_MAX=0.020, warmup 2 epochs): 2.59, warmup wastes early epochs
+- Cosine LR decay (0.020→0.002): 2.59, high initial LR hurts ES convergence
+- Aggressive sigma schedule (0.04→0.85^epoch): 2.66, early epochs too noisy
+- Cosine sigma schedule (0.03→0.01): 2.57, start too noisy
+- Hybrid QR orthogonal perturbations at HALF_POP=4096 (2306 ortho + 1790 random): 2.50, no improvement
+- Pure QR HALF_POP=2304: 2.57 at 94s, faster but worse quality
+- Guided ES (bias perturbations toward prev gradient, GUIDE_SCALE=0.3): 2.78, catastrophic
+- Momentum β1=0.95: 2.51, too much smoothing for 10 epochs
+- AdamW weight decay=0.01 with α=0.30: 2.51, no improvement
+- Smaller init scale 0.5x: 2.60, model learns slower from flat region
+- Hybrid backprop warmup: REJECTED by user — pure EGGROLL only
 
 ---
 
