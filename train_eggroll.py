@@ -53,12 +53,13 @@ SIGMA_START = 0.022
 SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
-ALPHA = 0.25
+ALPHA = 0.30
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
+WEIGHT_DECAY = 0.01
 
 
 def winsorized_zscore(fitness_diffs):
@@ -141,7 +142,7 @@ def train(seed=42):
             # Bias correction
             m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
             v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
-            new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
+            new_params[pkey] = params[pkey] * (1 - lr * WEIGHT_DECAY) - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
         return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
 
