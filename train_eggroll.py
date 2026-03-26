@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 
 from data import prepare_data
-from model import init_transformer, count_params
+from model import init_transformer, transformer_forward_batch, cross_entropy_loss, count_params
 def build_param_spec(params):
     """Build perturbation vector spec from model params (alphabetical key order)."""
     spec = []
@@ -81,9 +81,6 @@ def train(seed=42):
         init_key, vocab_size, d_model=D_MODEL, n_heads=N_HEADS,
         n_layers=N_LAYERS, context_len=CONTEXT_LEN,
     )
-    # Scale down init for smoother loss landscape (helps ES)
-    INIT_SCALE = 0.5
-    params = {k: v * INIT_SCALE for k, v in params.items()}
     spec, total_vec_dim = build_param_spec(params)
     n_batches = len(data["train_x"]) // BATCH_SIZE
 
@@ -172,8 +169,49 @@ def train(seed=42):
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
     v_buf = jax.tree.map(jnp.zeros_like, params)
     step = jnp.int32(0)
+
+    # Backprop warmup epoch (gives EGGROLL a better starting point)
+    BACKPROP_WARMUP = 1
+    BP_LR = 3e-3
+
+    @jax.jit
+    def bp_loss_fn(params, x, y):
+        logits = transformer_forward_batch(params, config, x)
+        return cross_entropy_loss(logits, y)
+
+    @jax.jit
+    def bp_step(params, bp_m, bp_v, bp_t, x, y):
+        loss, grads = jax.value_and_grad(bp_loss_fn)(params, x, y)
+        bp_t_new = bp_t + 1
+        new_params = {}
+        new_m = {}
+        new_v = {}
+        for k in params:
+            new_m[k] = 0.9 * bp_m[k] + 0.1 * grads[k]
+            new_v[k] = 0.999 * bp_v[k] + 0.001 * grads[k] ** 2
+            m_hat = new_m[k] / (1 - 0.9 ** bp_t_new)
+            v_hat = new_v[k] / (1 - 0.999 ** bp_t_new)
+            new_params[k] = params[k] - BP_LR * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+        return new_params, new_m, new_v, bp_t_new, loss
+
     # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
+
+    # Run backprop warmup
+    bp_m = jax.tree.map(jnp.zeros_like, params)
+    bp_v = jax.tree.map(jnp.zeros_like, params)
+    bp_t = jnp.int32(0)
+    for wp_epoch in range(BACKPROP_WARMUP):
+        key, sk = jax.random.split(key)
+        perm = jax.random.permutation(sk, len(data["train_x"]))
+        sx, sy = train_x[perm], train_y[perm]
+        for bi in range(n_batches):
+            s = bi * BATCH_SIZE
+            params, bp_m, bp_v, bp_t, _ = bp_step(
+                params, bp_m, bp_v, bp_t, sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE])
+        vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
+        print(f"  BP warmup {wp_epoch+1}/{BACKPROP_WARMUP}  val_loss={float(vl):.4f}")
+    del bp_m, bp_v, bp_t
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
