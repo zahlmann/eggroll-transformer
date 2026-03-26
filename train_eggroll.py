@@ -48,7 +48,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
-HALF_POP = 2306  # = vec_dim: exactly covers parameter space with orthogonal basis
+HALF_POP = 2304  # ~vec_dim (2306), divisible by N_SUBGROUPS=8, uses QR orthogonal
 SIGMA_START = 0.022
 SIGMA_DECAY = 0.998
 LR_START = 0.010
