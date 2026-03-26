@@ -25,12 +25,12 @@ only pursue them if a speed optimization opens a quality opportunity for free.**
 
 ---
 
-## Current State (2026-03-25)
+## Current State (2026-03-26)
 
 **Quality:** EGGROLL val_loss=2.41 (3-seed avg ~2.48) vs backprop+Adam 1.84.
 Gap = 0.64 to backprop+Adam. Beats vanilla SGD backprop (2.44 vs 2.45).
 
-**Speed: 156s for 10 epochs (was 175s, was 444s).** 2.85x total speedup achieved.
+**Speed: 154s for 10 epochs (was 156s, was 175s, was 444s).** 2.88x total speedup achieved.
 Backprop+Adam takes 4.1s. Speed gap is 38x (was 43x, was 108x).
 
 **Memory: 70MB (was 113MB).** Lower due to reduced population.
@@ -164,6 +164,27 @@ that degrades quality beyond this threshold is rejected.
 - **Fewer batches per epoch** (48 batches: 123s but 2.56 val_loss; 56 batches: 144s but 2.51):
   Reducing gradient updates degrades quality faster than it saves time.
 
+## What Did NOT Work (Speed Session 2026-03-26)
+
+- **Sequence-tiled kernel (SEQ_TILE=64)**: Split 128 positions into two 64-position tiles.
+  Tile 0 achieved 240 regs/thread (2 blocks/SM!) and 139ms. Tile 1 with FlashAttention
+  recompute stuck at 255 regs/thread (1 block/SM), 151ms. Total 290ms > original 243ms.
+  ROOT CAUSE: two-kernel launches add overhead, and smaller matmuls (64×64 vs 128×128)
+  have lower arithmetic intensity, negating the occupancy benefit. Even tile 0 at 2 blocks/SM
+  is SLOWER per-position than the original at 1 block/SM.
+- **Restructured tile 1 liveness** (compute K_lower/V_lower → stage 1 → K_upper/V_upper → stage 2):
+  Still 255 regs — compiler can't reduce below max even with optimal variable ordering.
+- **Dynamic head loop for tile 1** (tl.range vs tl.static_range): Reduced tile 1 from 228ms
+  to 151ms (no unrolling overhead) but registers stayed at 255.
+- **Local attention for tile 1** (no cross-tile attention): val_loss=2.89, quality destroyed.
+  Also 178s total — slower due to two-kernel overhead.
+- **jax.lax.scan epoch loop** (compile entire epoch as single XLA graph): 154.0s, no improvement.
+  Per-batch dispatch overhead is ~0.1ms, negligible vs 250ms kernel time. MNIST benefited
+  because per-batch time was ~1ms. Doesn't transfer to expensive kernel.
+- **Per-batch float() sync removal** (156s → 154s, 1.3% speedup): Marginal improvement from
+  removing GPU-host synchronization on every batch. Accumulated proxy loss as JAX array
+  instead of converting to Python float.
+
 ## What IS Ready (for next session)
 
 - **CUDA kernel infrastructure**: Full kernel in `kernels/cuda/fused_transformer_ce.cu`
@@ -181,11 +202,17 @@ that degrades quality beyond this threshold is rejected.
 
 **The kernel is at ~47% of bf16 tensor core peak.** 255 regs/thread, 0 spills, 1 block/SM.
 Forced spilling (maxnreg) makes things worse — the kernel is too compute-bound.
-The only path to 2 blocks/SM is reducing ACTUAL register usage, not capping it.
 
-**Key constraint:** The (128, 128) attention score matrix uses 128 regs/thread (50% of budget).
-Triton can't slice register-resident tensors (no row indexing), so tiling Q requires
-computing everything from scratch per tile. tl.gather was already tried and adds 8% overhead.
+**CRITICAL FINDING (2026-03-26): Sequence tiling CANNOT beat the original kernel.** Even when
+tile 0 achieves 2 blocks/SM (240 regs), the per-position throughput is WORSE than 1 block/SM
+with full 128-position blocks. Reason: smaller matmuls (64×64 vs 128×128) have lower
+arithmetic intensity, reducing tensor core utilization. The optimal block size for this
+architecture is 128 positions with 1 block/SM. Further Triton optimizations are near impossible.
+
+**Remaining paths to speed are:**
+1. CUDA with PTX mma.sync (manual register control, bypass Triton's register allocator)
+2. Algorithmic changes (different ES variant, different gradient estimator)
+3. Accept current speed and focus on quality improvements instead
 
 ## What to Try Next — Triton Kernel (for next agent)
 
@@ -350,6 +377,11 @@ These have ALL been tried and don't work:
 - BLOCK_K=64 with dynamic FFN loop (168.7s, slower, larger tiles increase register pressure)
 - num_warps=8 with dynamic FFN loop (197.1s, much slower)
 - Fewer batches per epoch (48: quality fails; 56: borderline fail at 2.51 3-seed)
+- Sequence-tiled kernel SEQ_TILE=64 (tile 0: 240 regs/139ms, tile 1: 255 regs/151ms, total 290ms > 243ms baseline)
+- Sequence-tiled with local attention (val_loss=2.89, quality destroyed, also slower at 178s)
+- FlashAttention recompute for tile 1 with restructured liveness (still 255 regs)
+- Dynamic head loop for tile 1 only (151ms but still 255 regs)
+- jax.lax.scan epoch loop (154s, no improvement — dispatch overhead negligible vs kernel time)
 
 ---
 
