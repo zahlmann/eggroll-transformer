@@ -59,7 +59,7 @@ CLIP_RANGE = 2.0
 MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
-EMA_DECAY = 0.99  # Polyak averaging of parameters
+EMA_DECAY = 0.999  # Polyak averaging of parameters
 
 
 def winsorized_zscore(fitness_diffs):
