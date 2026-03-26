@@ -48,7 +48,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
-HALF_POP = 3584
+HALF_POP = 8192
 SIGMA_START = 0.020
 SIGMA_DECAY = 0.998
 LR_START = 0.010
@@ -181,17 +181,16 @@ def train(seed=42):
         key, sk = jax.random.split(key)
         perm = jax.random.permutation(sk, len(data["train_x"]))
         sx, sy = train_x[perm], train_y[perm]
-        DATA_PASSES = 2  # process each batch twice with different perturbations
         eloss = jnp.float32(0.0)
-        for bi in range(n_batches * DATA_PASSES):
-            s = (bi % n_batches) * BATCH_SIZE
+        for bi in range(n_batches):
+            s = bi * BATCH_SIZE
             params, momentum_buf, v_buf, step, key, pl = train_batch(
                 params, momentum_buf, v_buf, step, key,
                 sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
-        print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/(n_batches*DATA_PASSES):.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
+        print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
 
     vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
     vl.block_until_ready()
