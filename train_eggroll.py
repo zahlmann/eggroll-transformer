@@ -49,7 +49,7 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 8192
-SIGMA_START = 0.006
+SIGMA_START = 0.008
 SIGMA_DECAY = 0.998
 LR_START = 0.005
 LR_DECAY = 1.0  # no decay for Adam
@@ -211,7 +211,10 @@ def train(seed=42):
                 params, bp_m, bp_v, bp_t, sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE])
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         print(f"  BP warmup {wp_epoch+1}/{BACKPROP_WARMUP}  val_loss={float(vl):.4f}")
-    del bp_m, bp_v, bp_t
+    # Transfer BP Adam state to EGGROLL (don't reset optimizer)
+    momentum_buf = bp_m
+    v_buf = bp_v
+    step = bp_t
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
