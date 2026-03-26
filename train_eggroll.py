@@ -59,7 +59,6 @@ CLIP_RANGE = 2.0
 MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
-EMA_DECAY = 0.999  # Polyak averaging of parameters
 
 
 def winsorized_zscore(fitness_diffs):
@@ -169,7 +168,6 @@ def train(seed=42):
 
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
     v_buf = jax.tree.map(jnp.zeros_like, params)
-    ema_params = jax.tree.map(jnp.copy, params)  # EMA shadow copy
     step = jnp.int32(0)
 
     # Training (JIT warmup happens on first batch — included in timing)
@@ -189,16 +187,12 @@ def train(seed=42):
             params, momentum_buf, v_buf, step, key, pl = train_batch(
                 params, momentum_buf, v_buf, step, key,
                 sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
-            # Update EMA shadow parameters
-            ema_params = jax.tree.map(
-                lambda e, p: EMA_DECAY * e + (1 - EMA_DECAY) * p,
-                ema_params, params)
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
-        vl = eval_loss(ema_params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
+        vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
 
-    vl = eval_loss(ema_params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
+    vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
     vl.block_until_ready()
     total = time.perf_counter() - t_start
     ppl = float(jnp.exp(vl))
