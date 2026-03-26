@@ -57,8 +57,8 @@ ALPHA = 0.50
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.9
-ADAM_BETA2 = 0.9999
-ADAM_EPS = 1e-6
+ADAM_BETA2 = 0.999
+ADAM_EPS = 1e-8
 
 
 def winsorized_zscore(fitness_diffs):
