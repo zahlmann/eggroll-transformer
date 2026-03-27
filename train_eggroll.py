@@ -129,21 +129,13 @@ def train(seed=42):
         key, vec_key = jax.random.split(key)
         vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
-        # Build batched tangent dict for vmap
-        batched_tangent = {}
-        for pkey, shape, offset, vec_dim, is_2d in spec:
-            if is_2d:
-                m, n = shape
-                u = vecs[:, offset:offset+m]
-                w = vecs[:, offset+m:offset+m+n]
-                batched_tangent[pkey] = u[:, :, None] * w[:, None, :]
-            else:
-                batched_tangent[pkey] = vecs[:, offset:offset+vec_dim]
+        # Compute directional derivatives via lax.scan (sequential, memory-efficient)
+        def scan_body(carry, v):
+            tangent = vec_to_tangent(v)
+            dloss = compute_jvp(carry, tangent, x, y)
+            return carry, dloss
 
-        # Compute all directional derivatives via vmapped JVP
-        dlosses = jax.vmap(
-            lambda t: compute_jvp(params, t, x, y)
-        )(batched_tangent)
+        _, dlosses = jax.lax.scan(scan_body, params, vecs)
 
         # Normalize directional derivatives (like winsorized z-score for ES)
         shaped = winsorized_zscore(dlosses)
