@@ -48,7 +48,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 # TUNABLE HYPERPARAMETERS
 # ══════════════════════════════════════════════════════════════
-N_DIRS = 4096        # perturbation directions (no antithetic pairs needed)
+N_DIRS = 7168        # match finite-diff HALF_POP for quality comparison
 LR_START = 0.010
 LR_DECAY = 1.0
 ALPHA = 0.50
