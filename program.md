@@ -422,6 +422,12 @@ These have ALL been tried and don't work:
   WORSE than rank-1 — higher dimensionality (66K vs 2306) means sparser gradient coverage per
   direction. Rank-1 compression is a feature, not a bug, for ES sample efficiency.
 - Forward-mode AD with chunked vmap (64/chunk): 3.6GB memory, 151s. OOM at full vmap (256).
+- **Dual-number Triton kernel** (fused forward-mode AD): tangent accuracy 1.00±0.04 vs jax.jvp.
+  At N_DIRS=7168: val_loss=2.42 at 354s (vs finite-diff 2.31 at 272s). 0.11 worse + 30% slower.
+  Root cause: accumulated bf16 precision loss through ~10 tangent matmuls. Finite differences
+  benefit from antithetic pairing (+σ/-σ) which cancels common-mode bf16 rounding errors.
+  The dual kernel is a technically correct implementation but loses to finite differences
+  at bf16 precision on this small model. Code in kernels/fused_transformer_ce_dual.py.
 
 ---
 
