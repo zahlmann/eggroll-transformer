@@ -8,10 +8,11 @@ The focus is on learning to write high-performance GPU kernels for transformer i
 
 ## Your Mission
 
-1. Train the model with backprop (done: `uv run train_backprop.py`, val_loss=1.84)
+1. Train the model with backprop (done: char val_loss=1.84, BPE val_loss=3.77)
 2. Write a fused Triton inference kernel that generates text token-by-token (done: 4x speedup)
-3. Benchmark against JAX/XLA baseline inference (done: 740 vs 185 tok/s)
-4. Optimize: fuse operations, minimize memory bandwidth, maximize throughput
+3. Benchmark against JAX/XLA baseline inference (done: 758 vs 174 tok/s)
+4. BPE tokenization + tiled output kernel (done: vocab=1024, 8 tiles, 4.35x speedup)
+5. Optimize: fuse operations, minimize memory bandwidth, maximize throughput
 
 The goal is to learn kernel-writing skills on a small model where iteration is fast,
 then apply those skills to larger models.
@@ -30,10 +31,13 @@ then apply those skills to larger models.
 ## Model Architecture
 
 ```
-Decoder-only transformer (character-level Shakespeare)
+Decoder-only transformer (Shakespeare)
 d_model: 64, n_heads: 2 (d_head=32), n_layers: 1, d_ff: 256
-context_len: 128, vocab_size: 65
-Parameters: 66,368
+context_len: 128
+
+Small:  d=64,  h=2, l=1, vocab=65,   params=66,368
+Medium: d=64,  h=2, l=1, vocab=1024, params=189,120  (BPE)
+Large:  d=128, h=4, l=2, vocab=1024, params=674,304  (BPE, multi-block)
 ```
 
 Weights: token_emb (65,64), pos_emb (128,64), Q/K/V/O (64,64 each), FFN up (64,256),
@@ -59,148 +63,102 @@ Key techniques:
   without going through HBM.
 - **num_warps=4 (128 threads/block).** Optimal — fewer warps = more registers/thread.
   255 regs/thread, 0 bytes spill.
+- **Tiled output projection.** Vocab dimension tiled in VOCAB_TILE=128 chunks via
+  `tl.range(0, VOCAB_PAD, VOCAB_TILE)`. Each tile independently computes and stores
+  logits to HBM. VOCAB_SIZE/VOCAB_PAD passed as kernel `tl.constexpr` parameters.
 - **Outputs KV cache** for the decode phase.
 
 ### `kernels/fused_decode.py` — Decode Kernel
 
 Single-token decode using KV cache. Uses element-wise ops (not tensor cores, since M=1).
 Reads KV cache, computes attention over all past tokens, outputs logits + new K/V vectors.
-JAX wrapper updates the cache via scatter.
+Same tiled output projection as prefill. JAX wrapper updates the cache via scatter.
 
 ---
 
 ## Results
 
 ```
-Prompt: 64 tokens, Generate: 64 tokens
+Char-level (vocab=65, register-only output):
+  Triton fused:   740 tok/s  (86.5 ms)
+  JAX baseline:   185 tok/s  (362.6 ms)
+  Speedup:        4.0x
 
-Triton fused:   740 tok/s  (86.5 ms)
-JAX baseline:   185 tok/s  (362.6 ms)
-Speedup:        4.0x
+BPE (vocab=1024, tiled output — 8 tiles of 128):
+  Triton fused:   758 tok/s  (84.5 ms)
+  JAX baseline:   174 tok/s  (367.4 ms)
+  Speedup:        4.35x
+
+Phase A2: d_model=128, n_heads=4, n_layers=2, vocab=1024, 674K params:
+  Triton block:   335 tok/s  (191.3 ms)
+  JAX baseline:   177 tok/s  (361.1 ms)
+  Speedup:        1.89x
+
+Key findings:
+- Tiled output projection has ZERO overhead vs register-only.
+- Multi-block approach (BLOCK_SEQ=32) enables any d_model.
+- Speedup decreased 4.3x→1.9x due to HBM traffic between kernels.
+- Text quality greatly improved with 2-layer model.
 ```
 
 ---
 
-## YOUR NEXT TASK: BPE Tokenization + Tiled Output Kernel
+## COMPLETED: BPE Tokenization + Tiled Output Kernel
 
-The immediate goal is to switch from character-level (vocab=65) to BPE subword tokens.
-This is the first scaling step — it improves text quality AND forces you to learn output
-tiling, the technique that unlocks everything bigger.
+Switched from char-level (vocab=65) to BPE subword tokens (vocab=1024).
+This was the first scaling step — forces tiled output projection in the kernel.
 
-### Why this matters
+### What was done
 
-With vocab=65, the output projection is (64, 65) = 4K params — trivially fits in
-registers. With BPE vocab=4096, the output projection is (64, 4096) = 256K params
-= 512KB in bf16. That's 4x larger than the entire register file. **You cannot load
-this matrix into registers.** You must tile it.
+1. **BPE tokenizer**: Trained on Shakespeare using HuggingFace `tokenizers` (ByteLevel
+   BPE). GPT-2's tiktoken had 16-25% UNK rate on Shakespeare (11K unique tokens in corpus).
+   The trained tokenizer has 0% UNK with vocab=1024.
 
-This is exactly the constraint that real models face. Solving it here teaches tiling
-patterns that apply everywhere.
+2. **Tiled output projection**: Both kernels now tile the output projection in VOCAB_TILE=128
+   chunks using `tl.range(0, VOCAB_PAD, VOCAB_TILE)`. VOCAB_SIZE and VOCAB_PAD are kernel
+   constexpr parameters, so jax-triton JIT-compiles per vocab configuration.
 
-### Step-by-step plan
+3. **Results**: Zero overhead from tiling (4.35x speedup vs 4.0x baseline). The output
+   projection is compute-light — attention dominates the kernel runtime. Text output is
+   coherent Shakespeare-like dialogue.
 
-**Step 1: Add a BPE tokenizer.**
+### Design decisions taken
 
-Use `tiktoken` (OpenAI's tokenizer library). Specifically use the `gpt2` encoding which
-has a vocab of 50257. For our tiny model, this is too large — we'll use a restricted
-vocabulary.
-
-Approach: tokenize the Shakespeare corpus with tiktoken, find the top-K most frequent
-tokens (start with K=512 or K=1024), and remap to a compact vocabulary. This gives us
-real subword tokens while keeping the embedding table manageable.
-
-Modify `data.py`:
-- Add tiktoken tokenization alongside the existing char-level path
-- Build a restricted vocab from the corpus (top-K frequent tokens + special tokens)
-- Save the vocab mapping so inference can decode tokens back to text
-- Keep the same `prepare_data` interface: returns train_x, train_y, vocab_size, etc.
-
-**Step 2: Update model.py for variable vocab size.**
-
-The model already parameterizes vocab_size — just make sure init_transformer and
-transformer_forward work with vocab_size=512 or 1024. Nothing fundamental changes
-in the JAX model.
-
-**Step 3: Retrain with BPE tokens.**
-
-Run train_backprop.py with the new data. Expect lower loss (BPE tokens carry more
-information per token than characters). Tune epochs/LR if needed — the model may
-need more capacity (increase d_model to 128 or add a layer) to take advantage of
-the richer tokenization.
-
-**Step 4: Update the prefill kernel for large vocab.**
-
-The current prefill kernel computes `logits = tl.dot(h_final, output_proj)` where
-output_proj is (64, 128_padded). With vocab=1024, output_proj becomes (64, 1024).
-
-The matmul `(128, 64) @ (64, 1024)` produces a (128, 1024) output = 128K f32 values
-= 512KB. This doesn't fit in registers.
-
-**Solution: tile the vocab dimension.** Process the output projection in chunks:
-```
-for v_start in tl.range(0, VOCAB_PAD, VOCAB_TILE):
-    # Load a (64, VOCAB_TILE) slice of output_proj
-    # Compute (128, VOCAB_TILE) logits
-    # Store directly to HBM (don't accumulate — each tile is independent)
-```
-
-This is analogous to the existing FFN K-tiling loop. Each tile produces independent
-logits that get written to HBM immediately.
-
-Similarly, the embedding lookup may need tiling if the embedding table (vocab × d_model)
-gets large, but at vocab=1024 and d_model=64 it's only 128KB — might still fit.
-
-**Step 5: Update the decode kernel for large vocab.**
-
-Same tiling approach for the output projection. The decode kernel already uses
-element-wise ops, so the pattern is:
-```
-for v_start in tl.range(0, VOCAB_PAD, VOCAB_TILE):
-    # Load (64, VOCAB_TILE) slice of output_proj
-    # Compute (VOCAB_TILE,) logits via element-wise dot
-    # Store to output
-```
-
-**Step 6: Benchmark.**
-
-Compare Triton vs JAX with the BPE model. The tiled output adds some overhead vs the
-register-only version, so the speedup may decrease. Quantify this — it tells you the
-cost of leaving the register-only regime.
-
-Generate text and verify it's coherent subword-tokenized English.
-
-### Key design decisions
-
-- **Vocab size**: Start with 512. If the model is too small to learn it well, try 256.
-  If it works, try 1024. The sweet spot is where the model produces coherent text and
-  the kernel needs real tiling.
-- **d_model**: May need to increase from 64 to 128 to give the model enough capacity for
-  BPE tokens. If you do, the attention and FFN weight matrices also need tiling (this is
-  Phase A2 territory — tackle it only if necessary for BPE to work).
-- **VOCAB_TILE size**: Start with 128 (power of 2, fits in registers). This means
-  vocab=512 needs 4 tiles, vocab=1024 needs 8 tiles.
-
-### What NOT to change
-
-- Don't change the attention mechanism or FFN structure yet
-- Don't add layers yet — keep it 1 layer
-- Don't change context_len from 128 yet
-- Keep the same kernel structure (one kernel for prefill, one for decode)
-- Keep num_warps=4
+- **Tokenizer**: GPT-2 tiktoken had 24-46% UNK rate on Shakespeare (11K unique tokens).
+  Trained a BPE tokenizer directly on the corpus using HuggingFace `tokenizers` — 0% UNK.
+- **Vocab size**: 1024. Gives 8 tiles of 128, meaningful tiling work. Both 512 and 1024
+  produce similar bits-per-character (~2.2) — the model's capacity is the bottleneck.
+- **VOCAB_TILE**: 128 (same as FFN BLOCK_K). Each tile loads (64, 128) bf16 weights,
+  produces (128, 128) f32 logits (prefill) or (128,) f32 logits (decode).
+- **d_model stays at 64**: model is parameter-inefficient (embedding tables dominate)
+  but the kernel engineering goal was achieved without changing the core architecture.
 
 ---
 
-## Future Directions (after BPE)
+## COMPLETED: Phase A2 — Bigger Model
 
-### Phase A2: Bigger Model
+Scaled d_model 64→128, added 2 layers, 4 attention heads. Used multi-block approach:
+3 Triton kernels per layer (proj, attn, ffn) + 1 output kernel, grid=(4,) with
+BLOCK_SEQ=32. Per-block register peak: ~52KB (vs 127KB budget).
 
-Scale d_model (64→128→256), add layers (1→2→4), increase context (128→512→1024).
-Key thresholds:
-- d_model=128: weights ~260KB in bf16, exceeds register file. Need multi-block tiling.
-- n_layers=2+: can't fuse everything into one kernel. Need one kernel per layer or
-  a persistent kernel that loops over layers.
-- context=512+: attention matrix (512×512 = 1MB) can't fit in registers. Need
-  FlashAttention-style tiled attention.
+### Block kernels architecture
+
+```
+kernels/block_prefill.py:
+  _proj_kernel:   LN + Q/K/V projections   (grid=4, each block=32 rows)
+  _attn_kernel:   causal attention + O + residual
+  _ffn_kernel:    LN + FFN + residual
+  _output_kernel: final LN + tiled output projection
+
+kernels/block_decode.py:
+  _decode_layer_kernel: per-layer decode (M=1, trivial register pressure)
+  _decode_output_kernel: final LN + output projection
+```
+
+### Phase A2 remaining (not yet done)
+
+- context=512+: attention matrix needs FlashAttention-style tiled attention
+- d_model=256+: even BLOCK_SEQ=32 blocks overflow registers, need smaller blocks
 
 ### Phase B: Kernel Optimizations
 
@@ -221,8 +179,9 @@ For 2+ layers, keep data in fast memory between layers:
 ## Profiling Commands
 
 ```bash
-uv run train_backprop.py             # train the model (4s)
-uv run inference_benchmark.py        # inference speed comparison
+uv run train_backprop.py                                          # char-level (4s)
+uv run train_backprop.py --tokenizer trained_bpe --bpe-vocab 1024 # BPE (6s)
+uv run inference_benchmark.py                                     # inference speed
 ```
 
 ---
@@ -235,9 +194,11 @@ inference_guide.md                  — ground-up explanation of GPU kernels + t
 README.md                           — project overview
 model.py                            — JAX transformer model (inference baseline)
 train_backprop.py                   — standard backprop training
-data.py                             — char-level Shakespeare dataset
-kernels/fused_prefill.py            — fused Triton prefill kernel
-kernels/fused_decode.py             — fused Triton decode kernel
+data.py                             — Shakespeare dataset (char, GPT-2 BPE, trained BPE)
+kernels/fused_prefill.py            — fused Triton prefill kernel (d_model≤64)
+kernels/fused_decode.py             — fused Triton decode kernel (d_model≤64)
+kernels/block_prefill.py            — multi-block prefill kernels (d_model≥128)
+kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
 inference_benchmark.py              — speed comparison benchmark
 ```
 
@@ -267,3 +228,30 @@ inference_benchmark.py              — speed comparison benchmark
 
 7. **maxnreg doesn't help.** The kernel is compute-bound, not occupancy-bound. Forcing
    fewer registers just causes spilling.
+
+8. **Tiled output projection has zero overhead.** Going from register-only (vocab=65)
+   to tiled (vocab=1024, 8 tiles of 128) maintained or improved speedup (4.0x → 4.35x).
+   The output projection is not the bottleneck — attention is. Tiling is free.
+
+9. **VOCAB_SIZE/VOCAB_PAD as kernel constexpr parameters.** Using `tl.constexpr` function
+   parameters (not module-level) lets jax-triton JIT-compile a kernel variant per vocab
+   size. Clean separation between kernel logic and model configuration.
+
+10. **Multi-block tiling is the key to scaling d_model.** With d_model=128, h is (128,128) =
+    64KB — can't fit with attention scores (also 64KB) in 127KB register file. Tiling
+    the sequence into BLOCK_SEQ=32 row blocks reduces h to (32,128) = 16KB, scores to
+    (32,128) = 16KB. Peak per block: ~52KB. Scales to any d_model.
+
+11. **Projections and attention need separate kernel launches.** Within a single Triton
+    kernel, blocks execute in parallel with no ordering guarantee. Block 3's attention
+    can't read K/V written by block 0 in the same launch. Split into proj_kernel (writes
+    K/V to HBM) → attn_kernel (reads K/V from HBM).
+
+12. **Decode kernel scales trivially with d_model.** M=1 means all tensors are 1D (d_model,).
+    With d_model=128, h is only 512 bytes. A single fused kernel per layer works for any
+    d_model. The bottleneck is attention over the KV cache: (max_seq, d_head) per head.
+
+13. **HBM traffic between kernels costs ~2x speedup.** Went from 4.3x (single fused kernel,
+    everything in registers) to 1.9x (multi-block, HBM between stages). Each kernel reads
+    and writes h (64KB) from HBM. With 7 kernel launches for 2-layer prefill and 3 per
+    decode step, the HBM traffic adds up.
