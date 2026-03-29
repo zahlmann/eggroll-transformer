@@ -33,8 +33,8 @@ def _decode_kernel(
     # Input
     token_id_ptr, pos_ptr,
     k_cache_ptr, v_cache_ptr,
-    # Outputs
-    logits_ptr, k_new_ptr, v_new_ptr,
+    # Outputs — full updated caches
+    logits_ptr, k_cache_out_ptr, v_cache_out_ptr,
     # Constexpr parameters for variable vocab
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
@@ -70,13 +70,12 @@ def _decode_kernel(
         K_new = tl.sum(h_norm[:, None] * tl.load(wk_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
         V_new = tl.sum(h_norm[:, None] * tl.load(wv_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
 
-        # Output new K/V for cache update
-        tl.store(k_new_ptr + head * D_HEAD + dh, K_new.to(tl.bfloat16))
-        tl.store(v_new_ptr + head * D_HEAD + dh, V_new.to(tl.bfloat16))
-
         # Load K cache, insert new K at current position
         K = tl.load(k_cache_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
         K = tl.where(seq[:, None] == pos, K_new[None, :], K)
+        # Write full updated K cache
+        tl.store(k_cache_out_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16), mask=mask[:, None])
+        tl.store(k_cache_out_ptr + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
 
         # Attention scores → softmax → weighted V sum
         scores = tl.sum(Q[None, :] * K, axis=1) * scale
@@ -86,6 +85,10 @@ def _decode_kernel(
 
         V = tl.load(v_cache_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
         V = tl.where(seq[:, None] == pos, V_new[None, :], V)
+        # Write full updated V cache
+        tl.store(v_cache_out_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16), mask=mask[:, None])
+        tl.store(v_cache_out_ptr + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
+
         attn_out = tl.sum(attn_w[:, None] * V, axis=0)
 
         # O projection
@@ -126,11 +129,21 @@ def _decode_kernel(
         tl.store(logits_ptr + vv, tile_logits)
 
 
-def fused_decode(params, token_id, pos, k_cache, v_cache, vocab_size=65):
+def prepare_decode_weights_small(params, vocab_size):
+    """Precompute bf16 weights + padded output proj once."""
+    vocab_pad = ((vocab_size + 127) // 128) * 128
+    pad_v = vocab_pad - params["output_proj"].shape[1]
+    w = {k: v.astype(jnp.bfloat16) for k, v in params.items()}
+    w["_output_proj_padded"] = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
+    w["_vocab_pad"] = vocab_pad
+    return w
+
+
+def fused_decode(w, token_id, pos, k_cache, v_cache, vocab_size=65):
     """Run one decode step in a single fused kernel call.
 
     Args:
-        params: weight dict from model.init_transformer
+        w: precomputed bf16 weights from prepare_decode_weights_small()
         token_id: scalar int32, the new token
         pos: scalar int32, position index (0-based)
         k_cache: (2, 128, 32) bf16 — valid at positions 0..pos-1
@@ -142,33 +155,26 @@ def fused_decode(params, token_id, pos, k_cache, v_cache, vocab_size=65):
         k_cache: (2, 128, 32) bf16 — now valid at 0..pos
         v_cache: (2, 128, 32) bf16
     """
-    assert k_cache.shape == (2, 128, 32) and v_cache.shape == (2, 128, 32)
-    vocab_pad = ((vocab_size + 127) // 128) * 128
+    vocab_pad = w["_vocab_pad"]
 
-    def bf(key):
-        return params[key].astype(jnp.bfloat16)
-
-    pad_v = vocab_pad - params["output_proj"].shape[1]
-    output_proj_padded = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
-
-    logits_pad, k_new, v_new = jt.triton_call(
-        bf("token_emb"), bf("pos_emb"),
-        bf("layer0.ln1.scale"), bf("layer0.ln1.bias"),
-        bf("layer0.attn.q"), bf("layer0.attn.k"),
-        bf("layer0.attn.v"), bf("layer0.attn.o"),
-        bf("layer0.ln2.scale"), bf("layer0.ln2.bias"),
-        bf("layer0.ffn.up"), bf("layer0.ffn.up_bias"),
-        bf("layer0.ffn.down"), bf("layer0.ffn.down_bias"),
-        bf("ln_final.scale"), bf("ln_final.bias"),
-        output_proj_padded,
+    logits_pad, k_out, v_out = jt.triton_call(
+        w["token_emb"], w["pos_emb"],
+        w["layer0.ln1.scale"], w["layer0.ln1.bias"],
+        w["layer0.attn.q"], w["layer0.attn.k"],
+        w["layer0.attn.v"], w["layer0.attn.o"],
+        w["layer0.ln2.scale"], w["layer0.ln2.bias"],
+        w["layer0.ffn.up"], w["layer0.ffn.up_bias"],
+        w["layer0.ffn.down"], w["layer0.ffn.down_bias"],
+        w["ln_final.scale"], w["ln_final.bias"],
+        w["_output_proj_padded"],
         jnp.int32(token_id),
         jnp.int32(pos),
         k_cache, v_cache,
         kernel=_decode_kernel,
         out_shape=[
             jax.ShapeDtypeStruct((vocab_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((2, 32), jnp.bfloat16),
-            jax.ShapeDtypeStruct((2, 32), jnp.bfloat16),
+            jax.ShapeDtypeStruct(k_cache.shape, jnp.bfloat16),
+            jax.ShapeDtypeStruct(v_cache.shape, jnp.bfloat16),
         ],
         grid=(1,),
         num_warps=4,
@@ -176,4 +182,4 @@ def fused_decode(params, token_id, pos, k_cache, v_cache, vocab_size=65):
         VOCAB_SIZE=vocab_size,
         VOCAB_PAD=vocab_pad,
     )
-    return logits_pad[:vocab_size], k_cache.at[:, pos, :].set(k_new), v_cache.at[:, pos, :].set(v_new)
+    return logits_pad[:vocab_size], k_out, v_out

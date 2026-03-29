@@ -162,19 +162,21 @@ kernels/block_decode.py:
   _decode_output_kernel: final LN + output projection
 ```
 
-### Phase A2 remaining (not yet done)
+### Phase A2 remaining (future work)
 
-- context=512+: attention matrix needs FlashAttention-style tiled attention
-- d_model=256+: even BLOCK_SEQ=32 blocks overflow registers, need smaller blocks
+- **context=512+**: attention scores (32, 512) = 64KB per block, need FlashAttention
+  (tiled attention with online softmax). Not needed at current context_len=128.
+- **d_model=256+**: need BLOCK_SEQ=16 or smaller. Straightforward extension.
 
 ### Phase B: Kernel Optimizations
 
 - ~~**Persistent kernel**: eliminate launch overhead~~ DONE — fused 2-layer decode
   into single kernel (3→1 launch/step, 35% speedup)
 - ~~**Precompute weights**: avoid per-step dtype conversion~~ DONE — 57% speedup
-- **Quantization**: INT8/FP8 weights for decode (memory-bound, ~1.5-2x speedup)
-- **Batched decode**: multiple sequences share weights, enables tensor cores
-- **Speculative decoding**: trade compute for latency
+- **Quantization**: NOT NEEDED — decode is dispatch-bound (0.4ms/step), not bandwidth-bound.
+  Weight loading is 1.3MB at 900 GB/s = 1.4μs. INT8 would save ~0.7μs. Negligible.
+- **Batched decode**: serving optimization, requires multi-sequence KV cache management
+- **Speculative decoding**: needs draft model, more relevant at larger scales
 
 ### Phase C: Multi-Layer Fusion — DONE
 

@@ -38,15 +38,16 @@ def generate_triton(params, config, prompt, n_tokens, vocab_size):
     if d_model <= 64 and n_layers == 1:
         # Small model: single fused kernel
         from kernels.fused_prefill import fused_prefill
-        from kernels.fused_decode import fused_decode
+        from kernels.fused_decode import fused_decode, prepare_decode_weights_small
 
+        w = prepare_decode_weights_small(params, vocab_size)
         x = jnp.pad(prompt, (0, ctx_len - len(prompt))).astype(jnp.int32)
         logits, kc, vc = fused_prefill(params, x, vocab_size=vocab_size)
         tokens = []
         tok = jnp.argmax(logits[len(prompt) - 1])
         tokens.append(int(tok))
         for i in range(n_tokens - 1):
-            logits, kc, vc = fused_decode(params, tok, len(prompt) + i, kc, vc, vocab_size=vocab_size)
+            logits, kc, vc = fused_decode(w, tok, len(prompt) + i, kc, vc, vocab_size=vocab_size)
             tok = jnp.argmax(logits)
             tokens.append(int(tok))
         return tokens
