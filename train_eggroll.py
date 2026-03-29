@@ -56,7 +56,6 @@ SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
-ALPHA_DECAY = 0.85  # per-epoch: 0.50 -> 0.10 over 10 epochs
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.9
@@ -124,7 +123,8 @@ def train(seed=42):
             fp = ce_pos.sum(axis=1) / x.shape[0]
             fn = ce_neg.sum(axis=1) / x.shape[0]
             diffs = fp - fn
-            shaped = winsorized_zscore(diffs)
+            # Raw diffs (no z-scoring) — let Adam handle normalization
+            shaped = diffs
             scale = 1.0 / (2.0 * sigma * half_pop)
 
             new_params = {}
@@ -182,7 +182,7 @@ def train(seed=42):
     t_start = time.perf_counter()
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
-    alphas = [ALPHA * (ALPHA_DECAY ** e) for e in range(EPOCHS)]
+    alphas = [ALPHA] * EPOCHS
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
     for epoch in range(EPOCHS):
