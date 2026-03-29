@@ -1,14 +1,98 @@
 # EGGROLL Transformer — Agent Program
 
-*You are an AI researcher. Your job: push EGGROLL (Evolution Strategies with low-rank
-perturbations) training quality to match or approach backprop+Adam on a small transformer.
-The kernel and speed are already heavily optimized (153s, near Triton limit). Now the
-priority is closing the quality gap: val_loss 2.49 → target 1.84 (backprop). You work
-autonomously — run experiments, log results, and keep going.*
+*You are an AI researcher working on EGGROLL — Evolution Strategies with low-rank
+perturbations for training transformers WITHOUT backpropagation. Before diving into code,
+read the "Where This Could Lead" section below to understand the bigger picture.*
 
-**Your priority is QUALITY IMPROVEMENT. The speed is already near its Triton limit (153s).
-Closing the val_loss gap from 2.49 to 1.84 is the main challenge. Speed regressions up to
-~200s are acceptable if they come with meaningful quality gains. Never exceed ~300s.**
+## Where This Could Lead (Problem Space — Read First)
+
+We've spent two intensive sessions pushing EGGROLL quality on a small transformer. The
+quality gap to backprop is real (val_loss 2.38 vs 1.84) and appears fundamental for this
+setup. Before trying more solution-space optimizations, step back and ask: **what is this
+project actually good for, and where should it go?**
+
+### What We've Actually Built
+
+1. **A fused Triton kernel that runs an entire transformer forward pass in one kernel call.**
+   Embedding → LayerNorm → Multi-Head Attention → FFN → Output → CE Loss, all fused. No
+   HBM round-trips between layers. This is valuable independent of ES training — it's a
+   template for fused inference kernels, forward-mode AD kernels, and custom training loops.
+
+2. **A rank-1 perturbation framework** that compresses 66K-parameter perturbations into
+   2306-dimensional vectors (28.8× compression). The kernel applies rank-1 weight updates
+   via efficient matvec + outer product operations, avoiding full matrix perturbation.
+
+3. **A dual-number Triton kernel** (`kernels/fused_transformer_ce_dual.py`) that computes
+   exact directional derivatives via forward-mode AD, fused into the same single-kernel
+   architecture. Validated against jax.jvp (1.00±0.04 accuracy). First known implementation
+   of fused forward-mode AD in a Triton transformer kernel.
+
+### Where Backprop-Free Training Actually Matters
+
+EGGROLL can't match backprop at equal compute on standard transformers. That's not a bug —
+it's a statement about the problem. The right question isn't "how to make ES match backprop"
+but **"where does avoiding backprop give you something backprop can't?"**:
+
+- **Non-differentiable objectives.** RLHF reward models, discrete sampling (hard attention,
+  VQ-VAE codebook selection), binary masks, integer programs. ES optimizes the ACTUAL
+  objective, not a differentiable surrogate. The fused kernel can evaluate any forward-pass
+  objective, not just CE loss.
+
+- **Communication-free distributed training.** Each GPU independently evaluates perturbation
+  members. No gradient synchronization, no all-reduce, no pipeline bubbles. On 1000+ GPUs,
+  backprop's communication overhead dominates; ES scales linearly. The kernel's massive
+  parallelism (14K+ concurrent evaluations) maps naturally to multi-GPU.
+
+- **Memory-constrained deployment.** No activation storage for backward pass. EGGROLL uses
+  70-103MB vs backprop's 160MB+ on this model. For billion-parameter models on edge devices,
+  this gap widens dramatically. ES needs only the forward pass, which can be heavily optimized
+  (quantized, pruned, fused).
+
+- **Hardware without backward-pass support.** Custom accelerators, FPGAs, neuromorphic chips,
+  analog compute. If you can run a forward pass, you can run EGGROLL. The fused kernel shows
+  how to structure the computation for any hardware target.
+
+- **Model editing and patching.** Rank-1 perturbations are structurally identical to LoRA
+  adapters (low-rank weight updates). EGGROLL could be used for gradient-free LoRA fine-tuning
+  — finding good low-rank weight edits without backprop. This is relevant for on-device
+  personalization, model merging, and task adaptation.
+
+### Concrete Next Directions (pick one)
+
+**A. Scale to a real model (most impactful).** Take the fused kernel architecture and apply
+it to a GPT-2-small (117M params) or similar. The rank-1 perturbation framework scales
+well (vec_dim grows as sqrt(params), not linearly). The key question: does the quality gap
+shrink or grow with model size? Theory suggests it shrinks (larger models have smoother
+loss landscapes), but this hasn't been tested.
+
+**B. Non-differentiable fine-tuning demo.** Add a non-differentiable objective (e.g., BLEU
+score for text generation, exact-match for QA) and show EGGROLL optimizing it directly
+while backprop can't. This is the strongest "why ES matters" demonstration.
+
+**C. Multi-GPU scaling experiment.** Run EGGROLL on 4-8 GPUs with zero communication.
+Compare wall-clock time and quality against data-parallel backprop with gradient all-reduce.
+The crossover point (where ES becomes faster than backprop) is a publishable result.
+
+**D. Gradient-free LoRA.** Adapt the rank-1 perturbation framework for LoRA-style
+fine-tuning of a pre-trained model. No backprop needed — just forward passes through the
+frozen model with rank-1 weight deltas. Compare with standard LoRA (which requires backprop).
+
+**E. Fused inference kernel (pivot away from training).** The fused Triton kernel is
+independently valuable for inference. Strip out the ES machinery and benchmark as a
+single-kernel inference engine vs standard multi-kernel PyTorch/JAX inference. Could be
+packaged as a standalone tool.
+
+### What NOT to Do
+
+- Don't keep tuning hyperparameters on this small model. 30+ experiments have thoroughly
+  explored the HP space. The ceiling is ~2.38 val_loss (3-seed avg) at ~300s budget.
+- Don't try to close the gap to backprop (1.84) on this architecture. The gap is fundamental
+  to rank-1 ES with 10 epochs on a 66K-param model. The math says so, and the experiments
+  confirm it.
+- Don't add complexity (CMA-ES, NES, etc.) without a clear hypothesis for why it would help
+  given the rank-1 constraint and 610-update budget.
+
+---
 
 **MANDATORY CLEANUP RULES (before every merge to main):**
 1. **One train_eggroll.py** — the best EGGROLL implementation. No duplicates.
@@ -26,7 +110,7 @@ Closing the val_loss gap from 2.49 to 1.84 is the main challenge. Speed regressi
 
 ---
 
-## Current State (2026-03-26, quality session)
+## Current State (2026-03-29)
 
 **Quality:** EGGROLL val_loss=2.38 (3-seed avg 2.376) vs backprop+Adam 1.84.
 Gap = 0.54 to backprop+Adam (was 0.65). Improved from 2.49 via HALF_POP=7168.

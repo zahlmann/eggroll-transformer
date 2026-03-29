@@ -49,8 +49,6 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 7168
-# Population schedule: small pop early (fast, coarse gradients), large pop late (slow, precise)
-POP_SCHEDULE = None  # uniform population
 SIGMA_START = 0.020
 SIGMA_DECAY = 0.998
 LR_START = 0.010
@@ -96,65 +94,60 @@ def train(seed=42):
 
     from kernels.fused_transformer_ce import fused_transformer_ce_both
 
-    def make_train_fn(half_pop):
-        """Create a JIT'd train function for a specific HALF_POP."""
-        def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr, alpha):
-            key, vec_key = jax.random.split(key)
-            if half_pop <= total_vec_dim:
-                raw = jax.random.normal(vec_key, (total_vec_dim, half_pop))
-                Q, _ = jnp.linalg.qr(raw)
-                vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
+    def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+        key, vec_key = jax.random.split(key)
+        if HALF_POP <= total_vec_dim:
+            raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
+            Q, _ = jnp.linalg.qr(raw)
+            vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
+        else:
+            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+
+        ce_pos, ce_neg = fused_transformer_ce_both(
+            params["token_emb"], params["pos_emb"],
+            params["layer0.ln1.scale"], params["layer0.ln1.bias"],
+            params["layer0.attn.q"], params["layer0.attn.k"],
+            params["layer0.attn.v"], params["layer0.attn.o"],
+            params["layer0.ln2.scale"], params["layer0.ln2.bias"],
+            params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
+            params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
+            params["ln_final.scale"], params["ln_final.bias"],
+            params["output_proj"],
+            vecs, x, y, sigma, ALPHA, TEMPERATURE,
+        )
+
+        fp = ce_pos.sum(axis=1) / x.shape[0]
+        fn = ce_neg.sum(axis=1) / x.shape[0]
+        diffs = fp - fn
+        shaped = winsorized_zscore(diffs)
+        scale = 1.0 / (2.0 * sigma * HALF_POP)
+
+        new_params = {}
+        new_momentum = {}
+        new_v = {}
+        t = step + 1  # 1-indexed for bias correction
+        for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
+            v_pert = vecs[:, offset:offset + vec_dim]
+            if is_2d:
+                m, n = shape
+                g = scale * (v_pert[:, :m] * shaped[:, None]).T @ v_pert[:, m:]
             else:
-                vecs = jax.random.normal(vec_key, (half_pop, total_vec_dim))
+                g = scale * (v_pert * shaped[:, None]).sum(axis=0)
+            lr_s = lr_scale_arr[idx]
+            # First moment (momentum)
+            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
+            # Second moment (Adam)
+            new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
+            # Bias correction
+            m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
+            v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
+            new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
-            ce_pos, ce_neg = fused_transformer_ce_both(
-                params["token_emb"], params["pos_emb"],
-                params["layer0.ln1.scale"], params["layer0.ln1.bias"],
-                params["layer0.attn.q"], params["layer0.attn.k"],
-                params["layer0.attn.v"], params["layer0.attn.o"],
-                params["layer0.ln2.scale"], params["layer0.ln2.bias"],
-                params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
-                params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
-                params["ln_final.scale"], params["ln_final.bias"],
-                params["output_proj"],
-                vecs, x, y, sigma, alpha, TEMPERATURE,
-            )
+        return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
 
-            fp = ce_pos.sum(axis=1) / x.shape[0]
-            fn = ce_neg.sum(axis=1) / x.shape[0]
-            diffs = fp - fn
-            shaped = winsorized_zscore(diffs)
-            scale = 1.0 / (2.0 * sigma * half_pop)
-
-            new_params = {}
-            new_momentum = {}
-            new_v = {}
-            t = step + 1
-            for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
-                v_pert = vecs[:, offset:offset + vec_dim]
-                if is_2d:
-                    m, n = shape
-                    g = scale * (v_pert[:, :m] * shaped[:, None]).T @ v_pert[:, m:]
-                else:
-                    g = scale * (v_pert * shaped[:, None]).sum(axis=0)
-                lr_s = lr_scale_arr[idx]
-                new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
-                new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
-                m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
-                v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
-                new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
-
-            return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
-
-        return jax.jit(train_one_batch)
-
-    # Build train functions for each unique HALF_POP in the schedule
-    if POP_SCHEDULE:
-        pop_per_epoch = POP_SCHEDULE
-    else:
-        pop_per_epoch = [HALF_POP] * EPOCHS
-    unique_pops = set(pop_per_epoch)
-    train_fns = {hp: make_train_fn(hp) for hp in unique_pops}
+    @jax.jit
+    def train_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr)
 
     @jax.jit
     def eval_loss(params, x, y):
@@ -181,13 +174,10 @@ def train(seed=42):
     t_start = time.perf_counter()
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
-    alphas = [ALPHA] * EPOCHS
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
     for epoch in range(EPOCHS):
-        sigma, lr, alpha_e = sigmas[epoch], lrs_sched[epoch], alphas[epoch]
-        hp = pop_per_epoch[epoch]
-        train_batch = train_fns[hp]
+        sigma, lr = sigmas[epoch], lrs_sched[epoch]
         key, sk = jax.random.split(key)
         perm = jax.random.permutation(sk, len(data["train_x"]))
         sx, sy = train_x[perm], train_y[perm]
@@ -196,11 +186,11 @@ def train(seed=42):
             s = bi * BATCH_SIZE
             params, momentum_buf, v_buf, step, key, pl = train_batch(
                 params, momentum_buf, v_buf, step, key,
-                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr, alpha_e)
+                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
-        print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}  pop={hp}")
+        print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
 
     vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
     vl.block_until_ready()
