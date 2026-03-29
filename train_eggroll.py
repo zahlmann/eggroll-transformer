@@ -51,8 +51,8 @@ TEMPERATURE = 2.0
 HALF_POP = 7168
 # Population schedule: small pop early (fast, coarse gradients), large pop late (slow, precise)
 POP_SCHEDULE = None  # uniform population
-SIGMA_START = 0.025
-SIGMA_DECAY = 0.92  # per-epoch: 0.025 -> 0.011 over 10 epochs
+SIGMA_START = 0.020
+SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
@@ -181,7 +181,14 @@ def train(seed=42):
     t_start = time.perf_counter()
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
-    lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
+    # LR warmup: ramp from LR_START/5 to LR_START over first 2 epochs
+    lrs_sched = []
+    for e in range(EPOCHS):
+        if e < 2:
+            lr_e = LR_START * (0.2 + 0.8 * (e + 1) / 2)
+        else:
+            lr_e = LR_START * (LR_DECAY ** (e - 2))
+        lrs_sched.append(lr_e)
 
     for epoch in range(EPOCHS):
         sigma, lr = sigmas[epoch], lrs_sched[epoch]
