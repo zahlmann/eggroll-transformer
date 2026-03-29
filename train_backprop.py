@@ -8,6 +8,7 @@ os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
 import argparse
 import time
+import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
@@ -79,6 +80,13 @@ def train(lr=1e-3, seed=SEED):
     peak_mb = mem_stats["peak_bytes_in_use"] / 1e6 if mem_stats else 0.0
 
     print(f"\nFinal: val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  time={total:.1f}s  mem={peak_mb:.0f}MB")
+
+    # Save weights for inference
+    import pickle
+    with open(os.path.join(os.path.dirname(__file__), "weights.pkl"), "wb") as f:
+        pickle.dump({"params": jax.tree.map(np.asarray, params), "config": config}, f)
+    print("Saved weights to weights.pkl")
+
     return float(vl), total, peak_mb
 
 

@@ -1,0 +1,3 @@
+Triton: 737 tok/s (86.8ms)
+JAX:    185 tok/s (346.6ms)
+Speedup: 3.99x

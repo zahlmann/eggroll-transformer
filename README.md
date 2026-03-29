@@ -1,35 +1,37 @@
-# EGGROLL Transformer
+# Fused Inference
 
-Training a small transformer with **EGGROLL** (Evolution Strategies with low-rank perturbations) instead of backpropagation. A fused Triton kernel runs the entire transformer forward pass + CE loss in a single GPU kernel call.
+Custom Triton kernels for transformer inference — the entire forward pass runs in a **single GPU kernel call** with all weights resident in registers. **4x faster** than JAX/XLA baseline.
 
 ## Quick Start
 
 ```bash
-uv run train_eggroll.py          # EGGROLL training (272s, val_loss ~2.38)
-uv run train_backprop.py         # Backprop+Adam baseline (4s, val_loss ~1.84)
-uv run benchmark.py              # Side-by-side comparison
-uv run validate.py               # 3-seed quality validation
+uv run train_backprop.py         # train model, save weights (4s)
+uv run inference_benchmark.py    # benchmark: Triton vs JAX (740 vs 185 tok/s)
 ```
 
-## Results (10 epochs, 3-seed average)
+## Results
 
-| Method | val_loss | ppl | Time | Memory |
-|--------|----------|-----|------|--------|
-| **EGGROLL** (pop=14336) | **2.38** | **10.8** | **272s** | **103MB** |
-| EGGROLL (pop=8192) | 2.49 | 12.1 | 153s | 70MB |
-| Backprop+Adam | 1.84 | 6.3 | 4.1s | 160MB |
-| Backprop+SGD | 2.45 | 11.6 | 1.3s | 300MB |
+```
+Prompt: 64 tokens, Generate: 64 tokens
 
-EGGROLL beats vanilla SGD backprop (2.38 vs 2.45) but has a 0.54 gap to Adam.
+Triton fused:   740 tok/s  (86.5 ms)
+JAX baseline:   185 tok/s  (362.6 ms)
+Speedup:        4.0x
+```
 
-## How EGGROLL Works
+Both produce identical text.
 
-1. Generate 7168 random perturbation vectors (rank-1 compressed: 66K params → 2306 dims)
-2. Evaluate perturbed model at +sigma and -sigma (14336 forward passes per batch)
-3. Estimate gradient from fitness differences (Winsorized z-score, per-subgroup normalization)
-4. Update with Adam optimizer
+## How It Works
 
-All 14336 forward passes run in a **single fused Triton kernel** — no HBM round-trips between layers.
+Two fused Triton kernels replace the ~15 separate XLA kernels that JAX generates:
+
+**Prefill kernel** — processes the full prompt (128 tokens) in one kernel call. All weights stay in the GPU register file (132 KB model fits in 130 KB register budget). Outputs logits + KV cache.
+
+**Decode kernel** — generates one token at a time using the KV cache. Uses element-wise ops instead of tensor cores (M=1 is too small for tensor cores). Outputs logits + new K/V vectors for cache update.
+
+The speedup comes from eliminating HBM round-trips between operations. In JAX, every intermediate result (embeddings, attention scores, FFN activations) gets written to HBM and read back. In the fused kernel, data flows through registers end-to-end.
+
+See `inference_guide.md` for a detailed walkthrough (no GPU experience required).
 
 ## Architecture
 
@@ -37,54 +39,15 @@ All 14336 forward passes run in a **single fused Triton kernel** — no HBM roun
 - Character-level Shakespeare, vocab=65, context=128
 - 66,368 parameters
 
-## What's Novel
-
-**The fused Triton kernel** (`kernels/fused_transformer_ce.py`) processes the entire
-transformer (embedding → layer norm → multi-head attention → FFN → output projection → CE
-loss) in one kernel call. Each thread block handles one (perturbation, sequence) pair with
-all weights resident in registers. This architecture is reusable for:
-- Fused inference (strip out ES, keep the single-kernel forward pass)
-- Forward-mode AD (the dual-number kernel in `kernels/fused_transformer_ce_dual.py`)
-- Any gradient-free optimization method that needs many parallel forward passes
-
-**The rank-1 perturbation framework** compresses weight perturbations from O(params) to
-O(sqrt(params)) via outer-product structure: delta_W = b ⊗ a for each 2D weight matrix.
-This is structurally identical to LoRA adapters.
-
-**The dual-number kernel** (`kernels/fused_transformer_ce_dual.py`) computes exact
-directional derivatives via forward-mode AD, fused into the same single-kernel architecture.
-Validated against jax.jvp to bf16 precision.
-
-## Where This Could Lead
-
-See `program.md` "Where This Could Lead" for detailed analysis. Key directions:
-- **Non-differentiable objectives** (RLHF rewards, discrete sampling, exact-match metrics)
-- **Communication-free distributed training** (no gradient sync, linear GPU scaling)
-- **Gradient-free LoRA** (rank-1 perturbations = LoRA adapters without backprop)
-- **Fused inference** (the kernel is independently valuable)
-
 ## Files
 
 ```
-train_eggroll.py              EGGROLL training script (best config)
-train_backprop.py             backprop+Adam baseline
-kernels/fused_transformer_ce.py       fused Triton kernel (production)
-kernels/fused_transformer_ce_dual.py  dual-number kernel (forward-mode AD)
-model.py                      JAX transformer model
-data.py                       Shakespeare dataset
-validate.py                   3-seed validation
-benchmark.py                  comparison benchmark
-program.md                    full experiment history + next directions (READ THIS)
+inference_guide.md                      ground-up explanation of GPU kernels + this project
+model.py                                JAX transformer (inference baseline)
+train_backprop.py                       backprop+Adam training, saves weights
+kernels/fused_prefill.py                fused prefill kernel (full sequence)
+kernels/fused_decode.py                 fused decode kernel (one token + KV cache)
+inference_benchmark.py                  benchmark + text generation
+data.py                                 Shakespeare dataset
 ```
 
-## Optimization History
-
-Speed: **444s → 153s (2.9×)** via kernel optimizations, then **153s → 272s** trading speed
-for quality (HALF_POP 4096 → 7168).
-
-Quality: **2.49 → 2.38** (3-seed avg) via larger population. 30+ algorithmic experiments
-(LR schedules, sigma schedules, orthogonal perturbations, guided ES, label smoothing tuning,
-Adam HP tuning, forward-mode AD, dual-number kernel, population scheduling, etc.) confirmed
-that population size is the only lever — all else is already optimized.
-
-See program.md for the complete experiment log.
