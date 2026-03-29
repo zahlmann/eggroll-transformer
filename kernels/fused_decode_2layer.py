@@ -40,10 +40,10 @@ def _fused_decode_2layer(
     token_id_ptr, pos_ptr,
     l0_kc_ptr, l0_vc_ptr,
     l1_kc_ptr, l1_vc_ptr,
-    # Outputs
+    # Outputs — full updated caches (avoids expensive .at[].set() in Python)
     logits_ptr,
-    l0_k_new_ptr, l0_v_new_ptr,
-    l1_k_new_ptr, l1_v_new_ptr,
+    l0_kc_out_ptr, l0_vc_out_ptr,
+    l1_kc_out_ptr, l1_vc_out_ptr,
     # Config
     D_MODEL: tl.constexpr,
     D_HEAD: tl.constexpr,
@@ -87,11 +87,11 @@ def _fused_decode_2layer(
         K_new = tl.sum(h_norm[:, None] * tl.load(l0_wk_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
         V_new = tl.sum(h_norm[:, None] * tl.load(l0_wv_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
 
-        tl.store(l0_k_new_ptr + head * D_HEAD + dh, K_new.to(tl.bfloat16))
-        tl.store(l0_v_new_ptr + head * D_HEAD + dh, V_new.to(tl.bfloat16))
-
         K = tl.load(l0_kc_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
         K = tl.where(seq[:, None] == pos, K_new[None, :], K)
+        tl.store(l0_kc_out_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16), mask=mask[:, None])
+        tl.store(l0_kc_out_ptr + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
+
         scores = tl.sum(Q[None, :] * K, axis=1) * scale
         scores = tl.where(mask, scores, -1e9)
         exp_s = tl.exp(scores - tl.max(scores))
@@ -99,6 +99,9 @@ def _fused_decode_2layer(
 
         V = tl.load(l0_vc_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
         V = tl.where(seq[:, None] == pos, V_new[None, :], V)
+        tl.store(l0_vc_out_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16), mask=mask[:, None])
+        tl.store(l0_vc_out_ptr + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
+
         attn_out = tl.sum(attn_w[:, None] * V, axis=0)
         attn_accum += tl.sum(attn_out[:, None] * tl.load(l0_wo_ptr + hd[:, None] * D_MODEL + d[None, :]).to(tl.float32), axis=0)
 
@@ -142,11 +145,11 @@ def _fused_decode_2layer(
         K_new = tl.sum(h_norm[:, None] * tl.load(l1_wk_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
         V_new = tl.sum(h_norm[:, None] * tl.load(l1_wv_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
 
-        tl.store(l1_k_new_ptr + head * D_HEAD + dh, K_new.to(tl.bfloat16))
-        tl.store(l1_v_new_ptr + head * D_HEAD + dh, V_new.to(tl.bfloat16))
-
         K = tl.load(l1_kc_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
         K = tl.where(seq[:, None] == pos, K_new[None, :], K)
+        tl.store(l1_kc_out_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16), mask=mask[:, None])
+        tl.store(l1_kc_out_ptr + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
+
         scores = tl.sum(Q[None, :] * K, axis=1) * scale
         scores = tl.where(mask, scores, -1e9)
         exp_s = tl.exp(scores - tl.max(scores))
@@ -154,6 +157,9 @@ def _fused_decode_2layer(
 
         V = tl.load(l1_vc_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
         V = tl.where(seq[:, None] == pos, V_new[None, :], V)
+        tl.store(l1_vc_out_ptr + cache_off + seq[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16), mask=mask[:, None])
+        tl.store(l1_vc_out_ptr + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
+
         attn_out = tl.sum(attn_w[:, None] * V, axis=0)
         attn_accum += tl.sum(attn_out[:, None] * tl.load(l1_wo_ptr + hd[:, None] * D_MODEL + d[None, :]).to(tl.float32), axis=0)
 
@@ -220,7 +226,7 @@ def fused_decode_2layer(w, config, token_id, pos, k_caches, v_caches, vocab_size
     max_seq = config["context_len"]
     vocab_pad = w["_vocab_pad"]
 
-    logits_pad, l0_k_new, l0_v_new, l1_k_new, l1_v_new = jt.triton_call(
+    logits_pad, l0_kc_out, l0_vc_out, l1_kc_out, l1_vc_out = jt.triton_call(
         # Embedding
         w["token_emb"], w["pos_emb"],
         # Layer 0
@@ -243,10 +249,10 @@ def fused_decode_2layer(w, config, token_id, pos, k_caches, v_caches, vocab_size
         kernel=_fused_decode_2layer,
         out_shape=[
             jax.ShapeDtypeStruct((vocab_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_heads, d_head), jnp.bfloat16),
-            jax.ShapeDtypeStruct((n_heads, d_head), jnp.bfloat16),
-            jax.ShapeDtypeStruct((n_heads, d_head), jnp.bfloat16),
-            jax.ShapeDtypeStruct((n_heads, d_head), jnp.bfloat16),
+            jax.ShapeDtypeStruct((n_heads, max_seq, d_head), jnp.bfloat16),
+            jax.ShapeDtypeStruct((n_heads, max_seq, d_head), jnp.bfloat16),
+            jax.ShapeDtypeStruct((n_heads, max_seq, d_head), jnp.bfloat16),
+            jax.ShapeDtypeStruct((n_heads, max_seq, d_head), jnp.bfloat16),
         ],
         grid=(1,),
         num_warps=4, num_stages=1,
@@ -255,6 +261,4 @@ def fused_decode_2layer(w, config, token_id, pos, k_caches, v_caches, vocab_size
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
     )
 
-    new_k = [k_caches[0].at[:, pos, :].set(l0_k_new), k_caches[1].at[:, pos, :].set(l1_k_new)]
-    new_v = [v_caches[0].at[:, pos, :].set(l0_v_new), v_caches[1].at[:, pos, :].set(l1_v_new)]
-    return logits_pad[:vocab_size], new_k, new_v
+    return logits_pad[:vocab_size], [l0_kc_out, l1_kc_out], [l0_vc_out, l1_vc_out]
