@@ -4,6 +4,8 @@
 small transformer using custom Triton kernels. The model is trained with standard backprop.
 The focus is on learning to write high-performance GPU kernels for transformer inference.*
 
+**IMPORTANT: Commit and push after every meaningful step. Don't batch up changes.**
+
 ---
 
 ## Your Mission
@@ -90,14 +92,18 @@ BPE (vocab=1024, tiled output — 8 tiles of 128):
   Speedup:        4.35x
 
 Phase A2: d_model=128, n_heads=4, n_layers=2, vocab=1024, 674K params:
-  Triton block:   335 tok/s  (191.3 ms)
-  JAX baseline:   177 tok/s  (361.1 ms)
-  Speedup:        1.89x
+  Multi-block (3 launches/step):   335 tok/s, 1.89x
+  + fused decode (1 launch/step):  454 tok/s, 2.58x
+  + precomputed bf16 weights:      713 tok/s, 3.90x
+  JAX baseline:                    183 tok/s
 
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.
 - Multi-block approach (BLOCK_SEQ=32) enables any d_model.
-- Speedup decreased 4.3x→1.9x due to HBM traffic between kernels.
+- Python dispatch overhead per jt.triton_call is ~0.4ms. Fusing all decode
+  into one kernel eliminated 128 launches (35% speedup).
+- .astype(bf16) per decode step created 1764 unnecessary allocations.
+  Precomputing once gave another 57% speedup.
 - Text quality greatly improved with 2-layer model.
 ```
 
@@ -251,7 +257,14 @@ inference_benchmark.py              — speed comparison benchmark
     With d_model=128, h is only 512 bytes. A single fused kernel per layer works for any
     d_model. The bottleneck is attention over the KV cache: (max_seq, d_head) per head.
 
-13. **HBM traffic between kernels costs ~2x speedup.** Went from 4.3x (single fused kernel,
-    everything in registers) to 1.9x (multi-block, HBM between stages). Each kernel reads
-    and writes h (64KB) from HBM. With 7 kernel launches for 2-layer prefill and 3 per
-    decode step, the HBM traffic adds up.
+13. **HBM traffic between kernels costs ~2x speedup** initially. Went from 4.3x to 1.9x.
+    But fusing decode back into one kernel + precomputing weights recovered most of it
+    (1.9x → 3.9x). The real cost was Python dispatch, not HBM.
+
+14. **Python dispatch dominates small-model latency.** Each jt.triton_call has ~0.4ms of
+    Python/JAX overhead. With 3 calls per decode step × 63 steps = 189 calls → 75ms of
+    pure overhead. Fusing into 1 call/step saved 35%.
+
+15. **Never convert dtypes inside the decode loop.** `.astype(bf16)` creates a new JAX
+    array every call. With 28 weight tensors × 63 steps = 1764 allocations → 57% slowdown.
+    Precompute bf16 weights once before the loop.
