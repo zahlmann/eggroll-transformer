@@ -428,6 +428,15 @@ These have ALL been tried and don't work:
   benefit from antithetic pairing (+σ/-σ) which cancels common-mode bf16 rounding errors.
   The dual kernel is a technically correct implementation but loses to finite differences
   at bf16 precision on this small model. Code in kernels/fused_transformer_ce_dual.py.
+- Population scheduling (4096 early + 10240 late, or reverse): same total compute as uniform
+  7168, but worse quality (2.36 and 2.32 vs 2.31). Uniform allocation is optimal.
+- Alpha=0.10 constant at HALF_POP=7168: 2.59, much worse — transformer needs high smoothing
+- Adaptive alpha 0.50 → 0.10 (decay=0.85/epoch): 2.49, worse — low alpha causes overfitting
+- Sigma decay 0.025→0.011 (decay=0.92/epoch) at HALF_POP=7168: 2.49, worse than constant 0.020
+- LR warmup (0.006→0.010 over 2 epochs) at HALF_POP=7168: 2.44, worse — wastes early epochs
+- SGD with Nesterov momentum (LR=0.10): diverged completely
+- Raw fitness diffs (no z-scoring): 2.45, z-scoring is essential
+- CLIP_RANGE=1.5: 2.35, CLIP_RANGE=2.5: 2.41, CLIP_RANGE=3.0: 2.43 — 2.0 is optimal
 
 ---
 
