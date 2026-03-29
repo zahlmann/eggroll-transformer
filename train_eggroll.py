@@ -57,7 +57,7 @@ LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
 N_SUBGROUPS = 8
-CLIP_RANGE = 2.0
+CLIP_RANGE = 3.0
 MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
@@ -123,8 +123,7 @@ def train(seed=42):
             fp = ce_pos.sum(axis=1) / x.shape[0]
             fn = ce_neg.sum(axis=1) / x.shape[0]
             diffs = fp - fn
-            # Raw diffs (no z-scoring) — let Adam handle normalization
-            shaped = diffs
+            shaped = winsorized_zscore(diffs)
             scale = 1.0 / (2.0 * sigma * half_pop)
 
             new_params = {}
