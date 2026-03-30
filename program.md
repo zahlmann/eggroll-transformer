@@ -247,13 +247,7 @@ Possible directions for continued work:
 - Verify with the large (d=256) model
 - Can achieve 2-3x additional speedup for decode
 
-### Option C: Quantization (INT8/FP8)
-
-- Quantize weights to INT8 with per-channel scaling
-- Reduces memory bandwidth → faster for larger models
-- Only useful when bandwidth-bound (the current models are dispatch-bound)
-
-### Option D: Batched Inference
+### Option C: Batched Inference
 
 - Generate multiple sequences in parallel
 - Uses tensor cores for decode (M>1 enables matmul)
