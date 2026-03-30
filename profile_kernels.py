@@ -201,8 +201,10 @@ def main():
     w = prepare_decode_weights_nlayer(params, config, vocab_size)
     tok = jnp.argmax(logits[PROMPT_LEN - 1])
 
-    # Multi-SM decode (primary)
-    print(f"--- Decode: Multi-SM ({GEN_LEN} tokens, grid={n_heads}) ---")
+    # Multi-SM decode (primary) — kv_splits=2 gives grid=N_HEADS*2
+    kv_splits = 2
+    total_blocks = n_heads * kv_splits
+    print(f"--- Decode: Multi-SM ({GEN_LEN} tokens, grid={total_blocks}, kv_splits={kv_splits}) ---")
     decode_ms, tokens = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
                                         n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=True)
     tok_per_s = GEN_LEN / decode_ms * 1000

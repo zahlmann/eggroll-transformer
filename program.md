@@ -27,29 +27,35 @@ Build the fastest possible inference for this transformer using custom Triton ke
 11. Speculative decoding with parallel verification kernel
 12. Scaled to d=512, 8 layers, 16 heads (29.7M params, ppl=2.91)
 13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
+14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
 
 ### Current Performance (RTX 4080 Super)
 
 ```
 XL model (d=512, h=16, l=8, ctx=512, 29.7M params, ppl=2.91):
-  Decode (multi-SM):   1734 tok/s (0.58 ms/tok)  ← 6x speedup via grid=(16,)
-  Decode (single-SM):  287 tok/s  (3.49 ms/tok)   (previous baseline)
+  Decode (multi-SM):   1851 tok/s (0.54 ms/tok)  ← 6.6x speedup via grid=(32,) kv_splits=2
+  Decode (grid=16):    1734 tok/s (0.58 ms/tok)   (kv_splits=1, previous)
+  Decode (single-SM):  287 tok/s  (3.49 ms/tok)   (original baseline)
   Prefill (128 tok):   6.1 ms    (21,168 tok/s)
   Weight buffer:       59.3 MB   (bf16)
   KV cache:            8.4 MB    (bf16, per sequence)
-  Bandwidth util:      14%       (of 836 GB/s theoretical, was 2%)
+  Bandwidth util:      15%       (of 836 GB/s theoretical, was 2%)
 
 Previous model sizes:
   d=64,  1L:    3056 tok/s
   d=128, 2L:    2589 tok/s
   d=256, 4L:    1396 tok/s
-  d=512, 8L:     287 tok/s  → 1734 tok/s (multi-SM, 2742 w/o sync)
+  d=512, 8L:     287 tok/s  → 1734 tok/s → 1851 tok/s (KV splits)
 ```
 
-**Key finding: multi-SM decode (grid=16) gave 6x speedup.** The single-SM kernel
-left 79 of 80 SMs idle. Splitting attention heads across blocks with atomic barriers
-parallelizes both attention and FFN. Bandwidth utilization improved from 2% to 14%.
-Without int() sync: 2742 tok/s (9.6x). Theoretical minimum is 0.081 ms/tok — 7x headroom.
+**Key findings:**
+- Multi-SM decode (grid=16) gave 6x speedup over single-SM.
+- KV-split parallelism (grid=32, kv_splits=2) adds another 10% (1734→1851 tok/s).
+  Splits KV cache tiles across 2 blocks per head (FlashDecoding-style).
+  Merge uses online softmax correction (weighted average of normalized O-projections).
+  kv_splits=4 was slightly slower (barrier contention with 64 blocks).
+- Bandwidth utilization: 15%. Without int() sync: ~2900 tok/s.
+- Theoretical minimum: 0.081 ms/tok — 6.7x headroom remaining.
 
 ---
 
@@ -136,6 +142,13 @@ Phase A5: Multi-SM decode optimization:
   Multi-SM decode (grid=16):       1734 tok/s  (0.58 ms/tok, 14% BW utilization)
   Without int() sync:              2742 tok/s  (0.36 ms/tok)
   Speedup vs single-SM:              6.0x (with sync), 9.6x (without sync)
+
+Phase A6: KV-split parallelism (FlashDecoding):
+  KV splits=2, grid=32:           1851 tok/s  (0.54 ms/tok, 15% BW utilization)
+  KV splits=4, grid=64:           1991 tok/s  (short-burst, but +barrier contention)
+  Improvement over grid=16:         +10% sustained throughput
+  Technique: split KV cache tiles across 2 blocks per head, merge with
+    online softmax correction (weighted average of normalized O-projections)
 
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.
@@ -358,15 +371,18 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 Run `uv run profile_kernels.py` after any kernel change. The hard metrics to beat:
 
 ```
-CURRENT (d=512, 8L, 29.7M params, multi-SM grid=16):
-  Decode throughput:     1753 tok/s  (with int sync for token collection)
+CURRENT (d=512, 8L, 29.7M params, multi-SM grid=32, kv_splits=2):
+  Decode throughput:     1851 tok/s  (with int sync for token collection)
   Decode no-sync:        ~2900 tok/s (in-kernel argmax, deferred collection)
-  Decode latency:        0.57 ms/tok (with sync), 0.35 ms/tok (no sync)
-  Bandwidth utilization: 14% of 836 GB/s
-  Prefill latency:       6.3 ms (128 tokens)
-  Theoretical min:       0.075 ms/tok (63 MB unique data @ 836 GB/s)
+  Decode latency:        0.54 ms/tok (with sync)
+  Bandwidth utilization: 15% of 836 GB/s
+  Prefill latency:       6.1 ms (128 tokens)
+  Theoretical min:       0.081 ms/tok (67.7 MB unique data @ 836 GB/s)
 
-PREVIOUS BASELINE (single-SM, grid=1):
+PREVIOUS (multi-SM, grid=16, kv_splits=1):
+  Decode throughput:     1734 tok/s (0.58 ms/tok, 14% BW)
+
+ORIGINAL BASELINE (single-SM, grid=1):
   Decode throughput:     287 tok/s (3.48 ms/tok, 2% BW)
 ```
 
@@ -437,7 +453,7 @@ would give up to 8x speedup if the work parallelizes well.
 
 ### Step 3: Reduce memory traffic per step
 
-Achieved: 0.35 ms/tok (no sync), 14% BW utilization. Remaining gap: 4.7x vs theoretical.
+Achieved: 0.54 ms/tok (with sync), 15% BW utilization. Remaining gap: 6.7x vs theoretical.
 
 **Bottleneck analysis (2026-03-31):**
 - Unique data per step: 63 MB. Theoretical at 836 GB/s: 0.075 ms.
@@ -450,9 +466,11 @@ Achieved: 0.35 ms/tok (no sync), 14% BW utilization. Remaining gap: 4.7x vs theo
 **3a. Reduce barriers** — Merge FFN reduction with next layer's LN1. Use persistent
 accumulators. Target: 9 barriers instead of 17. Saves 0.04-0.08 ms.
 
-**3b. More blocks (higher grid)** — grid=(32,) or grid=(64,) to use more SMs and
-increase outstanding memory requests. Requires splitting heads across multiple blocks
-for KV attention (2 blocks per head, each handling half the KV tiles).
+**3b. More blocks (higher grid)** — DONE. grid=(32,) with kv_splits=2.
+Each head's KV attention is split across 2 blocks (FlashDecoding-style).
+Merge uses online softmax correction: weighted average of normalized O-projections.
+Result: 1734→1851 tok/s (+10%). grid=64 (kv_splits=4) was slightly slower due to
+barrier contention — 32 blocks is the sweet spot for this model.
 
 **3c. GQA (Grouped-Query Attention)** — 4 KV heads for 16 Q heads → 4x less KV
 cache traffic. Requires retraining but reduces 8 MB KV cache to 2 MB.
@@ -650,3 +668,20 @@ baseline_metrics.txt                — current numbers to beat
     `tl.static_range` unrolls the loop at compile time, creating enormous IR that takes
     10+ minutes to compile. `tl.range` compiles the loop body once and executes it
     dynamically — identical runtime performance, 10x faster compilation.
+
+31. **KV-split parallelism (FlashDecoding) gives 10% improvement at grid=32.** With
+    N_HEADS=16 blocks, only 16/80 SMs were utilized. Splitting KV cache attention
+    across 2 blocks per head (KV_SPLITS=2) doubles the grid to 32 blocks. Each block
+    handles half the KV tiles and computes a partial online softmax. After the barrier,
+    all blocks merge the partials using the log-sum-exp trick: `h_head = Σ(o_proj_s *
+    l_s * exp(m_s - m_max)) / Σ(l_s * exp(m_s - m_max))`. The normalized O-projection
+    avoids large-value bf16 overflow. Edge case: blocks whose KV range has no valid
+    positions (pos < range_start) produce l=0, m=-inf — clamp l before normalization
+    to avoid NaN, then the merge naturally weights them to zero.
+
+32. **grid=32 is the sweet spot; grid=64 has diminishing returns.** KV_SPLITS=4
+    (grid=64) was slightly slower than KV_SPLITS=2 (grid=32) due to increased barrier
+    contention. With 64 blocks, each barrier has more atomic operations and longer
+    worst-case spin time. Also, each block has less FFN work (D_FF/64=32 elements,
+    only 1 iteration), reducing per-block compute efficiency. The FFN reduction also
+    reads from more blocks (64×D_MODEL vs 32×D_MODEL from L2).

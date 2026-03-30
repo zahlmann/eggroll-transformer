@@ -1,27 +1,30 @@
 """
-Multi-SM fused N-layer decode kernel.
+Multi-SM fused N-layer decode kernel with KV-split parallelism.
 
 Key insight from profiling: the single-SM kernel (grid=1) uses 1 of 80 SMs on the
-RTX 4080 Super, leaving 79 idle. This kernel uses grid=(N_HEADS,) to parallelize
-attention across SMs, and also distributes FFN work across all blocks.
+RTX 4080 Super, leaving 79 idle. This kernel uses grid=(N_HEADS * KV_SPLITS,) to
+parallelize attention across SMs, splitting KV cache tiles within each head for
+additional parallelism (FlashDecoding-style).
 
 Architecture:
-  grid = (N_HEADS,)  — each block handles one attention head
+  grid = (N_HEADS * KV_SPLITS,)  — multiple blocks per attention head
 
   Per layer:
-    Phase 1 (all blocks): LN1 + QKV proj + attention + O proj for one head
-      → write partial result to scratch buffer
-      → atomic barrier (f32 atomics on same buffer)
-    Phase 2 (all blocks): reduce attention + residual + LN2 + FFN partition
-      → each block handles D_FF/N_HEADS elements of intermediate dim
-      → write partial result to scratch buffer
+    Phase 1 (all blocks): LN1 + QKV proj + attention (split KV tiles) + O proj
+      → each block handles a subset of KV cache tiles for one head
+      → write normalized O-proj + online softmax state (m, l) to scratch buffer
+      → atomic barrier
+    Phase 2 (all blocks): merge KV splits + reduce attention + residual + LN2 + FFN
+      → weighted merge of O-proj partials using online softmax correction
+      → each block handles D_FF/TOTAL_BLOCKS elements of FFN intermediate dim
+      → write FFN partial to scratch buffer
       → atomic barrier
     Phase 3 (all blocks): reduce FFN + residual → h ready for next layer
 
   Output: all blocks participate in tiled output projection.
 
-Single f32 workspace buffer holds both partial results and barrier counters,
-reducing per-step allocation to one jnp.zeros call.
+Single f32 workspace buffer holds partial results, attention merge state (m/l),
+barrier counters, and argmax scratch.
 """
 
 import triton
@@ -44,7 +47,7 @@ def _multi_sm_decode(
     output_proj_ptr,
     token_id_ptr, pos_ptr,
     kv_in_ptr,
-    workspace_ptr,    # single f32 buffer: [partials (N_HEADS*D_MODEL) | barriers (2*N_LAYERS)]
+    workspace_ptr,    # single f32 buffer: [partials | attn_ml | barriers | argmax]
     # Outputs (from out_shape)
     logits_ptr,
     kv_out_ptr,
@@ -56,13 +59,18 @@ def _multi_sm_decode(
     N_HEADS: tl.constexpr,
     N_LAYERS: tl.constexpr,
     MAX_SEQ: tl.constexpr,
+    KV_SPLITS: tl.constexpr,      # KV cache splits per head (1=original, 2+=FlashDecoding)
+    TOTAL_BLOCKS: tl.constexpr,   # N_HEADS * KV_SPLITS
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
     FF_PER_BLOCK: tl.constexpr,
-    BARRIER_OFF: tl.constexpr,  # offset to barrier section = N_HEADS * D_MODEL
-    ARGMAX_OFF: tl.constexpr,   # offset to argmax section = BARRIER_OFF + 2*N_LAYERS
+    ATTN_ML_OFF: tl.constexpr,    # offset to attention m/l section
+    BARRIER_OFF: tl.constexpr,    # offset to barrier section
+    ARGMAX_OFF: tl.constexpr,     # offset to argmax section
 ):
-    pid = tl.program_id(0)  # 0..N_HEADS-1
+    pid = tl.program_id(0)  # 0..TOTAL_BLOCKS-1
+    head_id = pid // KV_SPLITS
+    kv_split = pid % KV_SPLITS
     d = tl.arange(0, D_MODEL)
 
     token_id = tl.load(token_id_ptr)
@@ -70,6 +78,7 @@ def _multi_sm_decode(
 
     # Aliases for workspace sections
     partial_ptr = workspace_ptr
+    attn_ml_ptr = workspace_ptr + ATTN_ML_OFF
     barrier_ptr = workspace_ptr + BARRIER_OFF
     argmax_ptr = workspace_ptr + ARGMAX_OFF
 
@@ -116,7 +125,7 @@ def _multi_sm_decode(
         hc = h - mean
         h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
 
-        head = pid
+        head = head_id
         hd = head * D_HEAD + dh
         cache_off = head * MAX_SEQ * D_HEAD
         h_norm_2d = h_norm[None, :].to(tl.bfloat16)
@@ -135,7 +144,10 @@ def _multi_sm_decode(
         l_i = tl.zeros((1,), dtype=tl.float32)
         o_i = tl.zeros((D_HEAD,), dtype=tl.float32)
 
-        for t in tl.range(0, MAX_SEQ, KV_TILE):
+        POS_PER_SPLIT: tl.constexpr = MAX_SEQ // KV_SPLITS
+        kv_start = kv_split * POS_PER_SPLIT
+        kv_end = kv_start + POS_PER_SPLIT
+        for t in tl.range(kv_start, kv_end, KV_TILE):
             tile_pos = t + tl.arange(0, KV_TILE)
             tile_mask = tile_pos <= pos
 
@@ -162,23 +174,40 @@ def _multi_sm_decode(
             o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)
             m_i = m_new
 
-        attn_out = o_i / l_i
+        attn_out = o_i / tl.maximum(l_i, 1e-10)  # clamp to avoid NaN when split has no valid positions
 
         wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
         o_proj = tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
 
         tl.store(partial_ptr + pid * D_MODEL + d, o_proj)
+        tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
+        tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 
         # Barrier (f32 atomics — exact for small integers)
         b0 = layer * 2
         tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu') < N_HEADS:
+        while tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
             pass
 
-        # ── PHASE 2: Reduce attention + LN2 + FFN ──
+        # ── PHASE 2: Merge KV splits + reduce attention + LN2 + FFN ──
         attn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
-        for i in tl.static_range(N_HEADS):
-            attn_total += tl.load(partial_ptr + i * D_MODEL + d)
+        for head in tl.range(N_HEADS):
+            # Find global max m across KV splits for this head
+            m_max_val = tl.full((), -1e9, dtype=tl.float32)
+            for s in tl.static_range(KV_SPLITS):
+                m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+                m_max_val = tl.maximum(m_max_val, m_s)
+            # Weighted merge of normalized O-projections
+            l_total = tl.full((), 0.0, dtype=tl.float32)
+            o_merged = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for s in tl.static_range(KV_SPLITS):
+                m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+                l_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2 + 1)
+                o_s = tl.load(partial_ptr + (head * KV_SPLITS + s) * D_MODEL + d)
+                w = l_s * tl.exp(m_s - m_max_val)
+                l_total = l_total + w
+                o_merged = o_merged + o_s * w
+            attn_total = attn_total + o_merged / l_total
         h = h + attn_total
 
         ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
@@ -203,12 +232,12 @@ def _multi_sm_decode(
 
         b1 = layer * 2 + 1
         tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu') < N_HEADS:
+        while tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
             pass
 
         # ── PHASE 3: Reduce FFN + residual ──
         ffn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
-        for i in tl.static_range(N_HEADS):
+        for i in tl.range(TOTAL_BLOCKS):
             ffn_total += tl.load(partial_ptr + i * D_MODEL + d)
         h = h + ffn_total + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
 
@@ -220,7 +249,7 @@ def _multi_sm_decode(
     h_final = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
     h_final_2d = h_final[None, :].to(tl.bfloat16)
 
-    TILES_PER_BLOCK: tl.constexpr = VOCAB_PAD // (OUTPUT_VTILE * N_HEADS)
+    TILES_PER_BLOCK: tl.constexpr = VOCAB_PAD // (OUTPUT_VTILE * TOTAL_BLOCKS)
     best_val = -1e9
     best_idx = 0.0
     for tile_idx in tl.range(0, TILES_PER_BLOCK):
@@ -244,14 +273,14 @@ def _multi_sm_decode(
     # Final barrier: all blocks done with output projection
     N_BARRIERS: tl.constexpr = 2 * N_LAYERS
     tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
-    while tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < N_HEADS:
+    while tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
         pass
 
     # Block 0: find global argmax
     if pid == 0:
         global_best_val = -1e9
         global_best_idx = 0.0
-        for i in tl.static_range(N_HEADS):
+        for i in tl.range(TOTAL_BLOCKS):
             v = tl.load(argmax_ptr + i * 2)
             idx = tl.load(argmax_ptr + i * 2 + 1)
             if v > global_best_val:
@@ -262,10 +291,13 @@ def _multi_sm_decode(
 
 # ──────────────────────────────────────────────────────────────────────
 
-def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
-    """Multi-SM fused N-layer decode: one kernel call per token, grid=(N_HEADS,).
+def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_splits=2):
+    """Multi-SM fused N-layer decode: one kernel call per token.
 
-    Uses a single f32 workspace buffer (partials + barriers + argmax scratch).
+    grid=(N_HEADS * kv_splits,). With kv_splits>1, each head's KV attention is
+    split across multiple blocks (FlashDecoding-style) for higher SM utilization.
+
+    Uses a single f32 workspace buffer (partials + attn m/l + barriers + argmax).
     Returns next_token from in-kernel argmax (avoids GPU→CPU sync).
 
     Returns: next_token (scalar int32), logits (vocab_size,), kv_packed (flat bf16)
@@ -278,11 +310,15 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
     max_seq = config["context_len"]
     vocab_pad = w["vocab_pad"]
     total_kv_size = n_layers * 2 * n_heads * max_seq * d_head
-    ff_per_block = d_ff // n_heads
-    barrier_off = n_heads * d_model
+    total_blocks = n_heads * kv_splits
+    ff_per_block = d_ff // total_blocks
+
+    # Workspace layout: partials | attn_ml | barriers | argmax
+    attn_ml_off = total_blocks * d_model
+    barrier_off = attn_ml_off + total_blocks * 2
     # +1 barrier for output projection sync
     argmax_off = barrier_off + 2 * n_layers + 1
-    workspace_size = argmax_off + 2 * n_heads  # per-block (val, idx)
+    workspace_size = argmax_off + 2 * total_blocks  # per-block (val, idx)
 
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
 
@@ -300,12 +336,14 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
             jax.ShapeDtypeStruct((total_kv_size,), jnp.bfloat16),
             jax.ShapeDtypeStruct((1,), jnp.int32),
         ],
-        grid=(n_heads,),
+        grid=(total_blocks,),
         num_warps=4, num_stages=1,
         D_MODEL=d_model, D_HEAD=d_head, D_FF=d_ff,
         N_HEADS=n_heads, N_LAYERS=n_layers, MAX_SEQ=max_seq,
+        KV_SPLITS=kv_splits, TOTAL_BLOCKS=total_blocks,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         FF_PER_BLOCK=ff_per_block,
+        ATTN_ML_OFF=attn_ml_off,
         BARRIER_OFF=barrier_off,
         ARGMAX_OFF=argmax_off,
     )
