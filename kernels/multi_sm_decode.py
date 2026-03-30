@@ -48,6 +48,7 @@ def _multi_sm_decode(
     # Outputs (from out_shape)
     logits_ptr,
     kv_out_ptr,
+    next_token_ptr,   # (1,) int32 — argmax result
     # Config
     D_MODEL: tl.constexpr,
     D_HEAD: tl.constexpr,
@@ -59,6 +60,7 @@ def _multi_sm_decode(
     VOCAB_PAD: tl.constexpr,
     FF_PER_BLOCK: tl.constexpr,
     BARRIER_OFF: tl.constexpr,  # offset to barrier section = N_HEADS * D_MODEL
+    ARGMAX_OFF: tl.constexpr,   # offset to argmax section = BARRIER_OFF + 2*N_LAYERS
 ):
     pid = tl.program_id(0)  # 0..N_HEADS-1
     d = tl.arange(0, D_MODEL)
@@ -69,6 +71,7 @@ def _multi_sm_decode(
     # Aliases for workspace sections
     partial_ptr = workspace_ptr
     barrier_ptr = workspace_ptr + BARRIER_OFF
+    argmax_ptr = workspace_ptr + ARGMAX_OFF
 
     # ── Embedding (all blocks compute redundantly — 2KB from L2) ──
     h = (tl.load(token_emb_ptr + token_id * D_MODEL + d).to(tl.float32)
@@ -218,6 +221,8 @@ def _multi_sm_decode(
     h_final_2d = h_final[None, :].to(tl.bfloat16)
 
     TILES_PER_BLOCK: tl.constexpr = VOCAB_PAD // (OUTPUT_VTILE * N_HEADS)
+    best_val = -1e9
+    best_idx = 0.0
     for tile_idx in tl.range(0, TILES_PER_BLOCK):
         v_start = (pid * TILES_PER_BLOCK + tile_idx) * OUTPUT_VTILE
         vv = v_start + tl.arange(0, OUTPUT_VTILE)
@@ -226,13 +231,44 @@ def _multi_sm_decode(
         tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
         tl.store(logits_ptr + vv, tile_logits)
 
+        # Track per-block argmax
+        tile_max = tl.max(tile_logits)
+        if tile_max > best_val:
+            best_val = tile_max
+            best_idx = (v_start + tl.argmax(tile_logits, axis=0)).to(tl.float32)
+
+    # Write per-block argmax to workspace
+    tl.store(argmax_ptr + pid * 2, best_val)
+    tl.store(argmax_ptr + pid * 2 + 1, best_idx)
+
+    # Final barrier: all blocks done with output projection
+    N_BARRIERS: tl.constexpr = 2 * N_LAYERS
+    tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
+    while tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < N_HEADS:
+        pass
+
+    # Block 0: find global argmax
+    if pid == 0:
+        global_best_val = -1e9
+        global_best_idx = 0.0
+        for i in tl.static_range(N_HEADS):
+            v = tl.load(argmax_ptr + i * 2)
+            idx = tl.load(argmax_ptr + i * 2 + 1)
+            if v > global_best_val:
+                global_best_val = v
+                global_best_idx = idx
+        tl.store(next_token_ptr, global_best_idx.to(tl.int32))
+
 
 # ──────────────────────────────────────────────────────────────────────
 
 def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
     """Multi-SM fused N-layer decode: one kernel call per token, grid=(N_HEADS,).
 
-    Uses a single f32 workspace buffer (partials + barriers) passed as input.
+    Uses a single f32 workspace buffer (partials + barriers + argmax scratch).
+    Returns next_token from in-kernel argmax (avoids GPU→CPU sync).
+
+    Returns: next_token (scalar int32), logits (vocab_size,), kv_packed (flat bf16)
     """
     d_model = config["d_model"]
     d_head = config["d_head"]
@@ -244,11 +280,13 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
     total_kv_size = n_layers * 2 * n_heads * max_seq * d_head
     ff_per_block = d_ff // n_heads
     barrier_off = n_heads * d_model
-    workspace_size = barrier_off + 2 * n_layers
+    # +1 barrier for output projection sync
+    argmax_off = barrier_off + 2 * n_layers + 1
+    workspace_size = argmax_off + 2 * n_heads  # per-block (val, idx)
 
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
 
-    logits_pad, kv_out = jt.triton_call(
+    logits_pad, kv_out, next_token = jt.triton_call(
         w["token_emb"], w["pos_emb"],
         w["packed_w"],
         w["lnf_s"], w["lnf_b"],
@@ -260,6 +298,7 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
         out_shape=[
             jax.ShapeDtypeStruct((vocab_pad,), jnp.float32),
             jax.ShapeDtypeStruct((total_kv_size,), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
         ],
         grid=(n_heads,),
         num_warps=4, num_stages=1,
@@ -268,6 +307,7 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         FF_PER_BLOCK=ff_per_block,
         BARRIER_OFF=barrier_off,
+        ARGMAX_OFF=argmax_off,
     )
 
-    return logits_pad[:vocab_size], kv_out
+    return next_token[0], logits_pad[:vocab_size], kv_out
