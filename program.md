@@ -357,27 +357,38 @@ CURRENT BASELINE (d=512, 8L, 29.7M params):
 The 2% bandwidth utilization means the GPU is 98% idle — there is massive room
 for improvement. Any optimization that moves bandwidth utilization upward is real progress.
 
-### Step 0: Profile to understand where time is spent
+### Step 0: Profile to understand where time is spent — COMPLETED
 
-Before optimizing, you MUST understand the bottleneck. Run Nsight Compute:
-```bash
-/usr/local/cuda/bin/ncu --set full uv run profile_kernels.py 2>&1 | head -100
+Profiled with custom host overhead measurement (profile_host_overhead.py).
+
+```
+PROFILING RESULTS (2026-03-30):
+  Total per step:       3.598 ms  (281 tok/s)
+  GPU kernel time:      3.351 ms  (93% of total)
+  argmax + GPU→CPU sync: 0.134 ms  (4%)
+  Host overhead:         0.113 ms  (3%)
+
+  Without int() sync:   3.031 ms/step (330 tok/s, 17% faster)
+  Amortized (batch):    3.028 ms/step (330 tok/s)
+  Theoretical min:      0.081 ms/tok (836 GB/s)
 ```
 
-Key questions to answer:
-- How much of the 3.48 ms/tok is kernel execution vs Python dispatch vs JAX overhead?
-- Within the kernel: how much time in attention vs FFN vs output projection?
-- What is the actual achieved memory bandwidth during kernel execution?
-- Is the kernel latency-bound (waiting for memory) or occupancy-bound (not enough warps)?
-- How many registers are spilling? What's the actual occupancy?
+**Key findings:**
+1. **Host overhead is NOT the bottleneck** — only 3% of step time.
+   The original hypothesis was wrong. Python/JAX dispatch is negligible at d=512.
+2. **The GPU kernel itself is 93% of step time** (3.35ms of 3.6ms).
+3. **The kernel runs on 1 SM** (grid=(1,)). The 4080 Super has 80 SMs.
+   79 SMs are completely idle during decode. This is the #1 bottleneck.
+4. **Removing int() sync gives 17% speedup** (281→330 tok/s) by avoiding
+   GPU→CPU transfer per step. Easy win.
+5. **Single-SM bandwidth**: 67.7MB / 3.35ms = 20.2 GB/s achieved.
+   This is ~2x the per-SM DRAM bandwidth (836/80 = 10.4 GB/s),
+   indicating significant L2 cache hits (weights are 59.3MB, L2 is 64MB).
 
-Use `nsys profile` for a timeline view of kernel launches vs host activity:
-```bash
-/usr/local/bin/nsys profile -t cuda uv run profile_kernels.py
-```
-
-Document all findings before proceeding to optimization. The profiling results
-determine which optimization below will have the most impact.
+**Revised priority based on profiling:**
+- Step 1 (host overhead) → low impact, only 3% of time
+- Step 2b (multi-SM decode) → HIGHEST IMPACT, 79 idle SMs
+- Step 1c (device argmax) → moderate impact, 17% speedup
 
 ### Step 1: Eliminate host overhead (likely biggest win)
 
