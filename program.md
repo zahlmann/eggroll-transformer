@@ -8,16 +8,24 @@ The focus is on learning to write high-performance GPU kernels for transformer i
 
 ---
 
-## Your Mission
+## Mission
 
-1. Train the model with backprop (done: char val_loss=1.84, BPE val_loss=3.77)
-2. Write a fused Triton inference kernel that generates text token-by-token (done: 4x speedup)
-3. Benchmark against JAX/XLA baseline inference (done: 758 vs 174 tok/s)
-4. BPE tokenization + tiled output kernel (done: vocab=1024, 8 tiles, 4.35x speedup)
-5. Optimize: fuse operations, minimize memory bandwidth, maximize throughput
+Build the fastest possible inference for this transformer using custom Triton kernels.
 
-The goal is to learn kernel-writing skills on a small model where iteration is fast,
-then apply those skills to larger models.
+### Completed
+
+1. Fused Triton prefill + decode kernels (single kernel for small model)
+2. BPE tokenization + tiled output projection (vocab=1024, zero overhead)
+3. Multi-block prefill for d_model=128 (BLOCK_SEQ=32, 3 kernels/layer)
+4. Fused multi-layer decode (all layers + output in one kernel)
+5. Host-side optimization: in-kernel cache updates, precomputed bf16 weights
+
+### Current Performance
+
+Small (d=64, 1L): 3056 tok/s, 16.9x over JAX
+Large (d=128, 2L): 2589 tok/s, 13.9x over JAX
+
+### Next: scale the model and data (see YOUR NEXT TASK below)
 
 ---
 
@@ -162,27 +170,90 @@ kernels/block_decode.py:
   _decode_output_kernel: final LN + output projection
 ```
 
-### Phase A2 remaining (future work)
+### What was done (optimization)
 
-- **context=512+**: attention scores (32, 512) = 64KB per block, need FlashAttention
-  (tiled attention with online softmax). Not needed at current context_len=128.
-- **d_model=256+**: need BLOCK_SEQ=16 or smaller. Straightforward extension.
+- ~~**Persistent kernel**~~ DONE — fused 2-layer decode into single kernel (35% speedup)
+- ~~**Precompute weights**~~ DONE — avoid per-step dtype conversion (57% speedup)
+- ~~**In-kernel cache updates**~~ DONE — eliminate .at[].set() (3.6x speedup, biggest win)
+- ~~**Multi-layer fusion**~~ DONE — h stays in registers between layers
+- **Quantization**: NOT NEEDED at this scale (dispatch-bound, not bandwidth-bound)
 
-### Phase B: Kernel Optimizations
+---
 
-- ~~**Persistent kernel**: eliminate launch overhead~~ DONE — fused 2-layer decode
-  into single kernel (3→1 launch/step, 35% speedup)
-- ~~**Precompute weights**: avoid per-step dtype conversion~~ DONE — 57% speedup
-- **Quantization**: NOT NEEDED — decode is dispatch-bound (0.4ms/step), not bandwidth-bound.
-  Weight loading is 1.3MB at 900 GB/s = 1.4μs. INT8 would save ~0.7μs. Negligible.
-- **Batched decode**: serving optimization, requires multi-sequence KV cache management
-- **Speculative decoding**: needs draft model, more relevant at larger scales
+## YOUR NEXT TASK: Scale Up
 
-### Phase C: Multi-Layer Fusion — DONE
+The kernel infrastructure is solid (14-17x speedup). Now scale up the model and data
+to make the inference kernels work harder and the text quality actually good.
 
-Fused 2-layer decode kernel keeps h in registers between layers (no HBM round-trip).
-Prefill still uses separate kernels per stage (HBM between stages) due to inter-block
-synchronization requirements.
+### Step 1: Bigger Training Data
+
+Shakespeare alone (1.1M chars) is too small for models beyond ~200K params — they overfit.
+Get more data to justify bigger models:
+
+- **Option A: TinyStories** (~500M tokens of simple English stories). Good for small models.
+  Available at https://huggingface.co/datasets/roneneldan/TinyStories
+- **Option B: OpenWebText subset** (~8M tokens sample). More diverse, harder to learn.
+- **Option C: Combine Shakespeare + other public domain literature** (Project Gutenberg).
+  Keep the style consistent. Maybe 10-50M chars total.
+
+Train the BPE tokenizer on the combined corpus. Vocab=2048-4096 should work well with
+more data (the current 1024 was chosen because Shakespeare alone is too small).
+
+### Step 2: Bigger Model (d_model=256, 4 layers)
+
+With more data, scale the model:
+- d_model=256, n_heads=8, d_head=32, n_layers=4, d_ff=1024
+- ~5-10M parameters (vs current 674K)
+- context_len=256 (or 512 if FlashAttention is implemented)
+
+This forces real kernel engineering:
+- **Prefill**: BLOCK_SEQ=16 (256 d_model overflows BLOCK_SEQ=32 blocks).
+  h_block = (16, 256) = 16KB. Attention = (16, 256) = 16KB. Fits.
+- **Decode**: still trivial (M=1, h is 1KB). Fused multi-layer kernel just gets longer.
+  May need to pass weights via a packed buffer instead of 50+ individual pointers.
+- **Output projection**: with vocab=4096, 32 tiles of 128. Already works.
+
+### Step 3: FlashAttention for context_len=512+
+
+At context=256 with BLOCK_SEQ=16, attention scores are (16, 256) = 16KB per block. Fits.
+At context=512, scores are (16, 512) = 32KB. Still fits but tight with other live tensors.
+At context=1024+, need FlashAttention (tiled attention with online softmax).
+
+FlashAttention approach:
+```
+for kv_start in range(0, seq_len, KV_TILE):
+    # Load Q block (already have from current block)
+    # Load K, V tile from cache
+    # Compute partial attention scores
+    # Update running softmax (online normalization)
+    # Accumulate weighted V
+```
+
+This keeps attention scores small: (BLOCK_SEQ, KV_TILE) instead of (BLOCK_SEQ, seq_len).
+
+### Step 4: Training Quality
+
+With bigger data and model:
+- Add learning rate warmup + cosine decay schedule
+- Add weight decay (AdamW)
+- Train for more epochs (20-50)
+- Target val_loss < 3.0 with BPE (coherent multi-sentence text)
+- Consider gradient accumulation if batch doesn't fit in memory
+
+### Step 5: Benchmark at Scale
+
+Compare Triton vs JAX at the larger scale. The speedup story changes:
+- With d_model=256, the model is compute-heavier → kernel fusion matters more
+- With context=512, attention is O(n²) → FlashAttention is critical
+- With 4 layers, the fused decode kernel saves 3 extra launches per layer
+
+### What NOT to change
+
+- Keep the same technology stack (Triton + JAX + jax-triton)
+- Keep BPE tokenization (trained on corpus)
+- Keep the multi-block prefill architecture (just reduce BLOCK_SEQ)
+- Keep the fused multi-layer decode approach (just add more layers)
+- Keep the in-kernel cache update optimization
 
 ---
 
@@ -209,6 +280,7 @@ kernels/fused_prefill.py            — fused Triton prefill kernel (d_model≤6
 kernels/fused_decode.py             — fused Triton decode kernel (d_model≤64)
 kernels/block_prefill.py            — multi-block prefill kernels (d_model≥128)
 kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
+kernels/fused_decode_2layer.py      — fully fused 2-layer decode (fastest path)
 inference_benchmark.py              — speed comparison benchmark
 ```
 
