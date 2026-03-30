@@ -127,6 +127,83 @@ def _attn_kernel(
 
 
 @triton.jit
+def _flash_attn_kernel(
+    h_ptr,
+    q_buf_ptr, k_cache_ptr, v_cache_ptr,
+    wo_ptr,
+    h_out_ptr,
+    D_MODEL: tl.constexpr,
+    D_HEAD: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    SEQ: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    KV_TILE: tl.constexpr,
+):
+    """FlashAttention: tiled KV with online softmax. For SEQ > 256 where full
+    attention scores don't fit in registers.
+
+    Instead of loading all K/V at once ((SEQ, D_HEAD) = too large), process
+    in tiles of KV_TILE positions. Maintain running max and sum for stable softmax.
+    """
+    bid = tl.program_id(0)
+    rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    d = tl.arange(0, D_MODEL)
+    dh = tl.arange(0, D_HEAD)
+
+    scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
+
+    attn_accum = tl.zeros((BLOCK_SEQ, D_MODEL), dtype=tl.float32)
+
+    for head in tl.range(N_HEADS):
+        hd = head * D_HEAD + dh
+        head_off = head * SEQ * D_HEAD
+
+        # Load Q for this block: (BLOCK_SEQ, D_HEAD)
+        Q = tl.load(q_buf_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+
+        # Online softmax accumulators
+        m_i = tl.full((BLOCK_SEQ,), value=-1e9, dtype=tl.float32)  # running max
+        l_i = tl.zeros((BLOCK_SEQ,), dtype=tl.float32)             # running sum of exp
+        o_i = tl.zeros((BLOCK_SEQ, D_HEAD), dtype=tl.float32)      # running weighted V
+
+        for kv_start in tl.range(0, SEQ, KV_TILE):
+            kv_pos = kv_start + tl.arange(0, KV_TILE)
+
+            # Load K, V tile: (KV_TILE, D_HEAD)
+            K_tile = tl.load(k_cache_ptr + head_off + kv_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+            V_tile = tl.load(v_cache_ptr + head_off + kv_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+
+            # Attention scores: (BLOCK_SEQ, KV_TILE)
+            s = tl.dot(Q.to(tl.bfloat16), tl.trans(K_tile.to(tl.bfloat16))).to(tl.float32) * scale
+
+            # Causal mask
+            causal_mask = rows[:, None] >= kv_pos[None, :]
+            s = tl.where(causal_mask, s, -1e9)
+
+            # Online softmax update
+            m_ij = tl.max(s, axis=1)                      # (BLOCK_SEQ,)
+            m_new = tl.maximum(m_i, m_ij)                 # (BLOCK_SEQ,)
+            alpha = tl.exp(m_i - m_new)                   # correction factor
+            p = tl.exp(s - m_new[:, None])                # new exp scores (BLOCK_SEQ, KV_TILE)
+
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            o_i = o_i * alpha[:, None] + tl.dot(p.to(tl.bfloat16), V_tile.to(tl.bfloat16)).to(tl.float32)
+            m_i = m_new
+
+        # Normalize
+        attn_out = o_i / l_i[:, None]  # (BLOCK_SEQ, D_HEAD)
+
+        # O projection: (BLOCK_SEQ, D_HEAD) @ (D_HEAD, D_MODEL) → (BLOCK_SEQ, D_MODEL)
+        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+        attn_accum += tl.dot(attn_out.to(tl.bfloat16), wo).to(tl.float32)
+
+    # Residual connection
+    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :]).to(tl.float32)
+    h = h + attn_accum
+    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h)
+
+
+@triton.jit
 def _ffn_kernel(
     h_ptr,
     ln_scale_ptr, ln_bias_ptr,
@@ -260,18 +337,35 @@ def block_prefill(params, config, x, vocab_size):
         all_v_caches.append(v_cache)
 
         # Kernel 2: Attention + O projection + residual
-        (h,) = jt.triton_call(
-            h, q_buf, k_cache, v_cache,
-            w[f"{p}.attn.o"],
-            kernel=_attn_kernel,
-            out_shape=[
-                jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
-            ],
-            grid=(num_blocks,),
-            num_warps=4, num_stages=1,
-            D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
-            BLOCK_SEQ=block_seq,
-        )
+        # Use FlashAttention for long sequences (SEQ > 256) to keep memory bounded
+        use_flash = seq_len > 256
+        if use_flash:
+            kv_tile = 64  # tile size for KV dimension
+            (h,) = jt.triton_call(
+                h, q_buf, k_cache, v_cache,
+                w[f"{p}.attn.o"],
+                kernel=_flash_attn_kernel,
+                out_shape=[
+                    jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
+                ],
+                grid=(num_blocks,),
+                num_warps=4, num_stages=1,
+                D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
+                BLOCK_SEQ=block_seq, KV_TILE=kv_tile,
+            )
+        else:
+            (h,) = jt.triton_call(
+                h, q_buf, k_cache, v_cache,
+                w[f"{p}.attn.o"],
+                kernel=_attn_kernel,
+                out_shape=[
+                    jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
+                ],
+                grid=(num_blocks,),
+                num_warps=4, num_stages=1,
+                D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
+                BLOCK_SEQ=block_seq,
+            )
 
         # Kernel 3: LN + FFN + residual
         (h,) = jt.triton_call(
