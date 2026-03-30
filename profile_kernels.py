@@ -63,29 +63,50 @@ def measure_prefill(params, config, prompt, vocab_size, n_runs=20):
 def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10,
                    use_multi_sm=True):
     """Measure decode throughput."""
-    decode_fn = multi_sm_decode_nlayer if use_multi_sm else fused_decode_nlayer
-
-    # Warmup
-    kv_tmp = kv_packed
-    t = tok
-    for i in range(5):
-        logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
-        t = jnp.argmax(logits)
-        _ = int(t)
-
-    times = []
-    all_tokens = []
-    for _ in range(n_runs):
+    if use_multi_sm:
+        # Multi-SM returns (next_token, logits, kv_out)
+        # Use in-kernel argmax — no jnp.argmax needed
+        # Warmup
         kv_tmp = kv_packed
         t = tok
-        tokens = []
-        t0 = time.perf_counter()
-        for i in range(n_tokens):
-            logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
+        for i in range(5):
+            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+            _ = int(t)
+
+        times = []
+        all_tokens = []
+        for _ in range(n_runs):
+            kv_tmp = kv_packed
+            t = tok
+            tokens = []
+            t0 = time.perf_counter()
+            for i in range(n_tokens):
+                t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+                tokens.append(int(t))
+            times.append(time.perf_counter() - t0)
+            all_tokens = tokens
+    else:
+        # Single-SM returns (logits, kv_out)
+        kv_tmp = kv_packed
+        t = tok
+        for i in range(5):
+            logits, kv_tmp = fused_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
             t = jnp.argmax(logits)
-            tokens.append(int(t))
-        times.append(time.perf_counter() - t0)
-        all_tokens = tokens
+            _ = int(t)
+
+        times = []
+        all_tokens = []
+        for _ in range(n_runs):
+            kv_tmp = kv_packed
+            t = tok
+            tokens = []
+            t0 = time.perf_counter()
+            for i in range(n_tokens):
+                logits, kv_tmp = fused_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+                t = jnp.argmax(logits)
+                tokens.append(int(t))
+            times.append(time.perf_counter() - t0)
+            all_tokens = tokens
 
     median_ms = np.median(times) * 1000
     return median_ms, all_tokens
