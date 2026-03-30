@@ -454,16 +454,13 @@ accumulators. Target: 9 barriers instead of 17. Saves 0.04-0.08 ms.
 increase outstanding memory requests. Requires splitting heads across multiple blocks
 for KV attention (2 blocks per head, each handling half the KV tiles).
 
-**3c. INT8 weight quantization** — Halve weight buffer to ~30 MB. Fits comfortably
-in L2 with KV cache (38 MB). Effective bandwidth is L2 bandwidth (~2 TB/s), not
-DRAM. Theoretical: 38 MB / 2000 GB/s = 0.019 ms. Requires dequantization in kernel.
-
-**3d. GQA (Grouped-Query Attention)** — 4 KV heads for 16 Q heads → 4x less KV
+**3c. GQA (Grouped-Query Attention)** — 4 KV heads for 16 Q heads → 4x less KV
 cache traffic. Requires retraining but reduces 8 MB KV cache to 2 MB.
 
-**3e. Persistent kernel across steps** — Kernel loops internally across all decode
+**3d. Persistent kernel across steps** — Kernel loops internally across all decode
 steps, polling for new tokens. Eliminates all per-step launch overhead and workspace
-allocation. Most ambitious approach.
+allocation. Most ambitious approach. (Tested: pipelined per-step approach was faster
+due to JAX overlapping dispatch with execution.)
 
 ### What NOT to change
 
@@ -472,6 +469,12 @@ allocation. Most ambitious approach.
 - Keep the multi-block prefill architecture
 - Keep the fused multi-layer decode approach
 - Keep the in-kernel cache update optimization
+- **No quantization** — Quantization (INT8, FP8, etc.) is a deployment optimization
+  technique, not a kernel engineering improvement. The goal of this project is to learn
+  GPU kernel programming by making the kernel itself fast, not to shrink the model.
+  Quantization trades accuracy for bandwidth — it doesn't teach you to write better
+  kernels. If the kernel is bandwidth-bound, the right response is to improve the
+  kernel's memory access patterns, not to reduce the data size.
 
 ---
 
