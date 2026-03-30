@@ -1,12 +1,15 @@
 # Fused Inference
 
-Custom Triton kernels for transformer inference — up to **15x faster** than JAX/XLA baseline. The entire decode step (embedding, attention, FFN, output projection) runs in a **single GPU kernel call**.
+Custom Triton kernels for transformer inference — the entire decode step (embedding, attention, FFN, output projection) runs in a **single GPU kernel call**. At d=512/8L, the naive JAX baseline can't even fit in memory.
 
 ## Quick Start
 
 ```bash
-# Train the scaled model on TinyStories (5.3M params, ~10 min)
+# Train the model on TinyStories (default: d=256, 4L, 5.3M params)
 uv run train_backprop.py
+
+# Or train the large model (d=512, 8L, 29.7M params, ~4 hours)
+uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
 
 # Benchmark Triton vs JAX
 uv run inference_benchmark.py
@@ -29,9 +32,13 @@ Large model (d=256, 4 layers, 5.3M params, TinyStories):
   Triton:    1396 tok/s
   JAX:         92 tok/s
   Speedup:   15.1x
+
+XL model (d=512, 8 layers, 29.7M params, TinyStories full):
+  Triton:     279 tok/s
+  JAX:        OOM (no KV cache, 16GB GPU)
 ```
 
-Text quality at 5.3M params (ppl=5.4) produces coherent multi-paragraph stories.
+Text quality at 29.7M params (ppl=2.91) produces coherent multi-paragraph stories.
 
 ## How It Works
 
@@ -39,33 +46,35 @@ Text quality at 5.3M params (ppl=5.4) produces coherent multi-paragraph stories.
 
 **Small model (d_model=64):** Single fused kernel — all weights stay in registers (132KB model fits in 130KB register budget). Zero HBM round-trips between operations.
 
-**Larger models (d_model=128-256):** Multi-block approach with configurable BLOCK_SEQ (32 for d=128, 16 for d=256). Three Triton kernels per layer (projections, attention, FFN). FlashAttention (tiled KV + online softmax) for context>256.
+**Larger models (d_model=128-512):** Multi-block approach with configurable BLOCK_SEQ (32 for d=128, 16 for d=256, 8 for d=512). Three Triton kernels per layer (projections, attention, FFN). FlashAttention (tiled KV + online softmax) for context>256.
 
 ### Decode (generate tokens one at a time)
 
 Fully fused N-layer kernel processes all layers in one launch using packed weight buffers and packed KV caches. Key optimizations:
-- **In-kernel KV cache updates** — the kernel writes full updated caches directly, avoiding expensive `.at[].set()` scatter ops in Python (3.6x speedup alone)
-- **Packed weight buffer** — all per-layer weights in one bf16 buffer, offsets computed from layer index
-- **Packed KV caches** — all layers' caches in one flat buffer, stays packed between decode steps
-- **Precomputed bf16 weights** — dtype conversions done once before the decode loop
+- **In-kernel KV cache updates** — the kernel writes full updated caches directly (3.6x speedup)
+- **Packed weight buffer** — all per-layer weights in one bf16 buffer
+- **Packed KV caches** — all layers' caches in one flat buffer, stays packed between steps
 - **Multi-layer fusion** — h stays in registers between layers (no HBM round-trip)
+- **tl.dot projections** — avoids register overflow at d=512 by tiling internally
+- **Tiled KV decode** — online softmax over KV_TILE=64 for large context (512+)
+
+### Speculative Decoding
+
+Draft model (d=128, 1L) proposes tokens, target model (d=256, 4L) verifies in parallel via custom batch verification kernel. Key finding: diminishing returns when both models are already fast from fused kernels.
 
 ### Training
 
-AdamW with linear warmup + cosine decay on TinyStories (14M BPE tokens, vocab=4096). Trained ByteLevel BPE tokenizer on the corpus (0% UNK).
-
-### Key Insight
-
-For small-to-medium models, **host-side overhead dominates GPU kernel time**. The GPU kernel takes <1ms per decode step, but Python/JAX dispatch, dtype conversions, and array scatters add several ms. Eliminating all host overhead through kernel fusion gives 15x speedup consistently across model scales.
+AdamW with linear warmup + cosine decay. Full TinyStories (487M BPE tokens, vocab=4096). Chunked tokenization to handle 1.9GB text without OOM.
 
 ## Architecture
 
 ```
-Decoder-only transformer
+Decoder-only transformer (d_head=32 for all sizes)
 
-Small:  d=64,  h=2, l=1, vocab=1024, 189K params  (Shakespeare)
-Medium: d=128, h=4, l=2, vocab=1024, 674K params  (Shakespeare)
-Large:  d=256, h=8, l=4, vocab=4096, 5.3M params  (TinyStories)
+Small:  d=64,  h=2,  l=1, vocab=1024,  189K params  (Shakespeare)
+Medium: d=128, h=4,  l=2, vocab=1024,  674K params  (Shakespeare)
+Large:  d=256, h=8,  l=4, vocab=4096, 5.3M params   (TinyStories)
+XL:     d=512, h=16, l=8, vocab=4096, 29.7M params  (TinyStories full)
 ```
 
 ## Files
@@ -82,5 +91,7 @@ kernels/block_prefill.py                multi-block prefill + FlashAttention (d_
 kernels/block_decode.py                 per-layer decode (d_model>=128)
 kernels/fused_decode_2layer.py          fully fused 2-layer decode
 kernels/fused_decode_nlayer.py          fully fused N-layer decode (packed weights/caches)
+kernels/verify_decode.py                parallel batch verification (speculative decode)
 inference_benchmark.py                  speed comparison benchmark
+speculative_decode.py                   speculative decoding benchmark
 ```
