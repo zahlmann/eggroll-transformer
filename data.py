@@ -1,4 +1,4 @@
-"""Download and prepare Shakespeare dataset (char-level or BPE)."""
+"""Download and prepare datasets (Shakespeare or TinyStories) with char-level or BPE tokenization."""
 
 import os
 import pickle
@@ -21,48 +21,75 @@ def download_shakespeare():
     return text
 
 
-def prepare_data(context_len=128, val_fraction=0.1, tokenizer="char", bpe_vocab_size=512):
-    """Prepare Shakespeare dataset.
+def load_tinystories():
+    """Load TinyStories dataset from pre-downloaded text files.
+
+    Returns (train_text, val_text). Download with:
+        datasets.load_dataset('roneneldan/TinyStories')
+    """
+    train_path = os.path.join(DATA_DIR, "tinystories_train.txt")
+    val_path = os.path.join(DATA_DIR, "tinystories_val.txt")
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(
+            f"TinyStories not found at {train_path}. "
+            "Download with: datasets.load_dataset('roneneldan/TinyStories')"
+        )
+    with open(train_path, "r") as f:
+        train_text = f.read()
+    with open(val_path, "r") as f:
+        val_text = f.read()
+    return train_text, val_text
+
+
+def prepare_data(context_len=128, val_fraction=0.1, tokenizer="char",
+                 bpe_vocab_size=512, dataset="shakespeare"):
+    """Prepare dataset for training.
 
     Args:
-        tokenizer: "char" for character-level (vocab=65),
+        dataset: "shakespeare" or "tinystories".
+        tokenizer: "char" for character-level,
                    "bpe" for GPT-2 BPE with restricted vocab,
-                   "trained_bpe" for BPE trained on Shakespeare (0% UNK).
+                   "trained_bpe" for BPE trained on corpus (0% UNK).
         bpe_vocab_size: vocabulary size (only used if tokenizer="bpe" or "trained_bpe").
     """
-    text = download_shakespeare()
+    if dataset == "tinystories":
+        train_text, val_text = load_tinystories()
+    else:
+        text = download_shakespeare()
+        split = int(len(text) * (1 - val_fraction))
+        train_text, val_text = text[:split], text[split:]
 
     if tokenizer == "char":
-        return _prepare_char(text, context_len, val_fraction)
+        return _prepare_char_from_texts(train_text, val_text, context_len)
     elif tokenizer == "bpe":
-        return _prepare_bpe(text, context_len, val_fraction, bpe_vocab_size)
+        combined = train_text + val_text
+        return _prepare_bpe(combined, context_len, val_fraction, bpe_vocab_size)
     elif tokenizer == "trained_bpe":
-        return _prepare_trained_bpe(text, context_len, val_fraction, bpe_vocab_size)
+        return _prepare_trained_bpe_from_texts(
+            train_text, val_text, context_len, bpe_vocab_size, dataset)
     else:
         raise ValueError(f"Unknown tokenizer: {tokenizer}")
 
 
-def _prepare_char(text, context_len, val_fraction):
-    chars = sorted(set(text))
+def _make_sequences(arr, context_len):
+    n_seq = (len(arr) - 1) // context_len
+    arr = arr[: n_seq * context_len + 1]
+    x = arr[:-1].reshape(n_seq, context_len)
+    y = arr[1:].reshape(n_seq, context_len)
+    return x, y
+
+
+def _prepare_char_from_texts(train_text, val_text, context_len):
+    all_text = train_text + val_text
+    chars = sorted(set(all_text))
     vocab_size = len(chars)
     char_to_idx = {c: i for i, c in enumerate(chars)}
 
-    data = np.array([char_to_idx[c] for c in text], dtype=np.int32)
+    train_data = np.array([char_to_idx[c] for c in train_text], dtype=np.int32)
+    val_data = np.array([char_to_idx[c] for c in val_text], dtype=np.int32)
 
-    n = len(data)
-    split = int(n * (1 - val_fraction))
-    train_data = data[:split]
-    val_data = data[split:]
-
-    def make_sequences(arr):
-        n_seq = (len(arr) - 1) // context_len
-        arr = arr[: n_seq * context_len + 1]
-        x = arr[:-1].reshape(n_seq, context_len)
-        y = arr[1:].reshape(n_seq, context_len)
-        return x, y
-
-    train_x, train_y = make_sequences(train_data)
-    val_x, val_y = make_sequences(val_data)
+    train_x, train_y = _make_sequences(train_data, context_len)
+    val_x, val_y = _make_sequences(val_data, context_len)
 
     return {
         "train_x": train_x,
@@ -115,15 +142,8 @@ def _prepare_bpe(text, context_len, val_fraction, bpe_vocab_size):
     train_data = data[:split]
     val_data = data[split:]
 
-    def make_sequences(arr):
-        n_seq = (len(arr) - 1) // context_len
-        arr = arr[: n_seq * context_len + 1]
-        x = arr[:-1].reshape(n_seq, context_len)
-        y = arr[1:].reshape(n_seq, context_len)
-        return x, y
-
-    train_x, train_y = make_sequences(train_data)
-    val_x, val_y = make_sequences(val_data)
+    train_x, train_y = _make_sequences(train_data, context_len)
+    val_x, val_y = _make_sequences(val_data, context_len)
 
     def decode_tokens(ids):
         return b"".join(compact_to_bytes.get(int(i), b"?") for i in ids).decode("utf-8", errors="replace")
@@ -140,10 +160,11 @@ def _prepare_bpe(text, context_len, val_fraction, bpe_vocab_size):
     }
 
 
-def _prepare_trained_bpe(text, context_len, val_fraction, vocab_size):
+def _prepare_trained_bpe_from_texts(train_text, val_text, context_len, vocab_size,
+                                     dataset="shakespeare"):
     from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
-    tokenizer_path = os.path.join(DATA_DIR, f"trained_bpe_{vocab_size}.json")
+    tokenizer_path = os.path.join(DATA_DIR, f"trained_bpe_{dataset}_{vocab_size}.json")
 
     if os.path.exists(tokenizer_path):
         tok = Tokenizer.from_file(tokenizer_path)
@@ -153,15 +174,22 @@ def _prepare_trained_bpe(text, context_len, val_fraction, vocab_size):
         tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         tok.decoder = decoders.ByteLevel()
         trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["<pad>"])
-        corpus_path = os.path.join(DATA_DIR, "input.txt")
+        # Write train text to temp file for tokenizer training
+        corpus_path = os.path.join(DATA_DIR, f"_train_corpus_{dataset}.txt")
+        with open(corpus_path, "w") as f:
+            f.write(train_text)
         tok.train([corpus_path], trainer)
         tok.save(tokenizer_path)
+        os.remove(corpus_path)
 
-    all_tokens = tok.encode(text).ids
+    train_tokens = tok.encode(train_text).ids
+    val_tokens = tok.encode(val_text).ids
     actual_vocab = tok.get_vocab_size()
-    print(f"Trained BPE: {len(all_tokens)} tokens, vocab={actual_vocab}")
+    print(f"Trained BPE ({dataset}): {len(train_tokens)} train tokens, "
+          f"{len(val_tokens)} val tokens, vocab={actual_vocab}")
 
-    data = np.array(all_tokens, dtype=np.int32)
+    train_data = np.array(train_tokens, dtype=np.int32)
+    val_data = np.array(val_tokens, dtype=np.int32)
 
     # Save vocab mapping for inference
     vocab_path = os.path.join(DATA_DIR, "bpe_vocab.pkl")
@@ -173,20 +201,8 @@ def _prepare_trained_bpe(text, context_len, val_fraction, vocab_size):
         }, f)
     print(f"Saved BPE vocab mapping to {vocab_path}")
 
-    n = len(data)
-    split = int(n * (1 - val_fraction))
-    train_data = data[:split]
-    val_data = data[split:]
-
-    def make_sequences(arr):
-        n_seq = (len(arr) - 1) // context_len
-        arr = arr[: n_seq * context_len + 1]
-        x = arr[:-1].reshape(n_seq, context_len)
-        y = arr[1:].reshape(n_seq, context_len)
-        return x, y
-
-    train_x, train_y = make_sequences(train_data)
-    val_x, val_y = make_sequences(val_data)
+    train_x, train_y = _make_sequences(train_data, context_len)
+    val_x, val_y = _make_sequences(val_data, context_len)
 
     def decode_tokens(ids):
         return tok.decode(list(int(i) for i in ids))
@@ -215,14 +231,17 @@ def load_bpe_vocab():
 
 
 if __name__ == "__main__":
-    print("=== Char-level ===")
-    d = prepare_data(tokenizer="char")
+    import sys
+    ds = sys.argv[1] if len(sys.argv) > 1 else "shakespeare"
+
+    print(f"=== Char-level ({ds}) ===")
+    d = prepare_data(tokenizer="char", dataset=ds)
     print(f"Vocab size: {d['vocab_size']}")
     print(f"Train sequences: {d['train_x'].shape}")
     print(f"Val sequences: {d['val_x'].shape}")
 
-    print("\n=== BPE ===")
-    d = prepare_data(tokenizer="bpe", bpe_vocab_size=512)
+    print(f"\n=== Trained BPE ({ds}, vocab=4096) ===")
+    d = prepare_data(tokenizer="trained_bpe", bpe_vocab_size=4096, dataset=ds)
     print(f"Vocab size: {d['vocab_size']}")
     print(f"Train sequences: {d['train_x'].shape}")
     print(f"Val sequences: {d['val_x'].shape}")
