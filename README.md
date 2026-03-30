@@ -2,6 +2,10 @@
 
 Custom Triton kernels for transformer inference on a single **RTX 4080 Super (16GB VRAM)**. The entire decode step (embedding, attention, FFN, output projection) runs in a **single GPU kernel call**.
 
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — a coding agent is pointed at `program.md` repeatedly to make progress autonomously. The human only steers which direction to work on next; the agent handles implementation, debugging, benchmarking, and documentation.
+
+See [`repo_explained_from_zero.md`](repo_explained_from_zero.md) for a ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all the techniques used in this project.
+
 ## Quick Start
 
 ```bash
