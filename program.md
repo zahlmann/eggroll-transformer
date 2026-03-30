@@ -24,6 +24,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 8. Fused N-layer decode with packed weights/caches (any layer count)
 9. FlashAttention for context>256 (tiled KV + online softmax)
 10. AdamW + LR warmup + cosine decay training improvements
+11. Speculative decoding with parallel verification kernel
 
 ### Current Performance
 
@@ -230,6 +231,69 @@ All 5 steps completed. Speedup holds at 15x with 8x larger model.
 
 ---
 
+## COMPLETED: Speculative Decoding (Phase B)
+
+Implemented speculative decoding with a custom parallel verification kernel.
+
+### What was done
+
+1. **Draft model**: Trained d=128, h=4, l=1 (1.3M params, ppl=8.76) on TinyStories
+   with same vocab=4096 as target. Saved to `draft_weights.pkl`.
+
+2. **Speculative decode algorithm**: Draft generates K tokens autoregressively,
+   target verifies in parallel, greedy accept/reject with first-disagreement cutoff.
+
+3. **Parallel verification kernel** (`kernels/verify_decode.py`): Processes K draft
+   tokens through the full target model in ONE kernel call. Key techniques:
+   - Pads to PAD_K=16 internally for `tl.dot` shape compatibility (inner dim >= 16)
+   - Online softmax over tiled KV cache (same as FlashAttention) for prefix tokens
+   - Causal attention among draft tokens with runtime `real_k` mask
+   - Single grid=(1,) launch — all K tokens in one thread block
+
+4. **Correctness verified**: Parallel kernel matches sequential decode within bf16
+   tolerance (max logit diff < 0.06).
+
+### Results
+
+```
+Standard target decode:                1395 tok/s
+Speculative K=2 (sequential verify):    707 tok/s  (0.51x)  acceptance=51%
+Speculative K=2 (parallel verify):      715 tok/s  (0.51x)  acceptance=50%
+Speculative K=4 (sequential verify):    488 tok/s  (0.35x)  acceptance=37%
+Speculative K=4 (parallel verify):      632 tok/s  (0.45x)  acceptance=36%
+
+Parallel kernel speedup over sequential: 1.30x at K=4
+```
+
+### Key findings
+
+- **Speculative decoding has diminishing returns at small model scale.**
+  With fused kernels, both draft (~2500 tok/s) and target (~1400 tok/s) are
+  extremely fast. The speed ratio is only ~2x, not the ~10x needed for
+  speculative decoding to be profitable.
+
+- **Acceptance rate is the bottleneck.** With a 1-layer draft (ppl=8.76) vs
+  4-layer target (ppl=5.40), greedy acceptance is only 36-51%. Speculative
+  decoding needs 80%+ acceptance to break even at this speed ratio.
+
+- **The parallel verification kernel works.** 1.3x faster than K sequential
+  decode calls at K=4. The kernel correctly handles prefix cache attention,
+  causal draft-draft attention, and online softmax — all in one launch.
+
+- **When speculative decoding helps:** Large, slow target models (e.g., 70B at
+  20 tok/s) with a fast draft (7B at 200 tok/s) give a 10x speed ratio.
+  At that ratio, even 50% acceptance yields 2-3x speedup.
+
+### Kernel engineering lesson
+
+23. **Batch verification is a "mini-prefill" with existing KV cache.** The
+    verification kernel processes K tokens through all layers, attending to P
+    cached tokens (via tiled KV + online softmax) plus K draft tokens (via
+    causal intra-draft attention). Padding K to 16 satisfies Triton's
+    `tl.dot` minimum inner dimension requirement.
+
+---
+
 ## YOUR NEXT TASK: Further Scaling or Optimization
 
 Possible directions for continued work:
@@ -241,13 +305,7 @@ Possible directions for continued work:
 - FlashAttention essential for context≥512
 - May need gradient accumulation for training
 
-### Option B: Speculative Decoding
-
-- Use the small (d=64) model as a draft model to propose tokens
-- Verify with the large (d=256) model
-- Can achieve 2-3x additional speedup for decode
-
-### Option C: Batched Inference
+### Option B: Batched Inference
 
 - Generate multiple sequences in parallel
 - Uses tensor cores for decode (M>1 enables matmul)
@@ -288,7 +346,11 @@ kernels/block_prefill.py            — multi-block prefill + FlashAttention (d_
 kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
 kernels/fused_decode_2layer.py      — fully fused 2-layer decode
 kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
+kernels/verify_decode.py            — parallel batch verification kernel (speculative decode)
 inference_benchmark.py              — speed comparison benchmark
+speculative_decode.py               — speculative decoding benchmark (draft+target)
+draft_weights.pkl                   — draft model weights (d=128, 1L, 1.3M params)
+target_weights.pkl                  — target model weights (d=256, 4L, 5.3M params)
 ```
 
 ---
