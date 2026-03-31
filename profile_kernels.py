@@ -32,6 +32,7 @@ from kernels.block_prefill import block_prefill
 from kernels.fused_decode_nlayer import (
     fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
 from kernels.multi_sm_decode import multi_sm_decode_nlayer
+from kernels.batched_decode import batched_decode_nlayer
 
 
 def load_params():
@@ -119,6 +120,49 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
                 tokens.append(int(t))
             times.append(time.perf_counter() - t0)
             all_tokens = tokens
+
+    median_ms = np.median(times) * 1000
+    return median_ms, all_tokens
+
+
+def measure_batched_decode(w, config, tok, start_pos, kv_packed, vocab_size,
+                           batch_size=4, n_tokens=128, n_runs=10):
+    """Measure batched decode throughput.
+
+    Runs B identical sequences in parallel to isolate the kernel speedup.
+    Total throughput = B * n_tokens / time.
+    """
+    # Replicate inputs for B sequences
+    token_ids = jnp.full((batch_size,), tok, dtype=jnp.int32)
+    positions = jnp.full((batch_size,), start_pos, dtype=jnp.int32)
+    # Concatenate B copies of the KV cache
+    kv_batch = jnp.tile(kv_packed, batch_size)
+
+    # Warmup
+    kv_tmp = kv_batch
+    tids = token_ids
+    for i in range(5):
+        pos = jnp.full((batch_size,), start_pos + i, dtype=jnp.int32)
+        next_toks, _, kv_tmp = batched_decode_nlayer(
+            w, config, tids, pos, kv_tmp, vocab_size, batch_size)
+        tids = next_toks
+        _ = int(next_toks[0])
+
+    times = []
+    all_tokens = []
+    for _ in range(n_runs):
+        kv_tmp = kv_batch
+        tids = token_ids
+        tokens_b0 = []
+        t0 = time.perf_counter()
+        for i in range(n_tokens):
+            pos = jnp.full((batch_size,), start_pos + i, dtype=jnp.int32)
+            next_toks, _, kv_tmp = batched_decode_nlayer(
+                w, config, tids, pos, kv_tmp, vocab_size, batch_size)
+            tids = next_toks
+            tokens_b0.append(int(next_toks[0]))
+        times.append(time.perf_counter() - t0)
+        all_tokens = tokens_b0
 
     median_ms = np.median(times) * 1000
     return median_ms, all_tokens
@@ -247,6 +291,28 @@ def main():
     else:
         decode_ms_old = decode_ms  # for end-to-end calc
         print(f"--- Decode: Single-SM skipped (GQA not supported) ---")
+        print()
+
+    # Batched decode
+    for B in [4, 8]:
+        print(f"--- Decode: Batched B={B} ({GEN_LEN} tokens/seq, grid={total_blocks}) ---")
+        try:
+            batch_ms, batch_tokens = measure_batched_decode(
+                w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
+                batch_size=B, n_tokens=GEN_LEN, n_runs=args.n_runs)
+            total_tokens_batch = B * GEN_LEN
+            batch_tok_per_s = total_tokens_batch / batch_ms * 1000
+            batch_ms_per_tok = batch_ms / GEN_LEN
+            print(f"Total:            {batch_ms:.1f} ms ({GEN_LEN} steps)")
+            print(f"Per step:         {batch_ms_per_tok:.3f} ms")
+            print(f"Throughput:       {batch_tok_per_s:.0f} tok/s total ({batch_tok_per_s/B:.0f} per seq)")
+            print(f"Speedup vs B=1:   {batch_tok_per_s / tok_per_s:.2f}x total throughput")
+            print(f"Text (seq 0):     {decode_fn(batch_tokens)[:100]}...")
+            # Verify seq 0 matches single-sequence
+            match = batch_tokens == tokens
+            print(f"Matches single:   {'YES' if match else 'NO (expected for greedy)'}")
+        except Exception as e:
+            print(f"ERROR: {e}")
         print()
 
     # End-to-end
