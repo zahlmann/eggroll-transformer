@@ -52,35 +52,31 @@ def generate_triton(params, config, prompt, n_tokens, vocab_size):
             tokens.append(int(tok))
         return tokens
     else:
-        # Larger model: multi-block prefill + fused decode
-        from kernels.block_prefill import block_prefill
+        # Larger model: prefill + multi-SM decode
+        from kernels.fused_decode_nlayer import prepare_decode_weights_nlayer, pack_kv_caches
+        from kernels.multi_sm_decode import multi_sm_decode_nlayer
+        from model import prefill_with_kv
+
+        is_gqa = config.get("n_kv_heads", n_heads) != n_heads
 
         x = jnp.pad(prompt, (0, ctx_len - len(prompt))).astype(jnp.int32)
-        logits, k_caches, v_caches = block_prefill(params, config, x, vocab_size)
-        tokens = []
-        tok = jnp.argmax(logits[len(prompt) - 1])
-        tokens.append(int(tok))
 
-        if n_layers == 2:
-            from kernels.fused_decode_2layer import fused_decode_2layer, prepare_decode_weights
-            w = prepare_decode_weights(params, config, vocab_size)
-            for i in range(n_tokens - 1):
-                logits, k_caches, v_caches = fused_decode_2layer(
-                    w, config, tok, len(prompt) + i,
-                    k_caches, v_caches, vocab_size)
-                tok = jnp.argmax(logits)
-                tokens.append(int(tok))
+        if is_gqa:
+            logits, k_caches, v_caches = prefill_with_kv(params, config, x)
         else:
-            from kernels.fused_decode_nlayer import (
-                fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
-            w = prepare_decode_weights_nlayer(params, config, vocab_size)
-            kv_packed = pack_kv_caches(k_caches, v_caches)
-            for i in range(n_tokens - 1):
-                logits, kv_packed = fused_decode_nlayer(
-                    w, config, tok, len(prompt) + i,
-                    kv_packed, vocab_size)
-                tok = jnp.argmax(logits)
-                tokens.append(int(tok))
+            from kernels.block_prefill import block_prefill
+            logits, k_caches, v_caches = block_prefill(params, config, x, vocab_size)
+
+        w = prepare_decode_weights_nlayer(params, config, vocab_size)
+        kv_packed = pack_kv_caches(k_caches, v_caches)
+        tok = jnp.argmax(logits[len(prompt) - 1])
+        tokens = [int(tok)]
+
+        for i in range(n_tokens - 1):
+            tok, _, kv_packed = multi_sm_decode_nlayer(
+                w, config, tok, len(prompt) + i,
+                kv_packed, vocab_size)
+            tokens.append(int(tok))
         return tokens
 
 
