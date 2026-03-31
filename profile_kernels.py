@@ -231,17 +231,23 @@ def main():
     print(f"Throughput:       {tok_per_s:.0f} tok/s")
     print()
 
-    # Single-SM decode (reference)
-    print(f"--- Decode: Single-SM ({GEN_LEN} tokens, grid=1) ---")
-    decode_ms_old, _ = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
-                                       n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=False)
-    tok_per_s_old = GEN_LEN / decode_ms_old * 1000
-    ms_per_tok_old = decode_ms_old / GEN_LEN
-    print(f"Total:            {decode_ms_old:.1f} ms")
-    print(f"Per token:        {ms_per_tok_old:.3f} ms/tok")
-    print(f"Throughput:       {tok_per_s_old:.0f} tok/s")
-    print(f"Multi-SM speedup: {decode_ms_old / decode_ms:.2f}x")
-    print()
+    # Single-SM decode (reference) — skip for GQA models (single-SM kernel doesn't support GQA)
+    is_gqa = config.get("n_kv_heads", n_heads) != n_heads
+    if not is_gqa:
+        print(f"--- Decode: Single-SM ({GEN_LEN} tokens, grid=1) ---")
+        decode_ms_old, _ = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
+                                           n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=False)
+        tok_per_s_old = GEN_LEN / decode_ms_old * 1000
+        ms_per_tok_old = decode_ms_old / GEN_LEN
+        print(f"Total:            {decode_ms_old:.1f} ms")
+        print(f"Per token:        {ms_per_tok_old:.3f} ms/tok")
+        print(f"Throughput:       {tok_per_s_old:.0f} tok/s")
+        print(f"Multi-SM speedup: {decode_ms_old / decode_ms:.2f}x")
+        print()
+    else:
+        decode_ms_old = decode_ms  # for end-to-end calc
+        print(f"--- Decode: Single-SM skipped (GQA not supported) ---")
+        print()
 
     # End-to-end
     total_ms = prefill_ms + decode_ms
