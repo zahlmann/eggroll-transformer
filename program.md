@@ -29,6 +29,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
 14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
 15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
+16. GQA: 4 KV heads for 16 Q heads. ppl 2.96 (was 2.91). KV 8.4→2.1 MB. No speedup (barrier-limited)
 
 ### Current Performance (RTX 4080 Super)
 
@@ -491,8 +492,11 @@ Merge uses online softmax correction: weighted average of normalized O-projectio
 Result: 1734→1851 tok/s (+10%). grid=64 (kv_splits=4) was slightly slower due to
 barrier contention — 32 blocks is the sweet spot for this model.
 
-**3c. GQA (Grouped-Query Attention)** — 4 KV heads for 16 Q heads → 4x less KV
-cache traffic. Requires retraining but reduces 8 MB KV cache to 2 MB.
+**3c. GQA (Grouped-Query Attention)** — DONE. 4 KV heads for 16 Q heads.
+Retrained: 26.5M params, ppl=2.96 (vs MHA ppl=2.91). KV cache 8.4→2.1 MB.
+Total data 67.7→55.1 MB (fits in L2!). But single-sequence decode is NOT faster
+(0.95x) because the bottleneck is barriers, not memory traffic. GQA value is
+mainly for batched inference where KV cache scales with batch size.
 
 **3d. Persistent kernel across steps** — Kernel loops internally across all decode
 steps, polling for new tokens. Eliminates all per-step launch overhead and workspace
@@ -727,3 +731,11 @@ baseline_metrics.txt                — current numbers to beat
     on device, JAX dispatches next call while current runs) achieves 3108 tok/s vs
     1937 tok/s with sync. For real applications, collect tokens on device and batch-
     transfer to CPU periodically.
+
+36. **GQA doesn't help single-sequence decode when barrier-limited.** With 17
+    barriers taking ~50% of kernel time, reducing data from 67.7 MB to 55.1 MB
+    (via GQA's 4x smaller KV cache + fewer K/V weights) gives 0% speedup. The
+    memory access is already served from L2 at high bandwidth; the bottleneck is
+    the barrier spin-wait. GQA's value is for batched inference (batch=8 KV cache:
+    16.8 MB GQA vs 67.2 MB MHA) and long-context scenarios. Lesson: always profile
+    to identify the actual bottleneck before optimizing.

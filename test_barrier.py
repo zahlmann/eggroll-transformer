@@ -1,65 +1,56 @@
-"""Minimal test: verify Triton cross-block barrier mechanism works."""
-
+"""Debug: test if asymmetric barrier produces correct results vs original barrier."""
 import os
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
-import triton
-import triton.language as tl
+import pickle
 import jax
 import jax.numpy as jnp
-import jax_triton as jt
+
+from kernels.block_prefill import block_prefill
+from kernels.fused_decode_nlayer import prepare_decode_weights_nlayer, pack_kv_caches
+from kernels.multi_sm_decode import multi_sm_decode_nlayer
 
 
-@triton.jit
-def _barrier_test(
-    # Inputs (positional args in jt.triton_call)
-    scratch_ptr,
-    barrier_ptr,
-    # Output (from out_shape)
-    out_ptr,
-    N_BLOCKS: tl.constexpr,
-):
-    """Each block writes its ID to scratch, barrier, then block 0 sums all."""
-    pid = tl.program_id(0)
-
-    # Phase 1: each block writes its pid + 1 to scratch
-    tl.store(scratch_ptr + pid, (pid + 1).to(tl.float32))
-
-    # Barrier: signal and wait
-    tl.atomic_add(barrier_ptr, 1, sem='release', scope='gpu')
-    while tl.atomic_add(barrier_ptr, 0, sem='acquire', scope='gpu') < N_BLOCKS:
-        pass
-
-    # Phase 2: block 0 sums all values
-    if pid == 0:
-        total = 0.0
-        for i in tl.static_range(N_BLOCKS):
-            total += tl.load(scratch_ptr + i)
-        tl.store(out_ptr, total)
+def load_params():
+    with open("weights.pkl", "rb") as f:
+        saved = pickle.load(f)
+    params = {k: jnp.array(v) for k, v in saved["params"].items()}
+    config = saved["config"]
+    return params, config
 
 
-def test_barrier():
-    N = 16
-    scratch = jnp.zeros((N,), dtype=jnp.float32)
-    barrier = jnp.zeros((1,), dtype=jnp.int32)
+def main():
+    params, config = load_params()
+    vocab_size = config["vocab_size"]
+    prompt_len = 128
 
-    print(f"Testing barrier with {N} blocks...")
-    (result,) = jt.triton_call(
-        scratch,
-        barrier,
-        kernel=_barrier_test,
-        out_shape=[jax.ShapeDtypeStruct((1,), jnp.float32)],
-        grid=(N,),
-        num_warps=4, num_stages=1,
-        N_BLOCKS=N,
-    )
+    prompt = jnp.arange(prompt_len, dtype=jnp.int32) % vocab_size
+    x = jnp.pad(prompt, (0, config["context_len"] - prompt_len)).astype(jnp.int32)
+    logits, kc, vc = block_prefill(params, config, x, vocab_size)
+    _ = logits.block_until_ready()
 
-    expected = sum(range(1, N+1))  # 1+2+...+16 = 136
-    actual = float(result[0])
-    print(f"  Expected: {expected}")
-    print(f"  Got:      {actual}")
-    print(f"  PASS" if abs(actual - expected) < 0.01 else f"  FAIL")
+    kv_packed = pack_kv_caches(kc, vc)
+    w = prepare_decode_weights_nlayer(params, config, vocab_size)
+    tok = jnp.argmax(logits[prompt_len - 1])
+
+    # Compare step-by-step: kv_splits=1 vs kv_splits=2
+    print("Step-by-step comparison (kv_splits=1 vs kv_splits=2):")
+    kv1 = kv_packed
+    kv2 = kv_packed
+    t1 = tok
+    t2 = tok
+    for i in range(20):
+        t1, logits1, kv1 = multi_sm_decode_nlayer(w, config, t1, prompt_len + i, kv1, vocab_size, kv_splits=1)
+        t2, logits2, kv2 = multi_sm_decode_nlayer(w, config, t2, prompt_len + i, kv2, vocab_size, kv_splits=2)
+        tok1 = int(t1)
+        tok2 = int(t2)
+        ldiff = float(jnp.max(jnp.abs(logits1 - logits2)))
+        kv_diff = float(jnp.max(jnp.abs(kv1.astype(jnp.float32) - kv2.astype(jnp.float32))))
+        match = "Y" if tok1 == tok2 else "N"
+        print(f"  step {i:2d}: tok={tok1:4d}/{tok2:4d} {match}  logit_diff={ldiff:.4f}  kv_diff={kv_diff:.4f}")
+        if tok1 != tok2:
+            break
 
 
 if __name__ == "__main__":
-    test_barrier()
+    main()
