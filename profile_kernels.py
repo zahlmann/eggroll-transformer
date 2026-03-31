@@ -169,6 +169,38 @@ def measure_batched_decode(w, config, tok, start_pos, kv_packed, vocab_size,
     return median_ms, all_tokens
 
 
+def measure_batched_pipelined(w, config, tok, start_pos, kv_packed, vocab_size,
+                              batch_size=4, n_tokens=128, n_runs=10):
+    """Measure pipelined batched decode (no per-step int() sync)."""
+    token_ids = jnp.full((batch_size,), tok, dtype=jnp.int32)
+    kv_batch = jnp.tile(kv_packed, batch_size)
+
+    # Warmup
+    kv_tmp = kv_batch
+    tids = token_ids
+    for i in range(5):
+        pos = jnp.full((batch_size,), start_pos + i, dtype=jnp.int32)
+        tids, _, kv_tmp = batched_decode_nlayer(w, config, tids, pos, kv_tmp, vocab_size, batch_size)
+    _ = tids.block_until_ready()
+
+    times = []
+    all_tokens = []
+    for _ in range(n_runs):
+        kv_tmp = kv_batch
+        tids = token_ids
+        tok_devs = []
+        t0 = time.perf_counter()
+        for i in range(n_tokens):
+            pos = jnp.full((batch_size,), start_pos + i, dtype=jnp.int32)
+            tids, _, kv_tmp = batched_decode_nlayer(w, config, tids, pos, kv_tmp, vocab_size, batch_size)
+            tok_devs.append(tids[0])
+        pipe_toks = [int(td) for td in tok_devs]
+        times.append(time.perf_counter() - t0)
+        all_tokens = pipe_toks
+
+    return np.median(times) * 1000, all_tokens
+
+
 def compute_memory_stats(config, vocab_size):
     """Compute theoretical memory usage."""
     d = config["d_model"]
@@ -313,6 +345,21 @@ def main():
             # Verify seq 0 matches single-sequence
             match = batch_tokens == tokens
             print(f"Matches single:   {'YES' if match else 'NO (expected for greedy)'}")
+        except Exception as e:
+            print(f"ERROR: {e}")
+        print()
+
+    # Pipelined batched decode (no per-token int() sync)
+    for B in [4, 8]:
+        print(f"--- Batched Pipelined B={B} ({GEN_LEN} tokens/seq, no per-step sync) ---")
+        try:
+            pipe_batch_ms, pipe_batch_tokens = measure_batched_pipelined(
+                w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
+                batch_size=B, n_tokens=GEN_LEN, n_runs=args.n_runs)
+            pipe_batch_tok_s = B * GEN_LEN / pipe_batch_ms * 1000
+            print(f"Total:            {pipe_batch_ms:.1f} ms ({GEN_LEN} steps)")
+            print(f"Per step:         {pipe_batch_ms/GEN_LEN:.3f} ms")
+            print(f"Throughput:       {pipe_batch_tok_s:.0f} tok/s total ({pipe_batch_tok_s/B:.0f} per seq)")
         except Exception as e:
             print(f"ERROR: {e}")
         print()
