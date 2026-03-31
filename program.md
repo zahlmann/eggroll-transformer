@@ -29,6 +29,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
 14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
 15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
+16. Batched decode: B sequences per kernel with shared weights (1890→3422 tok/s at B=4, +81%)
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -386,32 +387,48 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 
 ---
 
-## YOUR NEXT TASK: Batched Inference (Step 2c)
+## COMPLETED: Batched Inference (Step 2c) — DONE
 
-**GPU: RTX 4080 Super (Ada Lovelace, 16GB VRAM, 101KB shared memory, 52 TFLOPS FP16, 836 GB/s bandwidth)**
+**Results (MHA, d=512, 8L, 29.7M params):**
+```
+Single-sequence (B=1):  1890 tok/s  (0.529 ms/tok)
+Batched B=4:            3422 tok/s  (1.81x, 1.169 ms/step, 856 tok/s per seq)
+Batched B=8:            4347 tok/s  (2.30x, 1.841 ms/step, 543 tok/s per seq)
+```
 
-**The single biggest remaining optimization is batched decode (B=4-16 sequences).**
+**Why not 4x at B=4:** With MHA (8.4 MB KV per sequence), B=4 total data = 55 + 4×8.4 = 88.6 MB
+exceeds L2 cache (64 MB). KV cache thrashes L2, forcing HBM traffic. GQA (2.1 MB KV per seq)
+would fit B=4 in L2 (55 + 4×2.1 = 63.4 MB). Also, 3 barriers per layer (25 total) add ~75µs.
 
-Bottleneck analysis (2026-03-31):
-- Pure GPU kernel: 0.32 ms/tok (3100 tok/s no-sync)
-- Barrier straggler variance: ~80µs (25% of kernel time) — NOT reducible by fewer barriers
-- Weight loads: ~55 MB from L2 (75% of kernel time) — amortized B× with batching
-- GPU→CPU sync: 0.19 ms/tok overhead (34% of with-sync time)
+### What was done
 
-With batch=4 (GQA model, 55 MB weights, 4×2.1 MB KV caches):
-  Per-token weight cost: 55/4 = 13.75 MB (4× savings)
-  Per-token KV cost: 2.1 MB (same)
-  Total per-token: 15.85 MB → estimated 5-6µs at L2 speed
-  Plus barriers/4: ~20µs
-  Expected: ~80µs/tok → 12,500 tok/s (4× current)
+1. **Batched kernel** (`kernels/batched_decode.py`): same grid=(TOTAL_BLOCKS,) as single-seq.
+   Each block processes B sequences. Weight loads amortized across batch.
 
-**Implementation plan for batched decode:**
-1. Process B sequences per kernel launch (single grid, shared weights)
-2. Weight loads happen ONCE per layer, applied to all B sequences
-3. Attention computed independently per sequence (different KV caches, positions)
-4. FFN also shared-weight per sequence
-5. Partial buffer scales by B: B × TOTAL_BLOCKS × D_MODEL
-6. Use GQA (4 KV heads) — saves 4× KV memory per batch element
+2. **Race condition fixes** (two critical bugs found and fixed):
+   - **h_buf read-write race**: all blocks read h, compute h_new, write h_new. A fast block
+     can overwrite h before a slow block reads the original, causing double residual addition.
+     Fix: double-buffered h_buf (read buf_a, write buf_b, alternate per layer).
+   - **partial buffer merge/FFN race**: after the phase 1 barrier, all blocks read o_proj from
+     partial (merge) while also writing FFN results. Fix: separate ffn_buf for FFN accumulation.
+
+3. **Race-free design** — h_buf only written in phase 3, read in phases 1-2:
+   - Phase 1: LN1 → Q/K/V → attention → O-proj (reads h from buf_in)
+   - Phase 2: merge + LN2 + FFN fused per batch element (h_norm in registers, attn_total stored
+     to attn_buf, FFN partial to ffn_buf; h_buf NOT modified)
+   - Phase 3: h_new = h + attn_total + ffn_total + bias (writes to buf_out)
+   - 3 barriers per layer: after phase 1, after phase 2, after phase 3
+
+### YOUR NEXT TASK: Train GQA model and benchmark batched + GQA
+
+With GQA (4 KV heads), B=4 total data = 55 + 4×2.1 = 63.4 MB ≈ L2 cache.
+Expected improvement: 3-4x throughput (vs current 1.81x with MHA).
+
+Steps:
+1. Train GQA model: `uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 --n-kv-heads 4 --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16`
+2. Save as weights_gqa.pkl
+3. Benchmark batched decode with GQA weights
+4. Optionally try B=16 (55 + 16×2.1 = 88.6 MB, still tight)
 
 ### How to measure progress
 
@@ -588,6 +605,7 @@ kernels/block_decode.py             — per-layer decode + orchestrator (d_model
 kernels/fused_decode_2layer.py      — fully fused 2-layer decode
 kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
 kernels/multi_sm_decode.py          — multi-SM decode: grid=(N_HEADS,) with atomic barriers
+kernels/batched_decode.py           — batched multi-SM decode: B sequences per launch
 profile_kernels.py                  — primary profiling tool (run after every change)
 profile_host_overhead.py            — detailed host vs GPU timing breakdown
 inference_benchmark.py              — quick throughput benchmark
@@ -782,3 +800,25 @@ baseline_metrics.txt                — current numbers to beat
     8 × 1µs = 8µs of fixed overhead, but the ~80µs of straggler time stays constant.
     To reduce barrier overhead, must either: (a) balance work across blocks better,
     (b) reduce total work, or (c) use hardware cooperative group barriers.
+
+38. **Batched decode with shared buffers requires double-buffering for h.** When all
+    blocks read h, compute h_new = h + residual, and write h_new to the SAME buffer,
+    a fast block can write h_new before a slow block reads the original h. The slow
+    block then computes h_new + residual = h + 2×residual (double residual). Fix:
+    double-buffer h — even layers read buf_a/write buf_b, odd layers read buf_b/write
+    buf_a. The buffers never overlap because all reads are from one, all writes to
+    the other. Cost: 2× h_buf memory (negligible: 2 × B × D_MODEL f32).
+
+39. **Shared workspace buffers must separate read-phase from write-phase data.** In
+    the multi-SM batched kernel, the partial buffer stored both attention o_proj
+    (written phase 1, read in phase 2 merge) and FFN partial (written phase 2,
+    read in phase 3). After the phase 1 barrier, a fast block could finish the merge
+    and start writing FFN partials while a slow block was still reading o_proj values.
+    Fix: use separate partial and ffn_buf buffers. General rule: if a buffer is read
+    by all blocks and also written by all blocks within the same barrier-delimited
+    phase, it needs double-buffering or a separate buffer.
+
+40. **Batched decode throughput is L2-limited with MHA.** With MHA (8.4 MB KV per seq),
+    B=4 total data = 88.6 MB exceeds 64 MB L2 cache, forcing HBM traffic. Result:
+    1.81x throughput (not 4x). GQA (2.1 MB KV per seq) keeps B=4 data at 63.4 MB,
+    fitting in L2. Expected: 3-4x throughput with GQA.
