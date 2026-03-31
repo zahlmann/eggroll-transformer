@@ -289,12 +289,13 @@ def main():
         print(f"Multi-SM speedup: {decode_ms_old / decode_ms:.2f}x")
         print()
     else:
-        decode_ms_old = decode_ms  # for end-to-end calc
+        decode_ms_old = decode_ms
+        tok_per_s_old = tok_per_s
         print(f"--- Decode: Single-SM skipped (GQA not supported) ---")
         print()
 
     # Batched decode
-    for B in [4, 8]:
+    for B in [4, 8, 16]:
         print(f"--- Decode: Batched B={B} ({GEN_LEN} tokens/seq, grid={total_blocks}) ---")
         try:
             batch_ms, batch_tokens = measure_batched_decode(
