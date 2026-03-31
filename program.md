@@ -426,243 +426,163 @@ significant fixed cost. GQA helped ~10% over MHA (L2-friendly KV caches: 2.1 vs 
    - Phase 3: h_new = h + attn_total + ffn_total + bias (writes to buf_out)
    - 3 barriers per layer: after phase 1, after phase 2, after phase 3
 
-## YOUR NEXT TASK: Close the 7.8x Gap to Theoretical Throughput
+## COMPLETED: Close the 7.8x Gap — Optimization Round (2026-03-31)
 
 **GPU: RTX 4080 Super (Ada Lovelace, 16GB VRAM, 101KB shared memory, 52 TFLOPS FP16, 836 GB/s HBM, ~3-6 TB/s L2)**
 
-**Current state:** 0.517 ms/tok achieved vs 0.066 ms/tok theoretical = 7.8x gap (13% utilization).
-BUT: the 55 MB working set fits in L2 (64 MB), so we're NOT HBM-bound. The real bottleneck is
-a mix of barrier overhead, per-sequence compute, L2 contention, and workspace buffer traffic.
+**Targets achieved:**
+- Single-sequence: 4777 tok/s (persistent kernel) > 3000 ✓
+- Batched B=4: 6691 tok/s (pipelined) > 6000 ✓
 
-### Where the 0.517 ms/tok goes (estimated breakdown)
+**Optimizations applied:**
+1. Barrier reduction 25→17 (removed b2 in batched): minimal impact (lesson #37 confirmed)
+2. Weight-amortized FFN (batched): outer k-loop / inner b-loop, B=4 +14%, B=8 +22%, B=16 +19%
+3. Persistent decode kernel (single-seq): single launch for 128 tokens, 4777 tok/s (2.56x)
+4. Pipelined batched decode: tokens stay on GPU, B=4 6691 tok/s (1.59x vs sync'd)
 
 ```
-Barriers:           ~100 µs  (25 barriers × ~4µs avg, includes straggler variance)
-Per-seq compute:    ~150 µs  (attention over 512 KV positions, QKV/O projections, LN, FFN)
-Workspace traffic:  ~50 µs   (h_buf, attn_buf, ffn_buf, partial, h_norm load/stores)
-Weight loads:       ~100 µs  (53 MB from L2, shared across 32 blocks)
-KV cache traffic:   ~50 µs   (2.1 MB read + write per layer per KV split)
-Kernel launch:      ~20 µs   (JAX dispatch + workspace allocation)
-Remaining:          ~47 µs   (L2 contention, cache line waste, scheduling overhead)
-Total:              ~517 µs
+CURRENT (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
+  Single-seq (sync):    1869 tok/s  (0.535 ms/tok, 12% BW util)
+  Single-seq (pipe):    2624 tok/s  (0.381 ms/tok, no per-token sync)
+  Persistent kernel:    4777 tok/s  (0.209 ms/tok, single launch) ✓
+  Batched B=4 (sync):   4205 tok/s  (0.951 ms/step, 2.25x)
+  Batched B=4 (pipe):   6691 tok/s  (0.598 ms/step, 3.58x) ✓
+  Batched B=8 (pipe):   7339 tok/s  (1.090 ms/step, 3.93x)
+  Batched B=16 (sync):  6064 tok/s  (2.638 ms/step, 3.24x) ✓
 ```
 
-Profile to refine these estimates — run nsys or write a microbenchmark that measures each
-phase separately (add timing atomics at barrier points).
+**Key insight:** GPU→CPU sync (int() per token) was the #1 bottleneck at 30M params,
+costing 30-60% of wall time. Persistent kernel and pipelining eliminate it.
 
-### Priority-ordered optimization plan
+---
 
-**1. Reduce barrier count from 25 to 17 (single-seq) or eliminate entirely**
+## YOUR NEXT TASK: Kernel Optimization + Model Scaling Validation
 
-The batched kernel uses 3 barriers per layer × 8 layers + 1 final = 25 barriers. The
-single-sequence kernel uses 2 per layer = 17. Each barrier costs ~4µs fixed + straggler
-variance. 25 barriers × 4µs = 100µs = 19% of step time.
+Two goals in parallel: (A) push kernel performance further, and (B) scale the model up
+to verify that kernel optimizations generalize across d_model and context length.
 
-Options:
-- **Merge phases**: Phase 2 (merge+LN2+FFN) and phase 3 (reduce) could be merged if each
-  block reduces its OWN ffn_buf contribution inline instead of writing to shared buffer.
-  The only cross-block data in phase 3 is the ffn_total sum. If each block stores its
-  partial and ALL blocks redundantly compute the sum (like in the single-seq kernel),
-  phase 3 disappears and we save N_LAYERS barriers.
-- **Remove phase 3 barrier (b2)**: The b2 barrier was added to prevent cross-layer h_buf
-  races. With double-buffered h_buf, the race is between buf_in reads and buf_out writes.
-  These go to DIFFERENT addresses, so the barrier may be unnecessary. Test by removing
-  b2 and running verify_batched.py-style correctness checks.
+### Part A: Kernel Optimization (on current d=512, 8L model)
 
-**2. Weight-amortized FFN (save ~10% at B=4)**
+Continue closing the gap to theoretical. Current persistent kernel achieves 0.209 ms/tok
+vs 0.066 ms/tok theoretical = 3.2x gap. The kernel itself (not sync) runs at ~0.35 ms/tok
+pipelined, so the real gap to theoretical is ~5.3x.
 
-Current fused merge+LN2+FFN per batch element reloads FFN weights B times per k-tile.
-De-fuse: compute merge+LN2 for all B (store h_norm to buffer), then do FFN with outer
-k-loop / inner b-loop. This loads FFN weights once per tile. h_norm buffer is safe with
-the 3-barrier design (phase 2 writes h_norm, reads h_norm, separated from phase 1 by b0).
+**Priority-ordered optimizations:**
 
-Estimated savings: 3 × 128KB × 8 layers = 3 MB less L2 traffic per step at B=4.
+**A1. Shared memory workspace (highest expected impact)**
 
-**3. Persistent kernel (eliminate per-step launch overhead)**
+The 101KB shared memory is completely UNUSED. All workspace buffers (partial, attn_buf,
+ffn_buf, h_norm, etc.) go through L2 at ~100 cycle latency. Shared memory is ~20 cycles.
+Moving the hottest buffers to shared memory could save 50-100µs per step.
 
-Instead of launching a new kernel per decode step, have the kernel loop internally:
+Candidate buffers for shared memory:
+- `partial`: TOTAL_BLOCKS × D_MODEL f32 = 32 × 512 × 4 = 64KB — fits! This is the
+  most-accessed buffer (read by all blocks for merge and FFN reduce).
+- `attn_ml`: TOTAL_BLOCKS × 2 f32 = 256 bytes — trivially fits.
+- `h_norm`: B × D_MODEL f32 = 4 × 512 × 4 = 8KB — fits alongside partial.
+
+Challenge: shared memory is per-SM, but workspace buffers need to be visible across SMs
+(for cross-block barriers). Shared memory is SM-local. So this only works for buffers
+that are written and read within the SAME block, not cross-block buffers.
+
+This means only per-block-private data can use shared memory. The `partial` buffer IS
+cross-block (all blocks write their part, all blocks read all parts). So it can't use
+shared memory directly. But `qkv_tmp` (per-block Q/K/V) and `h_norm` (all blocks write
+same value, only need own block's write) could.
+
+**A2. Persistent batched kernel**
+
+Apply the same persistent kernel technique to the batched decode. This eliminates per-step
+workspace allocation and int() sync for batched inference, potentially pushing B=4 sync'd
+from 4205 to ~6000+ without pipelining.
+
+Design: same as persistent single-seq but with B sequences. Additional complexity:
+- h_buf double-buffering across steps (not just layers)
+- Larger workspace (more barrier slots for B × steps)
+- In-kernel next-token feedback for all B sequences
+
+**A3. In-place KV for persistent kernel (eliminate tile copy)**
+
+The current persistent kernel copies ALL KV tiles during attention (matching original
+read-modify-write). This is ~4 MB of unnecessary traffic per step. Writing K_new/V_new
+BEFORE attention and reading directly (no tl.where) saves this traffic but introduces a
+bf16 round-trip that caused token divergence at step 34. Debug and fix this — the divergence
+is a precision issue, not a correctness issue. Options:
+- Accept the divergence (both outputs are valid, just different greedy paths)
+- Keep K_new/V_new in f32 registers and use tl.where for the CURRENT step only,
+  write to kv_out after attention (already tried, still diverges — investigate further)
+
+**A4. Tensor core batched projections (B >= 16)**
+
+With B>=16, QKV/O projections become real matmuls: (B, D_MODEL) @ (D_MODEL, D_HEAD).
+This activates tensor cores. Process all B sequences as a single tl.dot.
+
+### Part B: Model Scaling Validation
+
+Train larger models and verify kernel optimizations hold. The key question: do the
+techniques (multi-SM, weight amortization, persistent kernel, pipelining) still work
+at larger d_model and context length, or do new bottlenecks emerge?
+
+**B1. Scale d_model to 768 (target: ~70M params)**
+
 ```
-for step in range(MAX_STEPS):
-    # full decode step (all layers)
-    # write next_token to output buffer
-    # read next_token as input for next step (no host round-trip)
+Config: d=768, h=24, l=12, d_ff=3072, ctx=512, vocab=4096
+Estimated params: ~70M
+KV cache (GQA 6 heads): 2 × 6 × 512 × 32 × 12 layers × 2 bytes ≈ 4.7 MB/seq
+Weight buffer: ~140 MB (exceeds L2!)
 ```
 
-This eliminates:
-- Workspace allocation (jnp.zeros per step → allocate once)
-- JAX dispatch overhead (~20µs per step)
-- Barrier counter reset (counters accumulate across steps instead of resetting)
+Key challenges at d=768:
+- Weight buffer overflows L2 (140 MB > 64 MB). Now truly HBM-bound for weights.
+  This is where the kernel becomes bandwidth-bound and the roofline model applies.
+- Register pressure: (1, 768) × (768, 32) tl.dot needs careful tiling.
+- BLOCK_SEQ for prefill: need BLOCK_SEQ ≤ 8 to keep h_block in registers.
 
-Challenge: barrier counters need to WRAP or be reset between steps. Simplest: use
-modular arithmetic (counter % TOTAL_BLOCKS == 0 means all arrived). Or reset barriers
-at the start of each step using one block.
+Expected: multi-SM and weight amortization should help MORE (larger weight matrices
+mean more L2/HBM traffic to amortize). Barriers should matter LESS (more compute
+per step dilutes fixed barrier cost).
 
-**4. Tensor core batched projections (B>=16)**
+**B2. Scale context to 2048**
 
-With B>=16, projections become (B, D_MODEL) @ (D_MODEL, D_HEAD) = (16, 512) @ (512, 32).
-This activates tensor cores (need M>=16). Process all B sequences' projections as a single
-tl.dot instead of B separate element-wise ops.
+```
+Config: d=512, h=16, l=8, ctx=2048
+KV cache (GQA): 2 × 4 × 2048 × 32 × 8 × 2 bytes ≈ 8.4 MB/seq
+FlashAttention tiles: 2048/64 = 32 tiles per KV split (was 4)
+```
 
-Requirements:
-- Reshape H from per-sequence loads to a (B, D_MODEL) 2D tensor
-- LN must be per-row: tl.sum(H, axis=1) / D_MODEL
-- After projection, extract per-sequence rows for attention (still per-seq)
+Key challenges at ctx=2048:
+- Attention cost grows linearly with context (32 tiles vs 4 at ctx=512).
+  Attention becomes a larger fraction of per-seq compute.
+- KV_SPLITS should probably increase (4 or 8) to parallelize over more tiles.
+- KV cache per sequence grows 4x. At B=4: 33.6 MB KV → doesn't fit in L2 with weights.
 
-Expected speedup: 2-4x for projection compute (which is ~30% of per-seq time).
+Expected: weight amortization matters less (attention dominates), KV-split parallelism
+matters more. GQA becomes essential.
 
-**5. Reduce workspace buffer traffic**
+**B3. Train and benchmark at each scale**
 
-The batched kernel does many load/store cycles through workspace buffers (h_buf, attn_buf,
-h_norm, ffn_buf, partial, attn_ml, qkv_tmp). Each load/store goes through L2 (~100 cycles).
-With B=4 and 8 layers, this adds up.
-
-Ideas:
-- Keep more intermediate state in registers (requires careful register pressure analysis)
-- Process multiple layers per "phase" to reduce buffer round-trips
-- Use shared memory (101KB) as a fast workspace instead of global memory
+For each config:
+1. Train with `uv run train_backprop.py --d-model D --n-heads H --n-layers L --context-len C`
+2. Run `uv run profile_kernels.py` to get throughput numbers
+3. Compare persistent/pipelined/sync'd throughput
+4. Identify new bottlenecks if optimizations don't transfer
 
 ### How to measure progress
 
 Run `uv run profile_kernels.py` after any kernel change. The hard metrics:
 
 ```
-CURRENT (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
-  Single-seq (sync):    1869 tok/s  (0.535 ms/tok, 12% BW util)
-  Single-seq (pipe):    2624 tok/s  (0.381 ms/tok, no per-token sync)
-  Persistent kernel:    4777 tok/s  (0.209 ms/tok, single launch) ✓ >3000
-  Batched B=4 (sync):   4205 tok/s  (0.951 ms/step, 2.25x)
-  Batched B=4 (pipe):   6691 tok/s  (0.598 ms/step, 3.58x) ✓ >6000
-  Batched B=8 (sync):   5615 tok/s  (1.425 ms/step, 3.00x)
-  Batched B=8 (pipe):   7339 tok/s  (1.090 ms/step, 3.93x)
-  Batched B=16 (sync):  6064 tok/s  (2.638 ms/step, 3.24x) ✓ >6000
-  Theoretical min:      0.066 ms/tok (55.1 MB @ 836 GB/s)
+CURRENT (d=512 baseline to beat):
+  Persistent:           4777 tok/s  (0.209 ms/tok)
+  Batched B=4 (pipe):   6691 tok/s  (0.598 ms/step)
+  Batched B=8 (pipe):   7339 tok/s  (1.090 ms/step)
 
-PREVIOUS (before optimization round):
-  Single-seq:         1935 tok/s  (0.517 ms/tok)
-  Batched B=4:        3821 tok/s  (1.047 ms/step, 1.97x)
-  Batched B=8:        4641 tok/s  (1.724 ms/step, 2.40x)
-  Batched B=16:       5050 tok/s  (3.169 ms/step, 2.61x)
-
-ORIGINAL BASELINE (single-SM, grid=1):
-  Decode throughput:  287 tok/s   (3.48 ms/tok, 2% BW)
+SCALING TARGETS (new):
+  d=768 persistent:     >2000 tok/s  (model is ~3x larger → expect ~3x slower)
+  d=768 B=4 pipe:       >4000 tok/s
+  ctx=2048 persistent:  >2000 tok/s  (4x more attention work)
+  ctx=2048 B=4 pipe:    >4000 tok/s
 ```
-
-TARGETS MET:
-- Single-sequence: 4777 tok/s (persistent kernel) > 3000 ✓
-- Batched B=4: 6691 tok/s (pipelined) > 6000 ✓
-
-**Optimizations applied:**
-1. Barrier reduction 25→17 (removed b2): minimal impact (lesson #37 confirmed)
-2. Weight-amortized FFN: B=4 +14%, B=8 +22%, B=16 +19% (outer k-loop / inner b-loop)
-3. Persistent decode kernel: 4777 tok/s single-seq (2.56x vs sync'd loop)
-   - Single kernel launch for all N decode steps (no per-step host overhead)
-   - In-kernel cooperative KV copy (kv_ptr → kv_out_ptr) with barrier
-   - Fresh barrier slots per step (step * BARRIERS_PER_STEP + idx)
-   - In-kernel argmax + next-token feedback via workspace
-4. Pipelined batched decode: 6691 tok/s B=4 (1.59x vs sync'd)
-   - Tokens stay on GPU, JAX dispatches overlapping kernel calls
-   - Single block_until_ready() at the end (no per-step int() sync)
-
-**Key insight:** GPU→CPU sync (int() per token) is the #1 bottleneck at this
-model scale, costing 30-60% of wall time. The persistent kernel eliminates it
-entirely for single-seq; pipelining eliminates it for batched.
-
-### Step 0: Profile to understand where time is spent — COMPLETED
-
-Profiled with custom host overhead measurement (profile_host_overhead.py).
-
-```
-PROFILING RESULTS (2026-03-30):
-  Total per step:       3.598 ms  (281 tok/s)
-  GPU kernel time:      3.351 ms  (93% of total)
-  argmax + GPU→CPU sync: 0.134 ms  (4%)
-  Host overhead:         0.113 ms  (3%)
-
-  Without int() sync:   3.031 ms/step (330 tok/s, 17% faster)
-  Amortized (batch):    3.028 ms/step (330 tok/s)
-  Theoretical min:      0.081 ms/tok (836 GB/s)
-```
-
-**Key findings:**
-1. **Host overhead is NOT the bottleneck** — only 3% of step time.
-   The original hypothesis was wrong. Python/JAX dispatch is negligible at d=512.
-2. **The GPU kernel itself is 93% of step time** (3.35ms of 3.6ms).
-3. **The kernel runs on 1 SM** (grid=(1,)). The 4080 Super has 80 SMs.
-   79 SMs are completely idle during decode. This is the #1 bottleneck.
-4. **Removing int() sync gives 17% speedup** (281→330 tok/s) by avoiding
-   GPU→CPU transfer per step. Easy win.
-5. **Single-SM bandwidth**: 67.7MB / 3.35ms = 20.2 GB/s achieved.
-   This is ~2x the per-SM DRAM bandwidth (836/80 = 10.4 GB/s),
-   indicating significant L2 cache hits (weights are 59.3MB, L2 is 64MB).
-
-**Revised priority based on profiling:**
-- Step 1 (host overhead) → low impact, only 3% of time
-- Step 2b (multi-SM decode) → HIGHEST IMPACT, 79 idle SMs
-- Step 1c (device argmax) → moderate impact, 17% speedup
-
-### Step 1: Eliminate host overhead — COMPLETED (low impact)
-
-Profiling showed host overhead is only 3% (0.11ms). Not the bottleneck at d=512.
-**1c. In-kernel argmax** — DONE. Avoids GPU→CPU sync in decode loop (1592→2900 tok/s).
-
-### Step 2: Multi-SM decode — COMPLETED (biggest win)
-
-**2a. num_warps sweep** — DONE. num_warps=4 and 8 are tied (2872 vs 2915 tok/s).
-Not warp-limited.
-
-**2b. Multi-SM decode** — DONE. grid=(N_HEADS=16,) with atomic barriers.
-
-**2b. Multi-SM decode** — Current decode launches grid=(1,) — one thread block on
-one SM. The 4080 Super has 80 SMs. 79 SMs are completely idle during decode.
-Possible approaches:
-- Split heads across SMs: grid=(N_HEADS,), each block handles one head's attention
-- Split layers across SMs: pipeline layers across blocks with barriers
-- Split the KV tiling across SMs: each block handles a tile of the cache
-
-This is the most impactful architectural change. Going from 1 SM to even 8 SMs
-would give up to 8x speedup if the work parallelizes well.
-
-**2c. Batched inference** — Process B sequences in parallel. With M>1:
-- Projections become real matmuls: tl.dot((B, D_MODEL), (D_MODEL, D_HEAD))
-- Tensor cores activate (need M >= 16 for full utilization)
-- Each SM has more work → better utilization
-- Trade-off: increases per-sequence latency slightly, but total tok/s goes up dramatically
-- Target: 4-8x throughput at batch=8-16
-
-### Step 3: Reduce memory traffic per step
-
-Achieved: 0.54 ms/tok (with sync), 15% BW utilization. Remaining gap: 6.7x vs theoretical.
-
-**Bottleneck analysis (2026-03-31):**
-- Unique data per step: 63 MB. Theoretical at 836 GB/s: 0.075 ms.
-- Achieved kernel time: 0.57 ms (block_until_ready), 0.35 ms (amortized/pipelined).
-- 17 barriers per step × 5-10µs each = 0.085-0.17 ms (15-30% of kernel time).
-- Weights (59.3 MB) barely fit in L2 (64 MB). With KV cache (8.4 MB), L2 overflows.
-- num_warps sweep: 2/4/8/16 all within 5% — not warp-limited.
-- Only 16 blocks on 80 SMs — low occupancy limits memory request parallelism.
-
-**3a. Reduce barrier cost** — PARTIALLY DONE. Split barrier implementation reduces
-L2 contention by separating arrival counter from done flag on different cache lines.
-Saves ~21µs/step (0.32→0.30 ms equivalent, +6.5% pure GPU throughput).
-Further reduction to 9 barriers (from 17) requires parallel residual model architecture
-(attention ‖ FFN instead of sequential), which needs retraining.
-
-**3b. More blocks (higher grid)** — DONE. grid=(32,) with kv_splits=2.
-Each head's KV attention is split across 2 blocks (FlashDecoding-style).
-Merge uses online softmax correction: weighted average of normalized O-projections.
-Result: 1734→1851 tok/s (+10%). grid=64 (kv_splits=4) was slightly slower due to
-barrier contention — 32 blocks is the sweet spot for this model.
-
-**3c. GQA (Grouped-Query Attention)** — DONE. 4 KV heads for 16 Q heads.
-Retrained: 26.5M params, ppl=2.96 (vs MHA ppl=2.91). KV cache 8.4→2.1 MB.
-Total data 67.7→55.1 MB (fits in L2!). But single-sequence decode is NOT faster
-(0.95x) because the bottleneck is barriers, not memory traffic. GQA value is
-mainly for batched inference where KV cache scales with batch size.
-
-**3d. Persistent kernel across steps** — Kernel loops internally across all decode
-steps, polling for new tokens. Eliminates all per-step launch overhead and workspace
-allocation. Most ambitious approach. (Tested: pipelined per-step approach was faster
-due to JAX overlapping dispatch with execution.)
 
 ### What NOT to change
 
