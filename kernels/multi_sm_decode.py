@@ -57,6 +57,8 @@ def _multi_sm_decode(
     D_HEAD: tl.constexpr,
     D_FF: tl.constexpr,
     N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,     # GQA: number of KV heads (N_KV_HEADS <= N_HEADS)
+    D_KV: tl.constexpr,           # N_KV_HEADS * D_HEAD
     N_LAYERS: tl.constexpr,
     MAX_SEQ: tl.constexpr,
     KV_SPLITS: tl.constexpr,      # KV cache splits per head (1=original, 2+=FlashDecoding)
@@ -88,14 +90,18 @@ def _multi_sm_decode(
     h = (tl.load(token_emb_ptr + token_id * D_MODEL + d).to(tl.float32)
        + tl.load(pos_emb_ptr + pos * D_MODEL + d).to(tl.float32))
 
+    # GQA: Q/O use D_MODEL columns, K/V use D_KV columns
     LAYER_W_SIZE: tl.constexpr = (
-        D_MODEL + D_MODEL +
-        4 * D_MODEL * D_MODEL +
-        D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF +
-        D_FF * D_MODEL + D_MODEL
+        D_MODEL + D_MODEL +                   # ln1 scale, bias
+        D_MODEL * D_MODEL +                   # wq (n_heads * d_head = d_model)
+        D_MODEL * D_KV +                      # wk (n_kv_heads * d_head)
+        D_MODEL * D_KV +                      # wv (n_kv_heads * d_head)
+        D_MODEL * D_MODEL +                   # wo
+        D_MODEL + D_MODEL +                   # ln2 scale, bias
+        D_MODEL * D_FF + D_FF +               # ffn up + bias
+        D_FF * D_MODEL + D_MODEL              # ffn down + bias
     )
-    LAYER_KV_SIZE: tl.constexpr = 2 * N_HEADS * MAX_SEQ * D_HEAD
+    LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
     scale = 0.17677669529663689
     dh = tl.arange(0, D_HEAD)
@@ -104,14 +110,14 @@ def _multi_sm_decode(
         w_base = layer * LAYER_W_SIZE
         kv_base = layer * LAYER_KV_SIZE
         kc_base = kv_base
-        vc_base = kv_base + N_HEADS * MAX_SEQ * D_HEAD
+        vc_base = kv_base + N_KV_HEADS * MAX_SEQ * D_HEAD
 
         off = w_base
         ln1_s_off = off;    off += D_MODEL
         ln1_b_off = off;    off += D_MODEL
         wq_off = off;       off += D_MODEL * D_MODEL
-        wk_off = off;       off += D_MODEL * D_MODEL
-        wv_off = off;       off += D_MODEL * D_MODEL
+        wk_off = off;       off += D_MODEL * D_KV
+        wv_off = off;       off += D_MODEL * D_KV
         wo_off = off;       off += D_MODEL * D_MODEL
         ln2_s_off = off;    off += D_MODEL
         ln2_b_off = off;    off += D_MODEL
@@ -128,15 +134,18 @@ def _multi_sm_decode(
         h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
 
         head = head_id
-        hd = head * D_HEAD + dh
-        cache_off = head * MAX_SEQ * D_HEAD
+        hd = head * D_HEAD + dh                    # Q head column indices
+        GQA_GROUP: tl.constexpr = N_HEADS // N_KV_HEADS
+        kv_head = head_id // GQA_GROUP              # which KV head this Q head uses
+        kv_hd = kv_head * D_HEAD + dh              # KV head column indices
+        cache_off = kv_head * MAX_SEQ * D_HEAD      # KV cache offset (per KV head)
         h_norm_2d = h_norm[None, :].to(tl.bfloat16)
 
         wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
         Q = tl.dot(h_norm_2d, wq).to(tl.float32).sum(axis=0)
-        wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+        wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :]).to(tl.bfloat16)
         K_new = tl.dot(h_norm_2d, wk).to(tl.float32).sum(axis=0)
-        wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+        wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :]).to(tl.bfloat16)
         V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)
 
         tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
@@ -317,11 +326,13 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
     d_model = config["d_model"]
     d_head = config["d_head"]
     n_heads = config["n_heads"]
+    n_kv_heads = config.get("n_kv_heads", n_heads)
+    d_kv = n_kv_heads * d_head
     n_layers = config["n_layers"]
     d_ff = 4 * d_model
     max_seq = config["context_len"]
     vocab_pad = w["vocab_pad"]
-    total_kv_size = n_layers * 2 * n_heads * max_seq * d_head
+    total_kv_size = n_layers * 2 * n_kv_heads * max_seq * d_head
     total_blocks = n_heads * kv_splits
     ff_per_block = d_ff // total_blocks
 
@@ -353,7 +364,8 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
         grid=(total_blocks,),
         num_warps=4, num_stages=2,
         D_MODEL=d_model, D_HEAD=d_head, D_FF=d_ff,
-        N_HEADS=n_heads, N_LAYERS=n_layers, MAX_SEQ=max_seq,
+        N_HEADS=n_heads, N_KV_HEADS=n_kv_heads, D_KV=d_kv,
+        N_LAYERS=n_layers, MAX_SEQ=max_seq,
         KV_SPLITS=kv_splits, TOTAL_BLOCKS=total_blocks,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         FF_PER_BLOCK=ff_per_block,

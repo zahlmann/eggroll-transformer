@@ -23,7 +23,7 @@ from model import init_transformer, transformer_forward_batch, cross_entropy_los
 def train(lr=1e-3, seed=42, tokenizer="char", bpe_vocab_size=512,
           dataset="shakespeare", d_model=128, n_heads=4, n_layers=2,
           context_len=128, batch_size=64, epochs=20, warmup_steps=200,
-          weight_decay=0.1):
+          weight_decay=0.1, n_kv_heads=None):
     data = prepare_data(context_len=context_len, tokenizer=tokenizer,
                         bpe_vocab_size=bpe_vocab_size, dataset=dataset)
     vocab_size = data["vocab_size"]
@@ -32,7 +32,7 @@ def train(lr=1e-3, seed=42, tokenizer="char", bpe_vocab_size=512,
     key, init_key = jax.random.split(key)
     params, config = init_transformer(init_key, vocab_size, d_model=d_model,
                                        n_heads=n_heads, n_layers=n_layers,
-                                       context_len=context_len)
+                                       context_len=context_len, n_kv_heads=n_kv_heads)
 
     # Keep training data on CPU (numpy) — move batches to GPU on the fly.
     # This avoids OOM when training on large datasets (e.g., full TinyStories).
@@ -133,6 +133,8 @@ if __name__ == "__main__":
                         choices=["shakespeare", "tinystories"])
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--n-kv-heads", type=int, default=None,
+                        help="Number of KV heads for GQA (default: same as n_heads)")
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--context-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -145,4 +147,4 @@ if __name__ == "__main__":
           d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
           context_len=args.context_len, batch_size=args.batch_size,
           epochs=args.epochs, warmup_steps=args.warmup_steps,
-          weight_decay=args.weight_decay)
+          weight_decay=args.weight_decay, n_kv_heads=args.n_kv_heads)
