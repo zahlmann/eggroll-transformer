@@ -30,6 +30,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
 15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
 16. GQA: 4 KV heads for 16 Q heads. ppl 2.96 (was 2.91). KV 8.4→2.1 MB. No speedup (barrier-limited)
+17. Parallel residual: attn||FFN, 9 barriers (was 17). ppl 3.01. Only 1.3% speedup (straggler variance dominates)
 
 ### Current Performance (RTX 4080 Super)
 
@@ -739,3 +740,13 @@ baseline_metrics.txt                — current numbers to beat
     the barrier spin-wait. GQA's value is for batched inference (batch=8 KV cache:
     16.8 MB GQA vs 67.2 MB MHA) and long-context scenarios. Lesson: always profile
     to identify the actual bottleneck before optimizing.
+
+37. **Barrier count reduction gives minimal speedup because straggler variance
+    dominates.** Parallel residual reduces barriers from 17 to 9 (-47%) but only
+    gives +1.3% speedup. Each barrier has ~1µs fixed overhead + variable straggler
+    wait. The straggler wait is proportional to the TOTAL WORK per step, not the
+    number of barriers. With fewer barriers, each remaining barrier has MORE work
+    between them → MORE straggler variance → HIGHER per-barrier cost. Net: saving
+    8 × 1µs = 8µs of fixed overhead, but the ~80µs of straggler time stays constant.
+    To reduce barrier overhead, must either: (a) balance work across blocks better,
+    (b) reduce total work, or (c) use hardware cooperative group barriers.
