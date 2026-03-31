@@ -29,8 +29,17 @@ Build the fastest possible inference for this transformer using custom Triton ke
 13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
 14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
 15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
-16. GQA: 4 KV heads for 16 Q heads. ppl 2.96 (was 2.91). KV 8.4→2.1 MB. No speedup (barrier-limited)
-17. Parallel residual: attn||FFN, 9 barriers (was 17). ppl 3.01. Only 1.3% speedup (straggler variance dominates)
+
+### Tried but didn't help (single-sequence decode)
+
+- **GQA** (4 KV heads for 16 Q heads): ppl 2.96 (vs 2.91). KV cache 8.4→2.1 MB, total
+  data 67.7→55.1 MB (fits in L2). But 0% decode speedup — kernel is barrier-limited,
+  not memory-limited. GQA value is for BATCHED inference (KV cache scales with batch).
+- **Parallel residual** (attn||FFN, 9 barriers instead of 17): ppl 3.01. Only 1.3% speedup.
+  Barrier cost is dominated by straggler VARIANCE (proportional to total work), not
+  fixed overhead. Halving barriers saves only ~8µs of fixed overhead.
+- **num_warps sweep**: 2/4/8 all within 5%. Not warp-limited.
+- **num_stages=2**: marginal (within noise of num_stages=1).
 
 ### Current Performance (RTX 4080 Super)
 
@@ -377,9 +386,32 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 
 ---
 
-## YOUR NEXT TASK: Further Scaling or Optimization
+## YOUR NEXT TASK: Batched Inference (Step 2c)
 
 **GPU: RTX 4080 Super (Ada Lovelace, 16GB VRAM, 101KB shared memory, 52 TFLOPS FP16, 836 GB/s bandwidth)**
+
+**The single biggest remaining optimization is batched decode (B=4-16 sequences).**
+
+Bottleneck analysis (2026-03-31):
+- Pure GPU kernel: 0.32 ms/tok (3100 tok/s no-sync)
+- Barrier straggler variance: ~80µs (25% of kernel time) — NOT reducible by fewer barriers
+- Weight loads: ~55 MB from L2 (75% of kernel time) — amortized B× with batching
+- GPU→CPU sync: 0.19 ms/tok overhead (34% of with-sync time)
+
+With batch=4 (GQA model, 55 MB weights, 4×2.1 MB KV caches):
+  Per-token weight cost: 55/4 = 13.75 MB (4× savings)
+  Per-token KV cost: 2.1 MB (same)
+  Total per-token: 15.85 MB → estimated 5-6µs at L2 speed
+  Plus barriers/4: ~20µs
+  Expected: ~80µs/tok → 12,500 tok/s (4× current)
+
+**Implementation plan for batched decode:**
+1. Process B sequences per kernel launch (single grid, shared weights)
+2. Weight loads happen ONCE per layer, applied to all B sequences
+3. Attention computed independently per sequence (different KV caches, positions)
+4. FFN also shared-weight per sequence
+5. Partial buffer scales by B: B × TOTAL_BLOCKS × D_MODEL
+6. Use GQA (4 KV heads) — saves 4× KV memory per batch element
 
 ### How to measure progress
 
