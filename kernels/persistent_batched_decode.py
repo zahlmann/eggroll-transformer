@@ -247,15 +247,25 @@ def _persistent_batched_decode(
                     tile_pos = t + tl.arange(0, KV_TILE)
                     tile_mask = tile_pos <= pos
 
+                    # In-place KV: K_new/V_new already written at pos above.
+                    # tl.where injects f32 values at pos for precision.
+                    # Pos-only store forces compiler to commit K/V at pos.
                     K_tile = tl.load(kv_out_ptr + kv_b + kc_base + cache_off
                                      + tile_pos[:, None] * D_HEAD + dh[None, :],
                                      mask=tile_mask[:, None], other=0.0).to(tl.float32)
                     K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
+                    pos_mask = tile_pos == pos
+                    tl.store(kv_out_ptr + kv_b + kc_base + cache_off
+                             + tile_pos[:, None] * D_HEAD + dh[None, :],
+                             K_tile.to(tl.bfloat16), mask=pos_mask[:, None])
 
                     V_tile = tl.load(kv_out_ptr + kv_b + vc_base + cache_off
                                      + tile_pos[:, None] * D_HEAD + dh[None, :],
                                      mask=tile_mask[:, None], other=0.0).to(tl.float32)
                     V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
+                    tl.store(kv_out_ptr + kv_b + vc_base + cache_off
+                             + tile_pos[:, None] * D_HEAD + dh[None, :],
+                             V_tile.to(tl.bfloat16), mask=pos_mask[:, None])
 
                     s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
                     s = tl.where(tile_mask, s, -1e9)

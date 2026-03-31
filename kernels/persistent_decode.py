@@ -160,12 +160,10 @@ def _persistent_decode(
             wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :]).to(tl.bfloat16)
             V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)
 
-            # Write K_new/V_new to kv_out at pos (all blocks, same as original)
+            # Write K_new/V_new at pos before attention.
             tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
             tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
 
-            # Attention with online softmax + KV tile copy to kv_out
-            # Step 0 reads from kv_ptr (input), all steps write to kv_out_ptr
             m_i = tl.full((1,), value=-1e9, dtype=tl.float32)
             l_i = tl.zeros((1,), dtype=tl.float32)
             o_i = tl.zeros((D_HEAD,), dtype=tl.float32)
@@ -174,14 +172,15 @@ def _persistent_decode(
                 tile_pos = t + tl.arange(0, KV_TILE)
                 tile_mask = tile_pos <= pos
 
-                # Read from kv_ptr on step 0 (original input), kv_out_ptr after
                 K_tile = tl.load(kv_out_ptr + kc_base + cache_off
                                  + tile_pos[:, None] * D_HEAD + dh[None, :],
                                  mask=tile_mask[:, None], other=0.0).to(tl.float32)
                 K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
+                # Store only at pos to force compiler commit (not full tile copy)
+                pos_mask = tile_pos == pos
                 tl.store(kv_out_ptr + kc_base + cache_off
                          + tile_pos[:, None] * D_HEAD + dh[None, :],
-                         K_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+                         K_tile.to(tl.bfloat16), mask=pos_mask[:, None])
 
                 V_tile = tl.load(kv_out_ptr + vc_base + cache_off
                                  + tile_pos[:, None] * D_HEAD + dh[None, :],
@@ -189,7 +188,7 @@ def _persistent_decode(
                 V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
                 tl.store(kv_out_ptr + vc_base + cache_off
                          + tile_pos[:, None] * D_HEAD + dh[None, :],
-                         V_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+                         V_tile.to(tl.bfloat16), mask=pos_mask[:, None])
 
                 s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
                 s = tl.where(tile_mask, s, -1e9)
