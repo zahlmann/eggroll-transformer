@@ -27,6 +27,7 @@ import jax.numpy as jnp
 
 from data import load_bpe_vocab
 from model import count_params
+from model import prefill_with_kv
 from kernels.block_prefill import block_prefill
 from kernels.fused_decode_nlayer import (
     fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
@@ -42,20 +43,31 @@ def load_params():
 
 
 def measure_prefill(params, config, prompt, vocab_size, n_runs=20):
-    """Measure prefill latency."""
+    """Measure prefill latency. Uses JAX prefill for GQA models, Triton for MHA."""
     x = jnp.pad(prompt, (0, config["context_len"] - len(prompt))).astype(jnp.int32)
+    is_gqa = config.get("n_kv_heads", config["n_heads"]) != config["n_heads"]
 
-    # Warmup
-    for _ in range(3):
-        logits, kc, vc = block_prefill(params, config, x, vocab_size)
-        _ = logits.block_until_ready()
-
-    times = []
-    for _ in range(n_runs):
-        t0 = time.perf_counter()
-        logits, kc, vc = block_prefill(params, config, x, vocab_size)
-        _ = logits.block_until_ready()
-        times.append(time.perf_counter() - t0)
+    if is_gqa:
+        # JAX prefill for GQA (Triton prefill kernel doesn't support GQA yet)
+        for _ in range(3):
+            logits, kc, vc = prefill_with_kv(params, config, x)
+            _ = logits.block_until_ready()
+        times = []
+        for _ in range(n_runs):
+            t0 = time.perf_counter()
+            logits, kc, vc = prefill_with_kv(params, config, x)
+            _ = logits.block_until_ready()
+            times.append(time.perf_counter() - t0)
+    else:
+        for _ in range(3):
+            logits, kc, vc = block_prefill(params, config, x, vocab_size)
+            _ = logits.block_until_ready()
+        times = []
+        for _ in range(n_runs):
+            t0 = time.perf_counter()
+            logits, kc, vc = block_prefill(params, config, x, vocab_size)
+            _ = logits.block_until_ready()
+            times.append(time.perf_counter() - t0)
 
     return np.median(times) * 1000, logits, kc, vc
 
@@ -116,15 +128,20 @@ def compute_memory_stats(config, vocab_size):
     """Compute theoretical memory usage."""
     d = config["d_model"]
     n_heads = config["n_heads"]
+    n_kv_heads = config.get("n_kv_heads", n_heads)
     n_layers = config["n_layers"]
     d_head = config["d_head"]
+    d_kv = n_kv_heads * d_head
     d_ff = 4 * d
     ctx = config["context_len"]
 
-    # Weight buffer (bf16)
+    # Weight buffer (bf16) — Q/O use d_model, K/V use d_kv (GQA)
     per_layer = (
         d + d +             # ln1 scale, bias
-        4 * d * d +         # Q/K/V/O
+        d * d +             # Q
+        d * d_kv +          # K (GQA: smaller)
+        d * d_kv +          # V (GQA: smaller)
+        d * d +             # O
         d + d +             # ln2 scale, bias
         d * d_ff + d_ff +   # ffn up + bias
         d_ff * d + d        # ffn down + bias
@@ -138,8 +155,8 @@ def compute_memory_stats(config, vocab_size):
     )
     weight_bytes = total_weights * 2  # bf16
 
-    # KV cache (bf16) — per sequence
-    kv_per_layer = 2 * n_heads * ctx * d_head * 2  # K + V, bf16
+    # KV cache (bf16) — per sequence (GQA: uses n_kv_heads)
+    kv_per_layer = 2 * n_kv_heads * ctx * d_head * 2  # K + V, bf16
     kv_total = n_layers * kv_per_layer
 
     return {
