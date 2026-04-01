@@ -15,12 +15,15 @@ Per-sequence state:
   - Hidden states: B vectors stored in workspace between phases
   - Attention: computed independently per sequence with own KV cache
 
+Supports non-power-of-2 D_MODEL via D_BLOCK padding: tl.arange uses D_BLOCK
+(next power of 2) with d_mask = d < D_MODEL for all loads/stores.
+
 Workspace layout (all f32):
-  h_buf:       2 * B * D_MODEL                   -- double-buffered hidden states (avoids read-write race)
-  partial:     B * TOTAL_BLOCKS * D_MODEL        -- attention o_proj (phase 1 only)
-  ffn_buf:     B * TOTAL_BLOCKS * D_MODEL        -- FFN partials (phase 2 only)
-  attn_buf:    B * D_MODEL                      -- attention residual (written phase 2, read phase 3)
-  h_norm_buf:  B * D_MODEL                      -- LN1 output (phase 1 only, separate from attn_buf)
+  h_buf:       2 * B * D_BLOCK                   -- double-buffered hidden states (avoids read-write race)
+  partial:     B * TOTAL_BLOCKS * D_BLOCK        -- attention o_proj (phase 1 only)
+  ffn_buf:     B * TOTAL_BLOCKS * D_BLOCK        -- FFN partials (phase 2 only)
+  attn_buf:    B * D_BLOCK                      -- attention residual (written phase 2, read phase 3)
+  h_norm_buf:  B * D_BLOCK                      -- LN1 output (phase 1 only, separate from attn_buf)
   attn_ml:     B * TOTAL_BLOCKS * 2              -- (m, l) for KV-split merge
   qkv_tmp:     TOTAL_BLOCKS * 3 * B * D_HEAD    -- per-block Q/K_new/V_new/attn_out
   barrier:     32                               -- arrival counter (cache line)
@@ -42,7 +45,7 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-BLOCK_K      = tl.constexpr(32)
+BLOCK_K      = tl.constexpr(16)
 KV_TILE      = tl.constexpr(64)
 OUTPUT_VTILE = tl.constexpr(32)
 
@@ -64,6 +67,7 @@ def _batched_decode(
     next_tokens_ptr,      # (B,) int32
     # Config
     D_MODEL: tl.constexpr,
+    D_BLOCK: tl.constexpr,   # next power of 2 >= D_MODEL
     D_HEAD: tl.constexpr,
     D_FF: tl.constexpr,
     N_HEADS: tl.constexpr,
@@ -93,7 +97,8 @@ def _batched_decode(
     pid = tl.program_id(0)
     head_id = pid // KV_SPLITS
     kv_split = pid % KV_SPLITS
-    d = tl.arange(0, D_MODEL)
+    d = tl.arange(0, D_BLOCK)
+    d_mask = d < D_MODEL
     dh = tl.arange(0, D_HEAD)
 
     # Workspace pointers
@@ -109,13 +114,13 @@ def _batched_decode(
     argmax_ptr = workspace_ptr + ARGMAX_OFF
 
     # ── Embedding for all B sequences (write to buf_a = offset 0) ──
-    H_BUF_SIZE: tl.constexpr = BATCH_SIZE * D_MODEL
+    H_BUF_SIZE: tl.constexpr = BATCH_SIZE * D_BLOCK
     for b in tl.range(0, BATCH_SIZE):
         token_id = tl.load(token_ids_ptr + b)
         pos = tl.load(positions_ptr + b)
-        h = (tl.load(token_emb_ptr + token_id * D_MODEL + d).to(tl.float32)
-           + tl.load(pos_emb_ptr + pos * D_MODEL + d).to(tl.float32))
-        tl.store(h_buf_ptr + b * D_MODEL + d, h)
+        h = (tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
+           + tl.load(pos_emb_ptr + pos * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32))
+        tl.store(h_buf_ptr + b * D_BLOCK + d, h, mask=d_mask)
 
     # ── Layer constants ──
     LAYER_W_SIZE: tl.constexpr = (
@@ -170,26 +175,30 @@ def _batched_decode(
         # ══════════════════════════════════════════════════
 
         # 1a. LN1 for all B — store to h_norm_buf (separate from attn_buf)
-        ln_s = tl.load(packed_w_ptr + ln1_s_off + d).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln1_b_off + d).to(tl.float32)
+        ln_s = tl.load(packed_w_ptr + ln1_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
+        ln_b = tl.load(packed_w_ptr + ln1_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
         for b in tl.range(0, BATCH_SIZE):
-            h = tl.load(h_buf_ptr + h_in_off + b * D_MODEL + d)
+            h = tl.load(h_buf_ptr + h_in_off + b * D_BLOCK + d, mask=d_mask, other=0.0)
             mean = tl.sum(h) / D_MODEL
-            hc = h - mean
-            h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
-            tl.store(h_norm_ptr + b * D_MODEL + d, h_norm)
+            hc = tl.where(d_mask, h - mean, 0.0)
+            h_norm = tl.where(d_mask,
+                              ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                              0.0)
+            tl.store(h_norm_ptr + b * D_BLOCK + d, h_norm, mask=d_mask)
 
         # 1b. Q projection — load wq once, apply to all B
-        wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+        wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :],
+                      mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
         for b in tl.range(0, BATCH_SIZE):
-            h_norm = tl.load(h_norm_ptr + b * D_MODEL + d)
+            h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
             Q = tl.dot(h_norm[None, :].to(tl.bfloat16), wq).to(tl.float32).sum(axis=0)
             tl.store(qkv_tmp_ptr + b * D_HEAD + dh, Q)
 
         # 1c. K projection — load wk once, apply to all B, store to cache
-        wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :]).to(tl.bfloat16)
+        wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :],
+                      mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
         for b in tl.range(0, BATCH_SIZE):
-            h_norm = tl.load(h_norm_ptr + b * D_MODEL + d)
+            h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
             K_new = tl.dot(h_norm[None, :].to(tl.bfloat16), wk).to(tl.float32).sum(axis=0)
             pos_b = tl.load(positions_ptr + b)
             kv_b = b * TOTAL_KV_SIZE
@@ -198,9 +207,10 @@ def _batched_decode(
             tl.store(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh, K_new)
 
         # 1d. V projection — load wv once, apply to all B, store to cache
-        wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :]).to(tl.bfloat16)
+        wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :],
+                      mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
         for b in tl.range(0, BATCH_SIZE):
-            h_norm = tl.load(h_norm_ptr + b * D_MODEL + d)
+            h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
             V_new = tl.dot(h_norm[None, :].to(tl.bfloat16), wv).to(tl.float32).sum(axis=0)
             pos_b = tl.load(positions_ptr + b)
             kv_b = b * TOTAL_KV_SIZE
@@ -259,11 +269,12 @@ def _batched_decode(
             tl.store(attn_ml_ptr + (b * TOTAL_BLOCKS + pid) * 2 + 1, tl.sum(l_i))
 
         # 1f. O projection — load wo once, apply to all B
-        wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+        wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :],
+                      mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
         for b in tl.range(0, BATCH_SIZE):
             attn_out = tl.load(qkv_tmp_ptr + b * D_HEAD + dh)
             o_proj = tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
-            tl.store(partial_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, o_proj)
+            tl.store(partial_ptr + (b * TOTAL_BLOCKS + pid) * D_BLOCK + d, o_proj, mask=d_mask)
 
         # ── Split barrier (counter + done flag on separate cache lines) ──
         b0 = layer * 2
@@ -281,40 +292,43 @@ def _batched_decode(
         # attn_total stored to attn_buf (all blocks write same value — benign race).
         # h_norm stored to h_norm_buf for FFN weight amortization.
 
-        ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
+        ln_s = tl.load(packed_w_ptr + ln2_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
+        ln_b = tl.load(packed_w_ptr + ln2_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
         ff_start = pid * FF_PER_BLOCK
 
         for b in tl.range(0, BATCH_SIZE):
-            h = tl.load(h_buf_ptr + h_in_off + b * D_MODEL + d)
+            h = tl.load(h_buf_ptr + h_in_off + b * D_BLOCK + d, mask=d_mask, other=0.0)
 
             # Merge KV splits → attn_total
-            attn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
+            attn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
             for head in tl.range(N_HEADS):
                 m_max_val = tl.full((), -1e9, dtype=tl.float32)
                 for sv in tl.static_range(KV_SPLITS):
                     m_s = tl.load(attn_ml_ptr + (b * TOTAL_BLOCKS + head * KV_SPLITS + sv) * 2)
                     m_max_val = tl.maximum(m_max_val, m_s)
                 l_total = tl.full((), 0.0, dtype=tl.float32)
-                o_merged = tl.zeros((D_MODEL,), dtype=tl.float32)
+                o_merged = tl.zeros((D_BLOCK,), dtype=tl.float32)
                 for sv in tl.static_range(KV_SPLITS):
                     m_s = tl.load(attn_ml_ptr + (b * TOTAL_BLOCKS + head * KV_SPLITS + sv) * 2)
                     l_s = tl.load(attn_ml_ptr + (b * TOTAL_BLOCKS + head * KV_SPLITS + sv) * 2 + 1)
-                    o_s = tl.load(partial_ptr + (b * TOTAL_BLOCKS + head * KV_SPLITS + sv) * D_MODEL + d)
+                    o_s = tl.load(partial_ptr + (b * TOTAL_BLOCKS + head * KV_SPLITS + sv) * D_BLOCK + d,
+                                  mask=d_mask, other=0.0)
                     w_val = l_s * tl.exp(m_s - m_max_val)
                     l_total = l_total + w_val
                     o_merged = o_merged + o_s * w_val
                 attn_total = attn_total + o_merged / l_total
 
             # Store attn_total for phase 3 (all blocks write same value)
-            tl.store(attn_buf_ptr + b * D_MODEL + d, attn_total)
+            tl.store(attn_buf_ptr + b * D_BLOCK + d, attn_total, mask=d_mask)
 
             # LN2 on (h + attn_total) → store h_norm for weight-amortized FFN
             h_attn = h + attn_total
             mean = tl.sum(h_attn) / D_MODEL
-            hc = h_attn - mean
-            h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
-            tl.store(h_norm_ptr + b * D_MODEL + d, h_norm)
+            hc = tl.where(d_mask, h_attn - mean, 0.0)
+            h_norm = tl.where(d_mask,
+                              ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                              0.0)
+            tl.store(h_norm_ptr + b * D_BLOCK + d, h_norm, mask=d_mask)
 
         # ══════════════════════════════════════════════════
         # PHASE 2b: FFN with weight amortization — outer k-loop, inner b-loop
@@ -324,12 +338,14 @@ def _batched_decode(
 
         for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
             kk = ff_start + k + tl.arange(0, BLOCK_K)
-            up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+            up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
+                           mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
             up_bias = tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
-            down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+            down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
+                             mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
 
             for b in tl.range(0, BATCH_SIZE):
-                h_norm = tl.load(h_norm_ptr + b * D_MODEL + d)
+                h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
                 h_norm_2d = h_norm[None, :].to(tl.bfloat16)
                 up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
                 up += up_bias
@@ -337,10 +353,12 @@ def _batched_decode(
                 partial = tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
                 if k == 0:
-                    tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, partial)
+                    tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_BLOCK + d, partial, mask=d_mask)
                 else:
-                    existing = tl.load(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d)
-                    tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, existing + partial)
+                    existing = tl.load(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_BLOCK + d,
+                                       mask=d_mask, other=0.0)
+                    tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_BLOCK + d,
+                             existing + partial, mask=d_mask)
 
         # ── Barrier ──
         b1 = layer * 2 + 1
@@ -356,13 +374,15 @@ def _batched_decode(
         # Double-buffer: read from h_in, write to h_out (no read-write race).
         # ══════════════════════════════════════════════════
         for b in tl.range(0, BATCH_SIZE):
-            h = tl.load(h_buf_ptr + h_in_off + b * D_MODEL + d)
-            attn_total = tl.load(attn_buf_ptr + b * D_MODEL + d)
-            ffn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
+            h = tl.load(h_buf_ptr + h_in_off + b * D_BLOCK + d, mask=d_mask, other=0.0)
+            attn_total = tl.load(attn_buf_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
+            ffn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
             for i in tl.range(TOTAL_BLOCKS):
-                ffn_total += tl.load(ffn_buf_ptr + (b * TOTAL_BLOCKS + i) * D_MODEL + d)
-            h = h + attn_total + ffn_total + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
-            tl.store(h_buf_ptr + h_out_off + b * D_MODEL + d, h)
+                ffn_total += tl.load(ffn_buf_ptr + (b * TOTAL_BLOCKS + i) * D_BLOCK + d,
+                                     mask=d_mask, other=0.0)
+            h = h + attn_total + ffn_total + tl.load(packed_w_ptr + down_b_off + d,
+                                                      mask=d_mask, other=0.0).to(tl.float32)
+            tl.store(h_buf_ptr + h_out_off + b * D_BLOCK + d, h, mask=d_mask)
 
         # No barrier needed after phase 3: all blocks write identical h values
         # (redundant reduce), so each block can safely read its own writes in the
@@ -371,18 +391,20 @@ def _batched_decode(
     # ══════════════════════════════════════════════════
     # OUTPUT: Final LN + tiled output projection + argmax
     # ══════════════════════════════════════════════════
-    ln_s = tl.load(lnf_s_ptr + d).to(tl.float32)
-    ln_b = tl.load(lnf_b_ptr + d).to(tl.float32)
+    ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
+    ln_b = tl.load(lnf_b_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
 
     TILES_PER_BLOCK: tl.constexpr = VOCAB_PAD // (OUTPUT_VTILE * TOTAL_BLOCKS)
     # After N_LAYERS, final h is in the output buffer of the last layer
     h_final_off = (N_LAYERS % 2) * H_BUF_SIZE
 
     for b in tl.range(0, BATCH_SIZE):
-        h = tl.load(h_buf_ptr + h_final_off + b * D_MODEL + d)
+        h = tl.load(h_buf_ptr + h_final_off + b * D_BLOCK + d, mask=d_mask, other=0.0)
         mean = tl.sum(h) / D_MODEL
-        hc = h - mean
-        h_final = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+        hc = tl.where(d_mask, h - mean, 0.0)
+        h_final = tl.where(d_mask,
+                           ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                           0.0)
         h_final_2d = h_final[None, :].to(tl.bfloat16)
 
         best_val = -1e9
@@ -390,7 +412,8 @@ def _batched_decode(
         for tile_idx in tl.range(0, TILES_PER_BLOCK):
             v_start = (pid * TILES_PER_BLOCK + tile_idx) * OUTPUT_VTILE
             vv = v_start + tl.arange(0, OUTPUT_VTILE)
-            out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :]).to(tl.bfloat16)
+            out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :],
+                            mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
             tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
             tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
             tl.store(logits_ptr + b * VOCAB_PAD + vv, tile_logits)
@@ -425,6 +448,14 @@ def _batched_decode(
             tl.store(next_tokens_ptr + b, global_best_idx.to(tl.int32))
 
 
+def _next_power_of_2(n):
+    """Return smallest power of 2 >= n."""
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
 # ──────────────────────────────────────────────────────────────────────
 
 def batched_decode_nlayer(w, config, token_ids, positions, kv_packed_batch,
@@ -447,6 +478,7 @@ def batched_decode_nlayer(w, config, token_ids, positions, kv_packed_batch,
         kv_out: (B * total_kv_per_seq,) bf16
     """
     d_model = config["d_model"]
+    d_block = _next_power_of_2(d_model)
     d_head = config["d_head"]
     n_heads = config["n_heads"]
     n_kv_heads = config.get("n_kv_heads", n_heads)
@@ -459,13 +491,13 @@ def batched_decode_nlayer(w, config, token_ids, positions, kv_packed_batch,
     total_blocks = n_heads * kv_splits
     ff_per_block = d_ff // total_blocks
 
-    # Workspace offsets (all f32)
+    # Workspace offsets (all f32) — use d_block for power-of-2 alignment
     h_buf_off = 0
-    partial_off = h_buf_off + 2 * batch_size * d_model  # double-buffered h
-    ffn_buf_off = partial_off + batch_size * total_blocks * d_model
-    attn_buf_off = ffn_buf_off + batch_size * total_blocks * d_model
-    h_norm_off = attn_buf_off + batch_size * d_model
-    attn_ml_off = h_norm_off + batch_size * d_model
+    partial_off = h_buf_off + 2 * batch_size * d_block  # double-buffered h
+    ffn_buf_off = partial_off + batch_size * total_blocks * d_block
+    attn_buf_off = ffn_buf_off + batch_size * total_blocks * d_block
+    h_norm_off = attn_buf_off + batch_size * d_block
+    attn_ml_off = h_norm_off + batch_size * d_block
     qkv_tmp_off = attn_ml_off + batch_size * total_blocks * 2
     barrier_off = qkv_tmp_off + total_blocks * 3 * batch_size * d_head
     done_off = barrier_off + 32   # separate cache line
@@ -490,8 +522,8 @@ def batched_decode_nlayer(w, config, token_ids, positions, kv_packed_batch,
             jax.ShapeDtypeStruct((batch_size,), jnp.int32),
         ],
         grid=(total_blocks,),
-        num_warps=4, num_stages=2,
-        D_MODEL=d_model, D_HEAD=d_head, D_FF=d_ff,
+        num_warps=4, num_stages=1,
+        D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, D_FF=d_ff,
         N_HEADS=n_heads, N_KV_HEADS=n_kv_heads, D_KV=d_kv,
         N_LAYERS=n_layers, MAX_SEQ=max_seq,
         KV_SPLITS=kv_splits, TOTAL_BLOCKS=total_blocks,
