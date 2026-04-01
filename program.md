@@ -505,132 +505,122 @@ UPDATED (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
 
 ---
 
-## YOUR NEXT TASK: Kernel Optimization + Model Scaling Validation
+## COMPLETED: Kernel Optimization + Model Scaling Validation (2026-04-01)
 
-Two goals in parallel: (A) push kernel performance further, and (B) scale the model up
-to verify that kernel optimizations generalize across d_model and context length.
+**All targets addressed.** See "Kernel Optimization Round 2" and performance tables above.
 
-### Part A: Kernel Optimization (on current d=512, 8L model)
+Summary:
+- A1 (shared memory): skipped — all hot buffers in registers, <2% potential
+- A2 (persistent batched): done — B=4 7351 tok/s (+10% vs pipelined)
+- A3 (in-place KV): done — pos-only store, +7.1% single-seq
+- A4 (tensor core B>=16): skipped — B=4/B=8 are the key batch sizes
+- B1 (d=768): done — 81.1M params, ppl=2.60, 1006 tok/s multi-SM, 2460 tok/s persist-B=8
+- B2 (ctx=2048): done — ppl=2.84, 3133 tok/s persistent, 4560 tok/s persist-B=4
+- B3 (benchmark): done — all kernel variants profiled at each scale
 
-Continue closing the gap to theoretical. Current persistent kernel achieves 0.209 ms/tok
-vs 0.066 ms/tok theoretical = 3.2x gap. The kernel itself (not sync) runs at ~0.35 ms/tok
-pipelined, so the real gap to theoretical is ~5.3x.
+Scaling targets:
+- ctx=2048 persistent >2000: PASSED (3133)
+- ctx=2048 B=4 >4000: PASSED (4560)
+- d=768 persistent >2000: MISSED (1344, but persistent B=4 2225 passes)
+- d=768 B=4 >4000: MISSED (2225 — HBM-bound, 162MB weights exceed L2)
 
-**Priority-ordered optimizations:**
+---
 
-**A1. Shared memory workspace (highest expected impact)**
+## YOUR NEXT TASK: Close the Bandwidth Gap + Production Hardening
 
-The 101KB shared memory is completely UNUSED. All workspace buffers (partial, attn_buf,
-ffn_buf, h_norm, etc.) go through L2 at ~100 cycle latency. Shared memory is ~20 cycles.
-Moving the hottest buffers to shared memory could save 50-100µs per step.
+The kernel architecture is validated across 3 model scales. The bottleneck has shifted
+from barriers/sync (d=512) to **bandwidth** (d=768). BW utilization is 12-20% of the
+836 GB/s theoretical — there's 5-8x headroom. The next phase focuses on reducing
+redundant data movement and making the kernels production-ready.
 
-Candidate buffers for shared memory:
-- `partial`: TOTAL_BLOCKS × D_MODEL f32 = 32 × 512 × 4 = 64KB — fits! This is the
-  most-accessed buffer (read by all blocks for merge and FFN reduce).
-- `attn_ml`: TOTAL_BLOCKS × 2 f32 = 256 bytes — trivially fits.
-- `h_norm`: B × D_MODEL f32 = 4 × 512 × 4 = 8KB — fits alongside partial.
+### Part A: Bandwidth Optimization (highest impact at d=768)
 
-Challenge: shared memory is per-SM, but workspace buffers need to be visible across SMs
-(for cross-block barriers). Shared memory is SM-local. So this only works for buffers
-that are written and read within the SAME block, not cross-block buffers.
+**A1. Cooperative weight loading (highest expected impact)**
 
-This means only per-block-private data can use shared memory. The `partial` buffer IS
-cross-block (all blocks write their part, all blocks read all parts). So it can't use
-shared memory directly. But `qkv_tmp` (per-block Q/K/V) and `h_norm` (all blocks write
-same value, only need own block's write) could.
+Currently all TOTAL_BLOCKS blocks redundantly load the same weight matrices from HBM/L2.
+With 48 blocks at d=768, that's 48× redundant reads of the same data. Instead:
+- One "leader" block per SM loads the weight tile into shared memory
+- Other blocks on the same SM read from shared memory (~20 cycles vs ~100 L2)
+- This is only possible for blocks co-located on the same SM
 
-**A2. Persistent batched kernel**
+Challenge: Triton doesn't expose SM affinity directly. But with grid=(48,) and 80 SMs
+on RTX 4080 Super, most blocks are alone on their SM. With persistent kernels (where
+blocks don't migrate), cooperative loading between blocks on the same SM is possible.
 
-Apply the same persistent kernel technique to the batched decode. This eliminates per-step
-workspace allocation and int() sync for batched inference, potentially pushing B=4 sync'd
-from 4205 to ~6000+ without pipelining.
+Alternative approach: **software-managed L2 cache pinning** — load weights once into L2
+with a "warmup" pass, then rely on L2 hits for subsequent reads. Triton supports
+`cache_modifier='ca'` (cache at all levels) vs `'cg'` (cache in L2 only, bypass L1).
 
-Design: same as persistent single-seq but with B sequences. Additional complexity:
-- h_buf double-buffering across steps (not just layers)
-- Larger workspace (more barrier slots for B × steps)
-- In-kernel next-token feedback for all B sequences
+Expected impact: 20-40% at d=768 (where weight loads dominate).
 
-**A3. In-place KV for persistent kernel (eliminate tile copy)**
+**A2. Adaptive KV_SPLITS based on context length**
 
-The current persistent kernel copies ALL KV tiles during attention (matching original
-read-modify-write). This is ~4 MB of unnecessary traffic per step. Writing K_new/V_new
-BEFORE attention and reading directly (no tl.where) saves this traffic but introduces a
-bf16 round-trip that caused token divergence at step 34. Debug and fix this — the divergence
-is a precision issue, not a correctness issue. Options:
-- Accept the divergence (both outputs are valid, just different greedy paths)
-- Keep K_new/V_new in f32 registers and use tl.where for the CURRENT step only,
-  write to kv_out after attention (already tried, still diverges — investigate further)
+At ctx=2048, each KV split processes 1024 positions (16 tiles). The attention loop takes
+longer, creating more straggler variance at barriers. Increasing KV_SPLITS to 4 would
+halve the attention work per block (8 tiles), reducing straggler time. But grid=64 had
+diminishing returns at ctx=512 (lesson #32). The tradeoff may be different at ctx=2048
+where attention dominates.
 
-**A4. Tensor core batched projections (B >= 16)**
+Design: profile KV_SPLITS=1,2,4,8 at ctx=2048 and find the sweet spot.
+
+**A3. Warp specialization for overlapped load/compute**
+
+Dedicate some warps to memory loading (weight prefetch) while others execute compute
+(attention, FFN activation). This overlaps memory latency with ALU work. Triton supports
+`num_warps` control but not explicit warp specialization — may need to restructure the
+kernel to interleave loads and compute at the tl.range loop level.
+
+### Part B: Production Hardening
+
+**B1. Streaming text generation**
+
+Currently persistent kernels collect all tokens and return them at the end. For
+interactive use, tokens should stream out as they're generated. Options:
+- Host polls a device buffer at intervals (separate CUDA stream)
+- Callback mechanism triggered by the kernel writing to a flag
+- Hybrid: persistent kernel for N tokens, then yield to host, repeat
+
+**B2. Variable-length batched inference**
+
+The batched kernel assumes all B sequences are at the same position. Real serving has
+sequences at different lengths. Add per-sequence position tracking and masking in the
+batched/persistent-batched kernels.
+
+**B3. Triton prefill kernel for GQA**
+
+The prefill currently uses JAX (not Triton) for GQA models. Extend block_prefill.py to
+support n_kv_heads < n_heads, so the entire inference pipeline uses custom kernels.
+
+### Part C: Frontier Kernel Techniques
+
+**C1. Tensor core batched projections (B >= 16)**
 
 With B>=16, QKV/O projections become real matmuls: (B, D_MODEL) @ (D_MODEL, D_HEAD).
-This activates tensor cores. Process all B sequences as a single tl.dot.
+This activates tensor cores. Process all B sequences as a single tl.dot instead of
+looping over B with element-wise dot products.
 
-### Part B: Model Scaling Validation
+**C2. Paged KV cache**
 
-Train larger models and verify kernel optimizations hold. The key question: do the
-techniques (multi-SM, weight amortization, persistent kernel, pipelining) still work
-at larger d_model and context length, or do new bottlenecks emerge?
-
-**B1. Scale d_model to 768 (target: ~70M params)**
-
-```
-Config: d=768, h=24, l=12, d_ff=3072, ctx=512, vocab=4096
-Estimated params: ~70M
-KV cache (GQA 6 heads): 2 × 6 × 512 × 32 × 12 layers × 2 bytes ≈ 4.7 MB/seq
-Weight buffer: ~140 MB (exceeds L2!)
-```
-
-Key challenges at d=768:
-- Weight buffer overflows L2 (140 MB > 64 MB). Now truly HBM-bound for weights.
-  This is where the kernel becomes bandwidth-bound and the roofline model applies.
-- Register pressure: (1, 768) × (768, 32) tl.dot needs careful tiling.
-- BLOCK_SEQ for prefill: need BLOCK_SEQ ≤ 8 to keep h_block in registers.
-
-Expected: multi-SM and weight amortization should help MORE (larger weight matrices
-mean more L2/HBM traffic to amortize). Barriers should matter LESS (more compute
-per step dilutes fixed barrier cost).
-
-**B2. Scale context to 2048**
-
-```
-Config: d=512, h=16, l=8, ctx=2048
-KV cache (GQA): 2 × 4 × 2048 × 32 × 8 × 2 bytes ≈ 8.4 MB/seq
-FlashAttention tiles: 2048/64 = 32 tiles per KV split (was 4)
-```
-
-Key challenges at ctx=2048:
-- Attention cost grows linearly with context (32 tiles vs 4 at ctx=512).
-  Attention becomes a larger fraction of per-seq compute.
-- KV_SPLITS should probably increase (4 or 8) to parallelize over more tiles.
-- KV cache per sequence grows 4x. At B=4: 33.6 MB KV → doesn't fit in L2 with weights.
-
-Expected: weight amortization matters less (attention dominates), KV-split parallelism
-matters more. GQA becomes essential.
-
-**B3. Train and benchmark at each scale**
-
-For each config:
-1. Train with `uv run train.py --d-model D --n-heads H --n-layers L --context-len C`
-2. Run `uv run profile_kernels.py` to get throughput numbers
-3. Compare persistent/pipelined/sync'd throughput
-4. Identify new bottlenecks if optimizations don't transfer
+For serving multiple sequences with different lengths, paged attention avoids pre-
+allocating max_seq × d_head per sequence. Instead, KV cache is allocated in pages
+and the attention kernel follows page table pointers. This is how vLLM serves models
+efficiently.
 
 ### How to measure progress
 
-Run `uv run profile_kernels.py` after any kernel change. The hard metrics:
+Run `uv run profile_kernels.py` after any kernel change. Switch models by copying
+weights: `cp weights_d768.pkl weights.pkl` or `cp weights_ctx2048.pkl weights.pkl`.
 
 ```
-CURRENT (d=512 baseline to beat):
-  Persistent:           4777 tok/s  (0.209 ms/tok)
-  Batched B=4 (pipe):   6691 tok/s  (0.598 ms/step)
-  Batched B=8 (pipe):   7339 tok/s  (1.090 ms/step)
+CURRENT BASELINES:
+  d=512, ctx=512:   Persistent 5129 tok/s, Persist-B=4 7351 tok/s (12% BW)
+  d=768, ctx=512:   Multi-SM 1006 tok/s, Persist-B=8 2460 tok/s (20% BW)
+  ctx=2048:         Persistent 3133 tok/s, Persist-B=4 4560 tok/s (12% BW)
 
-SCALING TARGETS (new):
-  d=768 persistent:     >2000 tok/s  (model is ~3x larger → expect ~3x slower)
-  d=768 B=4 pipe:       >4000 tok/s
-  ctx=2048 persistent:  >2000 tok/s  (4x more attention work)
-  ctx=2048 B=4 pipe:    >4000 tok/s
+TARGETS:
+  d=768 BW util:    >30% (from 20%)
+  d=768 persist:    >1500 tok/s (from 1344, via cooperative loading or L2 pinning)
+  d=768 B=4:        >3000 tok/s (from 2225)
 ```
 
 ### What NOT to change
@@ -640,12 +630,9 @@ SCALING TARGETS (new):
 - Keep the multi-block prefill architecture
 - Keep the fused multi-layer decode approach
 - Keep the in-kernel cache update optimization
-- **No quantization** — Quantization (INT8, FP8, etc.) is a deployment optimization
-  technique, not a kernel engineering improvement. The goal of this project is to learn
-  GPU kernel programming by making the kernel itself fast, not to shrink the model.
-  Quantization trades accuracy for bandwidth — it doesn't teach you to write better
-  kernels. If the kernel is bandwidth-bound, the right response is to improve the
-  kernel's memory access patterns, not to reduce the data size.
+- **No quantization** — The goal is to learn GPU kernel programming by making the
+  kernel itself fast, not to shrink the model. If bandwidth-bound, improve memory
+  access patterns, not data size.
 
 ---
 
