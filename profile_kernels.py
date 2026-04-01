@@ -46,31 +46,18 @@ def load_params():
 
 
 def measure_prefill(params, config, prompt, vocab_size, n_runs=20):
-    """Measure prefill latency. Uses JAX prefill for GQA models, Triton for MHA."""
+    """Measure prefill latency. Uses Triton prefill for all models (including GQA)."""
     x = jnp.pad(prompt, (0, config["context_len"] - len(prompt))).astype(jnp.int32)
-    is_gqa = config.get("n_kv_heads", config["n_heads"]) != config["n_heads"]
 
-    if is_gqa:
-        # JAX prefill for GQA (Triton prefill kernel doesn't support GQA yet)
-        for _ in range(3):
-            logits, kc, vc = prefill_with_kv(params, config, x)
-            _ = logits.block_until_ready()
-        times = []
-        for _ in range(n_runs):
-            t0 = time.perf_counter()
-            logits, kc, vc = prefill_with_kv(params, config, x)
-            _ = logits.block_until_ready()
-            times.append(time.perf_counter() - t0)
-    else:
-        for _ in range(3):
-            logits, kc, vc = block_prefill(params, config, x, vocab_size)
-            _ = logits.block_until_ready()
-        times = []
-        for _ in range(n_runs):
-            t0 = time.perf_counter()
-            logits, kc, vc = block_prefill(params, config, x, vocab_size)
-            _ = logits.block_until_ready()
-            times.append(time.perf_counter() - t0)
+    for _ in range(3):
+        logits, kc, vc = block_prefill(params, config, x, vocab_size)
+        _ = logits.block_until_ready()
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        logits, kc, vc = block_prefill(params, config, x, vocab_size)
+        _ = logits.block_until_ready()
+        times.append(time.perf_counter() - t0)
 
     return np.median(times) * 1000, logits, kc, vc
 
