@@ -30,6 +30,10 @@ Build the fastest possible inference for this transformer using custom Triton ke
 14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
 15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
 16. Batched decode: B sequences per kernel with shared weights (1890→3422 tok/s at B=4, +81%)
+17. Persistent batched decode: single launch for B seq × N steps (7351 tok/s B=4, +10% vs pipelined)
+18. In-place KV for persistent kernels: pos-only store (+7.1% single-seq)
+19. Scaled to d=768, 12 layers, 24 heads, GQA 6 KV heads (81.1M params, ppl=2.60)
+20. Non-power-of-2 D_MODEL support via D_BLOCK padding with masking
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -45,21 +49,29 @@ Build the fastest possible inference for this transformer using custom Triton ke
 ### Current Performance (RTX 4080 Super)
 
 ```
-XL model (d=512, h=16, l=8, ctx=512, 29.7M params, ppl=2.91):
-  Decode (multi-SM):   1937 tok/s (0.52 ms/tok)  ← 6.8x speedup via grid=(32,) + split barrier
-  Decode (no sync):    3108 tok/s (0.32 ms/tok)   (pure GPU, no int() per token)
-  Decode (grid=16):    1734 tok/s (0.58 ms/tok)   (kv_splits=1, previous)
-  Decode (single-SM):  287 tok/s  (3.49 ms/tok)   (original baseline)
-  Prefill (128 tok):   6.1 ms    (21,168 tok/s)
-  Weight buffer:       59.3 MB   (bf16)
-  KV cache:            8.4 MB    (bf16, per sequence)
-  Bandwidth util:      16%       (of 836 GB/s theoretical, was 2%)
+XXL model (d=768, h=24, l=12, ctx=512, GQA 6 KV heads, 81.1M params, ppl=2.60):
+  Multi-SM sync:       1006 tok/s (0.99 ms/tok, 20% BW util)
+  Pipelined:           1463 tok/s (0.68 ms/tok)
+  Persistent:          1344 tok/s (0.74 ms/tok)
+  Batched B=4 persist: 2225 tok/s (1.80 ms/step)
+  Batched B=8 persist: 2460 tok/s (3.25 ms/step)
+  Prefill (128 tok):   33.7 ms   (3802 tok/s)
+  Weight buffer:       162.2 MB  (bf16, exceeds L2!)
+  KV cache:            4.7 MB    (bf16, per sequence)
+  Bandwidth util:      20%       (of 836 GB/s theoretical)
+
+XL model (d=512, h=16, l=8, ctx=512, GQA 4 KV heads, 26.5M params, ppl=2.96):
+  Multi-SM sync:       1834 tok/s (0.55 ms/tok, 12% BW util)
+  Persistent:          5129 tok/s (0.20 ms/tok)
+  Persistent B=4:      7351 tok/s (0.54 ms/step)
+  Persistent B=8:      7862 tok/s (1.02 ms/step)
 
 Previous model sizes:
   d=64,  1L:    3056 tok/s
   d=128, 2L:    2589 tok/s
   d=256, 4L:    1396 tok/s
-  d=512, 8L:     287 tok/s  → 1734 → 1851 → 1937 tok/s
+  d=512, 8L:     287 tok/s  → 1734 → 1851 → 5129 tok/s (persistent)
+  d=768, 12L:   1006 tok/s  → 2460 tok/s (persistent B=8)
 ```
 
 **Key findings:**
@@ -928,3 +940,26 @@ baseline_metrics.txt                — current numbers to beat
     subsequent steps. Fix: store ONLY at pos in the tile loop (`mask=pos_mask`, 128
     bytes instead of 4MB). This forces the compiler to maintain the dependency chain
     without significant traffic. +7.1% for single-seq persistent (4797→5129 tok/s).
+
+46. **tl.arange requires power-of-2 ranges — pad D_MODEL to D_BLOCK.** Triton's
+    `tl.arange(start, end)` requires `end - start` to be a power of 2. D_MODEL=768
+    is not a power of 2, so all kernels need `D_BLOCK = next_power_of_2(D_MODEL) = 1024`
+    with `d_mask = d < D_MODEL` on every load/store. LayerNorm needs explicit masking:
+    `hc = tl.where(d_mask, h - mean, 0.0)` to prevent padded elements from corrupting
+    the variance. The padding adds 33% overhead (1024 vs 768), but tl.dot with zero-
+    padded operands produces correct results since 0 × anything = 0.
+
+47. **Batched FFN at D_BLOCK=1024 overflows shared memory with BLOCK_K=32.** The
+    weight-amortized FFN loads both up_w (D_BLOCK × BLOCK_K bf16 = 64KB) and down_w
+    (BLOCK_K × D_BLOCK bf16 = 64KB) before the batch loop, totaling 128KB > 101KB
+    shared memory. Fix: reduce BLOCK_K from 32 to 16, halving weight matrices to
+    32KB each (64KB total). The multi-SM kernel doesn't have this issue because it
+    loads up_w and down_w sequentially (not both alive during the batch inner loop).
+
+48. **At d=768, persistent decode is SLOWER than pipelined.** Persistent single-seq:
+    1344 tok/s vs pipelined: 1463 tok/s. With ~1ms per decode step (3× slower than
+    d=512's 0.35ms), the persistent kernel's overhead (barrier management, in-kernel
+    argmax, step-sync) becomes a significant fraction. The persistent technique's
+    advantage (eliminating 0.15-0.20ms host sync per step) matters less when the
+    kernel step itself takes 1ms. Lesson: persistent kernels help most when host
+    overhead is a large fraction of step time (d=512: 30-60%, d=768: ~15%).
