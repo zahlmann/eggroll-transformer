@@ -198,19 +198,32 @@ def _prepare_trained_bpe_from_texts(train_text, val_text, context_len, vocab_siz
                 print(f"  tokenized {i / 1e6:.0f}M / {len(text) / 1e6:.0f}M chars ({len(all_ids) / 1e6:.1f}M tokens)")
         return all_ids
 
-    print(f"Tokenizing train ({len(train_text)/1e6:.0f}M chars)...")
-    train_tokens = encode_chunked(train_text)
-    del train_text  # free memory
-    print(f"Tokenizing val ({len(val_text)/1e6:.0f}M chars)...")
-    val_tokens = encode_chunked(val_text)
-    del val_text
-    print(f"Trained BPE ({dataset}): {len(train_tokens)} train tokens, "
-          f"{len(val_tokens)} val tokens, vocab={actual_vocab}")
+    # Cache tokenized data to skip re-tokenization on subsequent runs
+    cache_path = os.path.join(DATA_DIR, f"tokenized_{dataset}_{vocab_size}.npz")
+    if os.path.exists(cache_path):
+        print(f"Loading cached tokens from {cache_path}...")
+        cached = np.load(cache_path)
+        train_data = cached["train"]
+        val_data = cached["val"]
+        print(f"Trained BPE ({dataset}): {len(train_data)} train tokens, "
+              f"{len(val_data)} val tokens, vocab={actual_vocab}")
+    else:
+        print(f"Tokenizing train ({len(train_text)/1e6:.0f}M chars)...")
+        train_tokens = encode_chunked(train_text)
+        del train_text
+        print(f"Tokenizing val ({len(val_text)/1e6:.0f}M chars)...")
+        val_tokens = encode_chunked(val_text)
+        del val_text
+        print(f"Trained BPE ({dataset}): {len(train_tokens)} train tokens, "
+              f"{len(val_tokens)} val tokens, vocab={actual_vocab}")
 
-    train_data = np.array(train_tokens, dtype=np.int32)
-    del train_tokens
-    val_data = np.array(val_tokens, dtype=np.int32)
-    del val_tokens
+        train_data = np.array(train_tokens, dtype=np.int32)
+        del train_tokens
+        val_data = np.array(val_tokens, dtype=np.int32)
+        del val_tokens
+
+        print(f"Caching tokens to {cache_path}...")
+        np.savez(cache_path, train=train_data, val=val_data)
 
     # Save vocab mapping for inference
     vocab_path = os.path.join(DATA_DIR, "bpe_vocab.pkl")

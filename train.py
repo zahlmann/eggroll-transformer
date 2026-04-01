@@ -8,6 +8,9 @@ Usage: uv run train.py [--seed SEED] [--lr LR] [--tokenizer char|bpe|trained_bpe
 
 import os
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
+# Persistent XLA compilation cache: skip recompilation on repeated runs
+os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), ".jax_cache")
+os.environ.setdefault("JAX_COMPILATION_CACHE_MAX_SIZE", str(2 * 1024**3))  # 2GB
 
 import argparse
 import time

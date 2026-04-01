@@ -114,46 +114,50 @@ def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads=None):
     return out @ wo
 
 
+def _transformer_layer(h, ln1_s, ln1_b, wq, wk, wv, wo,
+                       ln2_s, ln2_b, ffn_up, ffn_up_b, ffn_down, ffn_down_b,
+                       n_heads, n_kv_heads, parallel):
+    """Single transformer layer with explicit params (for gradient checkpointing)."""
+    h_norm = layer_norm(h, ln1_s, ln1_b)
+    attn_out = causal_attention(h_norm, wq, wk, wv, wo, n_heads, n_kv_heads)
+
+    if parallel:
+        h_norm2 = layer_norm(h, ln2_s, ln2_b)
+        h_ff = jax.nn.gelu(h_norm2 @ ffn_up + ffn_up_b)
+        h_ff = h_ff @ ffn_down + ffn_down_b
+        h = h + attn_out + h_ff
+    else:
+        h = h + attn_out
+        h_norm2 = layer_norm(h, ln2_s, ln2_b)
+        h_ff = jax.nn.gelu(h_norm2 @ ffn_up + ffn_up_b)
+        h_ff = h_ff @ ffn_down + ffn_down_b
+        h = h + h_ff
+    return h
+
+
 def transformer_forward(params, config, x):
     """Forward pass. x: (seq_len,) integer token indices. Returns logits (seq_len, vocab_size)."""
     seq_len = x.shape[0]
-
-    # embeddings
     h = params["token_emb"][x] + params["pos_emb"][:seq_len]
-
     parallel = config.get("parallel_residual", False)
+    n_heads = config["n_heads"]
+    n_kv_heads = config.get("n_kv_heads", n_heads)
 
     for layer in range(config["n_layers"]):
-        prefix = f"layer{layer}"
-
-        # pre-norm attention
-        h_norm = layer_norm(h, params[f"{prefix}.ln1.scale"], params[f"{prefix}.ln1.bias"])
-        attn_out = causal_attention(
-            h_norm,
-            params[f"{prefix}.attn.q"],
-            params[f"{prefix}.attn.k"],
-            params[f"{prefix}.attn.v"],
-            params[f"{prefix}.attn.o"],
-            config["n_heads"],
-            config.get("n_kv_heads", config["n_heads"]),
+        p = f"layer{layer}"
+        # Gradient checkpointing: pass only this layer's params to avoid saving
+        # the full model params dict at each checkpoint boundary.
+        h = jax.checkpoint(_transformer_layer, static_argnums=(13, 14, 15))(
+            h,
+            params[f"{p}.ln1.scale"], params[f"{p}.ln1.bias"],
+            params[f"{p}.attn.q"], params[f"{p}.attn.k"],
+            params[f"{p}.attn.v"], params[f"{p}.attn.o"],
+            params[f"{p}.ln2.scale"], params[f"{p}.ln2.bias"],
+            params[f"{p}.ffn.up"], params[f"{p}.ffn.up_bias"],
+            params[f"{p}.ffn.down"], params[f"{p}.ffn.down_bias"],
+            n_heads, n_kv_heads, parallel,
         )
 
-        if parallel:
-            # Parallel residual: attention and FFN both computed from h
-            # h_out = h + Attn(LN1(h)) + FFN(LN2(h))
-            h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
-            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
-            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
-            h = h + attn_out + h_ff
-        else:
-            # Standard sequential residual
-            h = h + attn_out
-            h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
-            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
-            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
-            h = h + h_ff
-
-    # final layer norm + output projection
     h = layer_norm(h, params["ln_final.scale"], params["ln_final.bias"])
     logits = h @ params["output_proj"]
     return logits
