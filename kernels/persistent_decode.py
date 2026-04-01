@@ -184,7 +184,8 @@ def _persistent_decode(
 
                 K_tile = tl.load(kv_out_ptr + kc_base + cache_off
                                  + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                 mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                                 mask=tile_mask[:, None], other=0.0,
+                                 eviction_policy='evict_last').to(tl.float32)
                 K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
                 # Store only at pos to force compiler commit (not full tile copy)
                 pos_mask = tile_pos == pos
@@ -194,7 +195,8 @@ def _persistent_decode(
 
                 V_tile = tl.load(kv_out_ptr + vc_base + cache_off
                                  + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                 mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                                 mask=tile_mask[:, None], other=0.0,
+                                 eviction_policy='evict_last').to(tl.float32)
                 V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
                 tl.store(kv_out_ptr + vc_base + cache_off
                          + tile_pos[:, None] * D_HEAD + dh[None, :],
@@ -304,7 +306,8 @@ def _persistent_decode(
             v_start = (pid * TILES_PER_BLOCK + tile_idx) * OUTPUT_VTILE
             vv = v_start + tl.arange(0, OUTPUT_VTILE)
             out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :],
-                            mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+                            mask=d_mask[:, None], other=0.0,
+                            eviction_policy='evict_first').to(tl.bfloat16)
             tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
             tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
             # Only store logits on last step
@@ -318,17 +321,14 @@ def _persistent_decode(
         tl.store(argmax_ptr + pid * 2, best_val)
         tl.store(argmax_ptr + pid * 2 + 1, best_idx)
 
-        # ── Final barrier: all blocks done with output projection ──
+        # ── Combined output + step-sync barrier ──
+        # Last-arriving block knows all argmax values are written,
+        # so it does argmax reduction + writes next_tok before signaling.
         bf = b_off + 2 * N_LAYERS
         old_cnt = tl.atomic_add(barrier_ptr + bf, 1.0, sem='release', scope='gpu')
         if old_cnt >= TOTAL_BLOCKS - 1:
             _ = tl.atomic_add(barrier_ptr + bf, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + bf, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + bf, 0.0, sem='acquire', scope='gpu') < 1.0:
-            pass
-
-        # Block 0 reduces argmax, writes next token
-        if pid == 0:
+            # Reduce argmax (this block arrived last → all values are ready)
             global_best_val = -1e9
             global_best_idx = 0.0
             for i in tl.range(TOTAL_BLOCKS):
@@ -340,18 +340,11 @@ def _persistent_decode(
             next_tok = global_best_idx.to(tl.int32)
             tl.store(next_tok_ptr, next_tok)
             tl.store(token_out_ptr + step, next_tok)
-
-        # ── Step-sync barrier: all blocks wait for block 0's next_token ──
-        bs = b_off + 2 * N_LAYERS + 1
-        old_cnt = tl.atomic_add(barrier_ptr + bs, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + bs, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + bs, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + bs, 0.0, sem='acquire', scope='gpu') < 1.0:
+            tl.atomic_add(done_ptr + bf, 1.0, sem='release', scope='gpu')
+        while tl.atomic_add(done_ptr + bf, 0.0, sem='acquire', scope='gpu') < 1.0:
             pass
 
-        # Load next token for next iteration (written by block 0 above)
-        # Cast f32→int32 since workspace is f32
+        # Load next token for next iteration
         token_id = tl.load(next_tok_ptr).to(tl.int32)
 
 
@@ -400,8 +393,8 @@ def persistent_decode_nlayer(w, config, first_token, start_pos, kv_packed,
     total_blocks = n_heads * kv_splits
     ff_per_block = d_ff // total_blocks
 
-    # Barriers per step: 2 per layer + 1 final + 1 step-sync = 18 for 8 layers
-    barriers_per_step = 2 * n_layers + 2
+    # Barriers per step: 2 per layer + 1 combined output/step-sync
+    barriers_per_step = 2 * n_layers + 1
     total_barrier_slots = 1 + n_steps * barriers_per_step  # +1 for initial KV copy
 
     # Workspace layout (all f32):

@@ -236,7 +236,8 @@ def _batched_decode(
 
                 K_tile = tl.load(kv_in_ptr + kv_b + kc_base + cache_off
                                  + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                 mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                                 mask=tile_mask[:, None], other=0.0,
+                                 eviction_policy='evict_last').to(tl.float32)
                 K_tile = tl.where(tile_pos[:, None] == pos_b, K_new[None, :], K_tile)
                 tl.store(kv_out_ptr + kv_b + kc_base + cache_off
                          + tile_pos[:, None] * D_HEAD + dh[None, :],
@@ -244,7 +245,8 @@ def _batched_decode(
 
                 V_tile = tl.load(kv_in_ptr + kv_b + vc_base + cache_off
                                  + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                 mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                                 mask=tile_mask[:, None], other=0.0,
+                                 eviction_policy='evict_last').to(tl.float32)
                 V_tile = tl.where(tile_pos[:, None] == pos_b, V_new[None, :], V_tile)
                 tl.store(kv_out_ptr + kv_b + vc_base + cache_off
                          + tile_pos[:, None] * D_HEAD + dh[None, :],
@@ -413,7 +415,8 @@ def _batched_decode(
             v_start = (pid * TILES_PER_BLOCK + tile_idx) * OUTPUT_VTILE
             vv = v_start + tl.arange(0, OUTPUT_VTILE)
             out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :],
-                            mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+                            mask=d_mask[:, None], other=0.0,
+                            eviction_policy='evict_first').to(tl.bfloat16)
             tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
             tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
             tl.store(logits_ptr + b * VOCAB_PAD + vv, tile_logits)

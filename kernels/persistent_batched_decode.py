@@ -262,7 +262,8 @@ def _persistent_batched_decode(
                     # Pos-only store forces compiler to commit K/V at pos.
                     K_tile = tl.load(kv_out_ptr + kv_b + kc_base + cache_off
                                      + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                     mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                                     mask=tile_mask[:, None], other=0.0,
+                                     eviction_policy='evict_last').to(tl.float32)
                     K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
                     pos_mask = tile_pos == pos
                     tl.store(kv_out_ptr + kv_b + kc_base + cache_off
@@ -271,7 +272,8 @@ def _persistent_batched_decode(
 
                     V_tile = tl.load(kv_out_ptr + kv_b + vc_base + cache_off
                                      + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                     mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                                     mask=tile_mask[:, None], other=0.0,
+                                     eviction_policy='evict_last').to(tl.float32)
                     V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
                     tl.store(kv_out_ptr + kv_b + vc_base + cache_off
                              + tile_pos[:, None] * D_HEAD + dh[None, :],
@@ -421,7 +423,8 @@ def _persistent_batched_decode(
                 v_start = (pid * TILES_PER_BLOCK + tile_idx) * OUTPUT_VTILE
                 vv = v_start + tl.arange(0, OUTPUT_VTILE)
                 out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :],
-                               mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+                               mask=d_mask[:, None], other=0.0,
+                               eviction_policy='evict_first').to(tl.bfloat16)
                 tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
                 tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
                 if step == N_STEPS - 1:
@@ -434,17 +437,12 @@ def _persistent_batched_decode(
             tl.store(argmax_ptr + (b * TOTAL_BLOCKS + pid) * 2, best_val)
             tl.store(argmax_ptr + (b * TOTAL_BLOCKS + pid) * 2 + 1, best_idx)
 
-        # ── Final barrier ──
+        # ── Combined output + step-sync barrier ──
+        # Last-arriving block does argmax reduction + writes next tokens.
         bf = b_off + 2 * N_LAYERS
         old_cnt = tl.atomic_add(barrier_ptr + bf, 1.0, sem='release', scope='gpu')
         if old_cnt >= TOTAL_BLOCKS - 1:
             _ = tl.atomic_add(barrier_ptr + bf, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + bf, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + bf, 0.0, sem='acquire', scope='gpu') < 1.0:
-            pass
-
-        # Block 0 reduces argmax, writes next tokens
-        if pid == 0:
             for b in tl.range(0, BATCH_SIZE):
                 global_best_val = -1e9
                 global_best_idx = 0.0
@@ -457,14 +455,8 @@ def _persistent_batched_decode(
                 next_tok = global_best_idx.to(tl.int32)
                 tl.store(next_tok_ptr + b, next_tok)
                 tl.store(token_out_ptr + step * BATCH_SIZE + b, next_tok)
-
-        # ── Step-sync barrier ──
-        bs = b_off + 2 * N_LAYERS + 1
-        old_cnt = tl.atomic_add(barrier_ptr + bs, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + bs, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + bs, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + bs, 0.0, sem='acquire', scope='gpu') < 1.0:
+            tl.atomic_add(done_ptr + bf, 1.0, sem='release', scope='gpu')
+        while tl.atomic_add(done_ptr + bf, 0.0, sem='acquire', scope='gpu') < 1.0:
             pass
 
 
@@ -513,7 +505,7 @@ def persistent_batched_decode_nlayer(w, config, first_tokens, start_pos, kv_pack
     ff_per_block = d_ff // total_blocks
 
     # Barriers per step: 2 per layer + 1 final + 1 step-sync
-    barriers_per_step = 2 * n_layers + 2
+    barriers_per_step = 2 * n_layers + 1
     total_barrier_slots = 1 + n_steps * barriers_per_step
 
     # Workspace offsets (all f32) — use d_block for power-of-2 alignment
