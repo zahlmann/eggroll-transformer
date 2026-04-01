@@ -33,43 +33,54 @@ def _proj_kernel(
     wq_ptr, wk_ptr, wv_ptr,
     q_buf_ptr, k_cache_ptr, v_cache_ptr,
     D_MODEL: tl.constexpr,
+    D_BLOCK: tl.constexpr,
     D_HEAD: tl.constexpr,
     N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    D_KV: tl.constexpr,
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
 ):
-    """LN1 + Q/K/V projections for a block of rows."""
+    """LN1 + Q/K/V projections for a block of rows. Supports GQA + non-power-of-2 D_MODEL."""
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    d = tl.arange(0, D_MODEL)
+    d = tl.arange(0, D_BLOCK)
+    d_mask = d < D_MODEL
     dh = tl.arange(0, D_HEAD)
 
-    # Load h block: (32, 128) f32 = 16KB
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :]).to(tl.float32)
+    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
 
     # Layer Norm
-    ln_s = tl.load(ln_scale_ptr + d).to(tl.float32)
-    ln_b = tl.load(ln_bias_ptr + d).to(tl.float32)
+    ln_s = tl.load(ln_scale_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
+    ln_b = tl.load(ln_bias_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
     mean = tl.sum(h, axis=1)[:, None] / D_MODEL
-    hc = h - mean
-    h_norm = ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :]
+    hc = tl.where(d_mask[None, :], h - mean, 0.0)
+    h_norm = tl.where(d_mask[None, :],
+                      ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :],
+                      0.0)
 
-    # Q/K/V projections per head
+    h_norm_bf16 = h_norm.to(tl.bfloat16)
+
+    # Q projections: N_HEADS heads
     for head in tl.range(N_HEADS):
         hd = head * D_HEAD + dh
         head_off = head * SEQ * D_HEAD
-
-        wq = tl.load(wq_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
-        Q = tl.dot(h_norm.to(tl.bfloat16), wq).to(tl.float32)
+        wq = tl.load(wq_ptr + d[:, None] * D_MODEL + hd[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+        Q = tl.dot(h_norm_bf16, wq).to(tl.float32)
         tl.store(q_buf_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :], Q)
 
-        wk = tl.load(wk_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
-        K = tl.dot(h_norm.to(tl.bfloat16), wk).to(tl.float32)
-        tl.store(k_cache_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16))
+    # K/V projections: N_KV_HEADS heads (shared across GQA groups)
+    for kv_head in tl.range(N_KV_HEADS):
+        kv_hd = kv_head * D_HEAD + dh
+        kv_head_off = kv_head * SEQ * D_HEAD
 
-        wv = tl.load(wv_ptr + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
-        V = tl.dot(h_norm.to(tl.bfloat16), wv).to(tl.float32)
-        tl.store(v_cache_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16))
+        wk = tl.load(wk_ptr + d[:, None] * D_KV + kv_hd[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+        K = tl.dot(h_norm_bf16, wk).to(tl.float32)
+        tl.store(k_cache_ptr + kv_head_off + rows[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16))
+
+        wv = tl.load(wv_ptr + d[:, None] * D_KV + kv_hd[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+        V = tl.dot(h_norm_bf16, wv).to(tl.float32)
+        tl.store(v_cache_ptr + kv_head_off + rows[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16))
 
 
 @triton.jit
@@ -79,51 +90,49 @@ def _attn_kernel(
     wo_ptr,
     h_out_ptr,
     D_MODEL: tl.constexpr,
+    D_BLOCK: tl.constexpr,
     D_HEAD: tl.constexpr,
     N_HEADS: tl.constexpr,
+    GQA_GROUP: tl.constexpr,
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
 ):
-    """Causal attention + O projection + residual for a block of rows."""
+    """Causal attention + O projection + residual. Supports GQA + D_BLOCK padding."""
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
     all_pos = tl.arange(0, SEQ)
-    d = tl.arange(0, D_MODEL)
+    d = tl.arange(0, D_BLOCK)
+    d_mask = d < D_MODEL
     dh = tl.arange(0, D_HEAD)
 
     scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
 
-    attn_accum = tl.zeros((BLOCK_SEQ, D_MODEL), dtype=tl.float32)  # 16KB
+    attn_accum = tl.zeros((BLOCK_SEQ, D_BLOCK), dtype=tl.float32)
 
     for head in tl.range(N_HEADS):
         hd = head * D_HEAD + dh
         head_off = head * SEQ * D_HEAD
+        kv_head = head // GQA_GROUP
+        kv_head_off = kv_head * SEQ * D_HEAD
 
-        # Load Q for this block: (32, 32) = 4KB
         Q = tl.load(q_buf_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+        K = tl.load(k_cache_ptr + kv_head_off + all_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+        V = tl.load(v_cache_ptr + kv_head_off + all_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
 
-        # Load K, V for ALL positions: (128, 32) = 16KB each
-        K = tl.load(k_cache_ptr + head_off + all_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
-        V = tl.load(v_cache_ptr + head_off + all_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
-
-        # Causal attention: scores (32, 128) = 16KB
         scores = tl.dot(Q.to(tl.bfloat16), tl.trans(K.to(tl.bfloat16))).to(tl.float32) * scale
         mask = rows[:, None] >= all_pos[None, :]
         scores = tl.where(mask, scores, -1e9)
         exp_s = tl.exp(scores - tl.max(scores, axis=1)[:, None])
         attn = exp_s / tl.sum(exp_s, axis=1)[:, None]
 
-        # Attention output: (32, 32) = 4KB
         attn_out = tl.dot(attn.to(tl.bfloat16), V.to(tl.bfloat16)).to(tl.float32)
 
-        # O projection: (32,32) @ (32,128) → (32,128) accumulated
-        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
         attn_accum += tl.dot(attn_out.to(tl.bfloat16), wo).to(tl.float32)
 
-    # Residual connection
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :]).to(tl.float32)
+    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
     h = h + attn_accum
-    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h)
+    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h, mask=d_mask[None, :])
 
 
 @triton.jit
@@ -133,74 +142,65 @@ def _flash_attn_kernel(
     wo_ptr,
     h_out_ptr,
     D_MODEL: tl.constexpr,
+    D_BLOCK: tl.constexpr,
     D_HEAD: tl.constexpr,
     N_HEADS: tl.constexpr,
+    GQA_GROUP: tl.constexpr,
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
     KV_TILE: tl.constexpr,
 ):
-    """FlashAttention: tiled KV with online softmax. For SEQ > 256 where full
-    attention scores don't fit in registers.
-
-    Instead of loading all K/V at once ((SEQ, D_HEAD) = too large), process
-    in tiles of KV_TILE positions. Maintain running max and sum for stable softmax.
-    """
+    """FlashAttention: tiled KV with online softmax. Supports GQA + D_BLOCK padding."""
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    d = tl.arange(0, D_MODEL)
+    d = tl.arange(0, D_BLOCK)
+    d_mask = d < D_MODEL
     dh = tl.arange(0, D_HEAD)
 
     scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
 
-    attn_accum = tl.zeros((BLOCK_SEQ, D_MODEL), dtype=tl.float32)
+    attn_accum = tl.zeros((BLOCK_SEQ, D_BLOCK), dtype=tl.float32)
 
     for head in tl.range(N_HEADS):
         hd = head * D_HEAD + dh
         head_off = head * SEQ * D_HEAD
+        kv_head = head // GQA_GROUP
+        kv_head_off = kv_head * SEQ * D_HEAD
 
-        # Load Q for this block: (BLOCK_SEQ, D_HEAD)
         Q = tl.load(q_buf_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
 
-        # Online softmax accumulators
-        m_i = tl.full((BLOCK_SEQ,), value=-1e9, dtype=tl.float32)  # running max
-        l_i = tl.zeros((BLOCK_SEQ,), dtype=tl.float32)             # running sum of exp
-        o_i = tl.zeros((BLOCK_SEQ, D_HEAD), dtype=tl.float32)      # running weighted V
+        m_i = tl.full((BLOCK_SEQ,), value=-1e9, dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_SEQ,), dtype=tl.float32)
+        o_i = tl.zeros((BLOCK_SEQ, D_HEAD), dtype=tl.float32)
 
         for kv_start in tl.range(0, SEQ, KV_TILE):
             kv_pos = kv_start + tl.arange(0, KV_TILE)
 
-            # Load K, V tile: (KV_TILE, D_HEAD)
-            K_tile = tl.load(k_cache_ptr + head_off + kv_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
-            V_tile = tl.load(v_cache_ptr + head_off + kv_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+            K_tile = tl.load(k_cache_ptr + kv_head_off + kv_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
+            V_tile = tl.load(v_cache_ptr + kv_head_off + kv_pos[:, None] * D_HEAD + dh[None, :]).to(tl.float32)
 
-            # Attention scores: (BLOCK_SEQ, KV_TILE)
             s = tl.dot(Q.to(tl.bfloat16), tl.trans(K_tile.to(tl.bfloat16))).to(tl.float32) * scale
 
-            # Causal mask
             causal_mask = rows[:, None] >= kv_pos[None, :]
             s = tl.where(causal_mask, s, -1e9)
 
-            # Online softmax update
-            m_ij = tl.max(s, axis=1)                      # (BLOCK_SEQ,)
-            m_new = tl.maximum(m_i, m_ij)                 # (BLOCK_SEQ,)
-            alpha = tl.exp(m_i - m_new)                   # correction factor
-            p = tl.exp(s - m_new[:, None])                # new exp scores (BLOCK_SEQ, KV_TILE)
+            m_ij = tl.max(s, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(s - m_new[:, None])
 
             l_i = l_i * alpha + tl.sum(p, axis=1)
             o_i = o_i * alpha[:, None] + tl.dot(p.to(tl.bfloat16), V_tile.to(tl.bfloat16)).to(tl.float32)
             m_i = m_new
 
-        # Normalize
-        attn_out = o_i / l_i[:, None]  # (BLOCK_SEQ, D_HEAD)
+        attn_out = o_i / l_i[:, None]
 
-        # O projection: (BLOCK_SEQ, D_HEAD) @ (D_HEAD, D_MODEL) → (BLOCK_SEQ, D_MODEL)
-        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
         attn_accum += tl.dot(attn_out.to(tl.bfloat16), wo).to(tl.float32)
 
-    # Residual connection
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :]).to(tl.float32)
+    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
     h = h + attn_accum
-    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h)
+    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h, mask=d_mask[None, :])
 
 
 @triton.jit
@@ -211,37 +211,42 @@ def _ffn_kernel(
     ffn_down_ptr, ffn_down_bias_ptr,
     h_out_ptr,
     D_MODEL: tl.constexpr,
+    D_BLOCK: tl.constexpr,
     D_FF: tl.constexpr,
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
 ):
-    """LN2 + FFN + residual for a block of rows."""
+    """LN2 + FFN + residual for a block of rows. Supports D_BLOCK padding."""
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    d = tl.arange(0, D_MODEL)
+    d = tl.arange(0, D_BLOCK)
+    d_mask = d < D_MODEL
 
-    # Load h block: (32, 128) = 16KB
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :]).to(tl.float32)
+    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
 
     # Layer Norm
-    ln_s = tl.load(ln_scale_ptr + d).to(tl.float32)
-    ln_b = tl.load(ln_bias_ptr + d).to(tl.float32)
+    ln_s = tl.load(ln_scale_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
+    ln_b = tl.load(ln_bias_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
     mean = tl.sum(h, axis=1)[:, None] / D_MODEL
-    hc = h - mean
-    h_norm = ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :]
+    hc = tl.where(d_mask[None, :], h - mean, 0.0)
+    h_norm = tl.where(d_mask[None, :],
+                      ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :],
+                      0.0)
 
     # FFN (tiled over D_FF)
-    ffn_out = tl.zeros((BLOCK_SEQ, D_MODEL), dtype=tl.float32)  # 16KB
+    ffn_out = tl.zeros((BLOCK_SEQ, D_BLOCK), dtype=tl.float32)
     for k in tl.range(0, D_FF, BLOCK_K):
         kk = k + tl.arange(0, BLOCK_K)
-        up = tl.dot(h_norm.to(tl.bfloat16), tl.load(ffn_up_ptr + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)).to(tl.float32)
+        up = tl.dot(h_norm.to(tl.bfloat16),
+                    tl.load(ffn_up_ptr + d[:, None] * D_FF + kk[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)).to(tl.float32)
         up += tl.load(ffn_up_bias_ptr + kk).to(tl.float32)[None, :]
-        act = up * tl.sigmoid(1.702 * up)  # GELU approximation
-        ffn_out += tl.dot(act.to(tl.bfloat16), tl.load(ffn_down_ptr + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)).to(tl.float32)
+        act = up * tl.sigmoid(1.702 * up)
+        ffn_out += tl.dot(act.to(tl.bfloat16),
+                          tl.load(ffn_down_ptr + kk[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.bfloat16)).to(tl.float32)
 
     # Residual
-    h = h + ffn_out + tl.load(ffn_down_bias_ptr + d).to(tl.float32)[None, :]
-    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h)
+    h = h + ffn_out + tl.load(ffn_down_bias_ptr + d, mask=d_mask, other=0.0).to(tl.float32)[None, :]
+    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h, mask=d_mask[None, :])
 
 
 @triton.jit
@@ -251,32 +256,42 @@ def _output_kernel(
     output_proj_ptr,
     logits_ptr,
     D_MODEL: tl.constexpr,
+    D_BLOCK: tl.constexpr,
     SEQ: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
     VTILE: tl.constexpr,
 ):
-    """Final LN + tiled output projection for a block of rows."""
+    """Final LN + tiled output projection. Supports D_BLOCK padding."""
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    d = tl.arange(0, D_MODEL)
+    d = tl.arange(0, D_BLOCK)
+    d_mask = d < D_MODEL
 
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :]).to(tl.float32)
+    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
 
-    ln_s = tl.load(ln_scale_ptr + d).to(tl.float32)
-    ln_b = tl.load(ln_bias_ptr + d).to(tl.float32)
+    ln_s = tl.load(ln_scale_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
+    ln_b = tl.load(ln_bias_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
     mean = tl.sum(h, axis=1)[:, None] / D_MODEL
-    hc = h - mean
-    h_final = ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :]
+    hc = tl.where(d_mask[None, :], h - mean, 0.0)
+    h_final = tl.where(d_mask[None, :],
+                       ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :],
+                       0.0)
 
-    # VTILE is smaller for large D_MODEL to avoid (D_MODEL, VTILE) overflow
     for v_start in tl.range(0, VOCAB_PAD, VTILE):
         vv = v_start + tl.arange(0, VTILE)
-        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :]).to(tl.bfloat16)
+        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
         tile_logits = tl.dot(h_final.to(tl.bfloat16), out_w).to(tl.float32)
         tile_logits = tl.where(vv[None, :] < VOCAB_SIZE, tile_logits, -1e9)
         tl.store(logits_ptr + rows[:, None] * VOCAB_PAD + vv[None, :], tile_logits)
+
+
+def _next_power_of_2(n):
+    p = 1
+    while p < n:
+        p *= 2
+    return p
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -294,13 +309,17 @@ def block_prefill(params, config, x, vocab_size):
 
     Returns:
         logits: (seq_len, vocab_size) float32
-        k_caches: list of (n_heads, seq_len, d_head) bf16 per layer
-        v_caches: list of (n_heads, seq_len, d_head) bf16 per layer
+        k_caches: list of (n_kv_heads, seq_len, d_head) bf16 per layer
+        v_caches: list of (n_kv_heads, seq_len, d_head) bf16 per layer
     """
     seq_len = x.shape[0]
     d_model = config["d_model"]
     d_head = config["d_head"]
     n_heads = config["n_heads"]
+    n_kv_heads = config.get("n_kv_heads", n_heads)
+    d_kv = n_kv_heads * d_head
+    gqa_group = n_heads // n_kv_heads
+    d_block = _next_power_of_2(d_model)
     n_layers = config["n_layers"]
     d_ff = 4 * d_model
     block_seq = 8 if d_model >= 512 else (16 if d_model >= 256 else 32)
@@ -319,7 +338,7 @@ def block_prefill(params, config, x, vocab_size):
     for layer in range(n_layers):
         p = f"layer{layer}"
 
-        # Kernel 1: LN + Q/K/V projections
+        # Kernel 1: LN + Q/K/V projections (GQA: K/V have N_KV_HEADS)
         q_buf, k_cache, v_cache = jt.triton_call(
             h,
             w[f"{p}.ln1.scale"], w[f"{p}.ln1.bias"],
@@ -327,22 +346,22 @@ def block_prefill(params, config, x, vocab_size):
             kernel=_proj_kernel,
             out_shape=[
                 jax.ShapeDtypeStruct((n_heads, seq_len, d_head), jnp.float32),
-                jax.ShapeDtypeStruct((n_heads, seq_len, d_head), jnp.bfloat16),
-                jax.ShapeDtypeStruct((n_heads, seq_len, d_head), jnp.bfloat16),
+                jax.ShapeDtypeStruct((n_kv_heads, seq_len, d_head), jnp.bfloat16),
+                jax.ShapeDtypeStruct((n_kv_heads, seq_len, d_head), jnp.bfloat16),
             ],
             grid=(num_blocks,),
             num_warps=4, num_stages=1,
-            D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
-            BLOCK_SEQ=block_seq,
+            D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, N_HEADS=n_heads,
+            N_KV_HEADS=n_kv_heads, D_KV=d_kv,
+            SEQ=seq_len, BLOCK_SEQ=block_seq,
         )
         all_k_caches.append(k_cache)
         all_v_caches.append(v_cache)
 
         # Kernel 2: Attention + O projection + residual
-        # Use FlashAttention for long sequences (SEQ > 256) to keep memory bounded
         use_flash = seq_len > 256
         if use_flash:
-            kv_tile = 64  # tile size for KV dimension
+            kv_tile = 64
             (h,) = jt.triton_call(
                 h, q_buf, k_cache, v_cache,
                 w[f"{p}.attn.o"],
@@ -352,8 +371,9 @@ def block_prefill(params, config, x, vocab_size):
                 ],
                 grid=(num_blocks,),
                 num_warps=4, num_stages=1,
-                D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
-                BLOCK_SEQ=block_seq, KV_TILE=kv_tile,
+                D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, N_HEADS=n_heads,
+                GQA_GROUP=gqa_group,
+                SEQ=seq_len, BLOCK_SEQ=block_seq, KV_TILE=kv_tile,
             )
         else:
             (h,) = jt.triton_call(
@@ -365,8 +385,9 @@ def block_prefill(params, config, x, vocab_size):
                 ],
                 grid=(num_blocks,),
                 num_warps=4, num_stages=1,
-                D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
-                BLOCK_SEQ=block_seq,
+                D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, N_HEADS=n_heads,
+                GQA_GROUP=gqa_group,
+                SEQ=seq_len, BLOCK_SEQ=block_seq,
             )
 
         # Kernel 3: LN + FFN + residual
@@ -381,7 +402,7 @@ def block_prefill(params, config, x, vocab_size):
             ],
             grid=(num_blocks,),
             num_warps=4, num_stages=1,
-            D_MODEL=d_model, D_FF=d_ff, SEQ=seq_len,
+            D_MODEL=d_model, D_BLOCK=d_block, D_FF=d_ff, SEQ=seq_len,
             BLOCK_SEQ=block_seq,
         )
 
@@ -399,7 +420,7 @@ def block_prefill(params, config, x, vocab_size):
         ],
         grid=(num_blocks,),
         num_warps=4, num_stages=1,
-        D_MODEL=d_model, SEQ=seq_len,
+        D_MODEL=d_model, D_BLOCK=d_block, SEQ=seq_len,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         BLOCK_SEQ=block_seq,
         VTILE=32 if d_model >= 512 else 128,
