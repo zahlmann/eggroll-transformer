@@ -32,6 +32,15 @@ No GPU experience required — just Python and a rough idea of what neural nets 
 17. [What Didn't Work](#17-what-didnt-work)
 18. [Key Lessons](#18-key-lessons)
 
+**Part III: Production Scale (d=768, 12 layers, 81M params)**
+
+19. [GQA: Grouped Query Attention](#19-gqa-grouped-query-attention)
+20. [Non-Power-of-2 D_MODEL (D_BLOCK Padding)](#20-non-power-of-2-d_model-d_block-padding)
+21. [L2 Cache Hints and Bandwidth Optimization](#21-l2-cache-hints-and-bandwidth-optimization)
+22. [Tensor Core Batched Projections](#22-tensor-core-batched-projections)
+23. [Streaming and Serving APIs](#23-streaming-and-serving-apis)
+24. [Paged KV Cache](#24-paged-kv-cache)
+
 ---
 
 ## 1. The Problem
@@ -1170,26 +1179,198 @@ uv run profile_kernels.py
 uv run inference_benchmark.py
 ```
 
+---
+
+## Part III: Production Scale (d=768, 12 layers, 81M params)
+
+---
+
+## 19. GQA: Grouped Query Attention
+
+Standard multi-head attention uses N_HEADS separate K/V heads. GQA (Grouped Query
+Attention) shares K/V across groups of Q heads, reducing KV cache size.
+
+With d=768, 24 Q heads, 6 KV heads: each KV head is shared by 4 Q heads (GQA_GROUP=4).
+KV cache shrinks 4x: from 24 × ctx × d_head to 6 × ctx × d_head per layer.
+
+**Kernel change:** In the attention loop, map Q head to KV head via `kv_head = head_id // GQA_GROUP`.
+Load K/V from `kv_head`'s cache, not `head_id`'s. Weights follow the same pattern:
+Q/O weight matrices are (D_MODEL, N_HEADS × D_HEAD), K/V are (D_MODEL, N_KV_HEADS × D_HEAD).
+
+**Prefill kernel change:** The projection kernel has two loops — Q over N_HEADS, K/V over
+N_KV_HEADS. The attention kernel maps each Q head to its KV group. KV cache output shape
+is (N_KV_HEADS, SEQ, D_HEAD) instead of (N_HEADS, SEQ, D_HEAD).
+
+**Why GQA matters:** At d=768 with B=8 batched inference, GQA reduces KV cache from
+37.6 MB to 9.4 MB per step — fits entirely in L2 cache (~64 MB on RTX 4080 Super).
+
+---
+
+## 20. Non-Power-of-2 D_MODEL (D_BLOCK Padding)
+
+Triton's `tl.arange` requires power-of-2 dimensions. For d_model=768, we use D_BLOCK=1024
+(next power of 2) with masking:
+
+```python
+d = tl.arange(0, D_BLOCK)      # 0..1023
+d_mask = d < D_MODEL            # True for 0..767, False for 768..1023
+
+# All loads use the mask:
+h = tl.load(ptr + d, mask=d_mask, other=0.0)
+
+# All stores use the mask:
+tl.store(ptr + d, h, mask=d_mask)
+```
+
+The padding (positions 768-1023) is always zero. `tl.dot` with zero-padded operands
+produces correct results: $0 \times \text{anything} = 0$.
+
+**Cost:** D_BLOCK=1024 wastes 33% of register/shared memory capacity compared to
+D_BLOCK=768 (if it were possible). This is why `num_stages=2` (software pipelining)
+fails at d=768 — the double-buffered tiles at (1024, 32) exceed shared memory.
+
+---
+
+## 21. L2 Cache Hints and Bandwidth Optimization
+
+At d=768, the weight buffer (162 MB) exceeds the L2 cache (~64 MB). Every decode step
+re-fetches all weights from HBM — the "terminal bandwidth bottleneck."
+
+**Eviction policies** tell the GPU which data to keep and which to evict first:
+
+```python
+# KV cache (4.7 MB, fits in L2, reused across steps):
+K_tile = tl.load(kv_ptr + ..., eviction_policy='evict_last')
+
+# Output projection (6.3 MB, single-use per step):
+out_w = tl.load(out_ptr + ..., eviction_policy='evict_first')
+```
+
+`evict_last` keeps KV cache hot in L2 between decode steps. `evict_first` on output
+projection prevents it from evicting KV data. Combined effect: ~3% throughput improvement.
+
+**Barrier merging:** The persistent kernel had 2 barriers per step for output (one for
+output projection sync, one for step-sync). By having the last-arriving block do the
+argmax reduction inline before signaling, we merge them into 1 barrier. Saves ~2%.
+
+**What was tried but didn't help:**
+- KV_SPLITS=1 (24 blocks): 15% slower — insufficient parallelism
+- KV_SPLITS=4 (96 blocks): compilation too slow, likely worse from contention
+- num_stages=2: shared memory overflow at D_BLOCK=1024
+
+---
+
+## 22. Tensor Core Batched Projections
+
+With batched inference, each block processes B sequences. Previously, Q/K/V projections
+looped over sequences:
+
+```python
+# OLD: B sequential (1, D_BLOCK) × (D_BLOCK, D_HEAD) dots
+wq = tl.load(...)  # weight loaded once
+for b in range(BATCH_SIZE):
+    h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d)
+    Q = tl.dot(h_norm[None, :], wq).sum(axis=0)   # element-wise, M=1
+```
+
+The optimization: stack all B hidden states into a 2D matrix and do one dot product:
+
+```python
+# NEW: single (B, D_BLOCK) × (D_BLOCK, D_HEAD) matmul
+b_range = tl.arange(0, BATCH_SIZE)
+h_batch = tl.load(h_norm_ptr + b_range[:, None] * D_BLOCK + d[None, :])
+Q_batch = tl.dot(h_batch, wq)  # (B, D_HEAD) — uses tensor cores when B >= 16
+```
+
+At B>=16, the (16, 1024) × (1024, 32) matmul activates tensor cores (Ada Lovelace FP16
+tensor cores need M >= 16). At B=4, tensor cores don't activate but the 2D load/store
+pattern still reduces loop overhead.
+
+**Result:** +8-12% across all batch sizes. O projection not batched because the output
+(B, D_BLOCK) = (16, 1024) × 4B = 64KB overflows shared memory alongside the weight matrix.
+
+---
+
+## 23. Streaming and Serving APIs
+
+**Streaming generation** (`generate.py`): A Python generator that yields tokens one at
+a time using pipelined multi-SM decode (one kernel call per token):
+
+```python
+for token_id in stream_tokens(params, config, prompt_ids, max_tokens=128):
+    print(decode_fn([token_id]), end='', flush=True)
+```
+
+Each token requires a GPU→CPU sync (`int(tok)`), giving ~966 tok/s at d=768 (vs ~1503
+tok/s for batch-synced pipelined where all tokens stay on GPU until the end).
+
+**Variable-length batched serving** (`serve.py`): The `BatchedServer` class manages
+multiple sequences at different generation stages. The batched decode kernel already
+supports per-sequence positions via `positions_ptr` — each sequence has its own `pos_b`
+for attention masking. The server handles:
+- Adding/removing sequences from the batch
+- Per-sequence position tracking and stopping conditions
+- Building batched inputs from heterogeneous sequence states
+
+---
+
+## 24. Paged KV Cache
+
+Standard KV cache pre-allocates `max_seq × d_head` per sequence per layer per head.
+For short sequences, most of this is wasted. Paged KV cache allocates memory in pages
+(blocks of PAGE_SIZE=64 positions) on demand.
+
+**Page pool:** A pre-allocated buffer of physical pages. Each page stores 64 positions
+of KV data for all layers and all KV heads. `PagePool` manages allocation and freeing.
+
+**Page table:** Maps `(sequence_id, logical_page_index)` → `physical_page_id`.
+When a sequence grows past a page boundary, a new page is allocated from the pool.
+When a sequence completes, its pages are freed for reuse.
+
+**Memory savings:** 4 short prompts (4-7 tokens) use 1 page each = 2.4 MB total,
+vs 4 × 4.7 MB = 18.8 MB with contiguous allocation (87% reduction).
+
+**Current limitation:** This implementation does page management in Python and converts
+between paged and contiguous representations before each kernel call. The conversion
+adds overhead (~2x slower for short sequences). The next step is kernel-level paging:
+passing the page table to the attention loop so it does per-tile page lookups directly,
+eliminating the copy.
+
+```python
+# Future kernel-level paging (not yet implemented):
+logical_page = t // PAGE_SIZE
+phys_page = tl.load(page_table_ptr + b * MAX_PAGES + logical_page)
+K_tile = tl.load(page_pool_ptr + phys_page * PAGE_ELEMS + local_offset)
+```
+
+---
+
 ### File overview
 
 ```
 Core:
-  model.py                        — JAX transformer model
-  data.py                         — Shakespeare + TinyStories + BPE tokenizer
-  train.py               — AdamW training with LR schedule
+  model.py                           — JAX transformer model
+  data.py                            — Shakespeare + TinyStories + BPE tokenizer
+  train.py                  — AdamW training with LR schedule
 
 Kernels:
-  kernels/fused_prefill.py        — fused prefill (d_model <= 64, one kernel call)
-  kernels/fused_decode.py         — fused decode (d_model <= 64, one kernel call)
-  kernels/block_prefill.py        — multi-block prefill + FlashAttention (d_model >= 128)
-  kernels/block_decode.py         — per-layer decode orchestrator (d_model >= 128)
-  kernels/fused_decode_nlayer.py  — fused N-layer decode (packed weights/caches)
-  kernels/multi_sm_decode.py      — multi-SM decode with atomic barriers + KV-split
-  kernels/batched_decode.py       — batched multi-SM decode (B sequences)
-  kernels/persistent_decode.py    — persistent decode (single launch, all steps)
+  kernels/fused_prefill.py           — fused prefill (d_model <= 64, one kernel call)
+  kernels/fused_decode.py            — fused decode (d_model <= 64, one kernel call)
+  kernels/block_prefill.py           — multi-block prefill + FlashAttention + GQA (d_model >= 128)
+  kernels/block_decode.py            — per-layer decode orchestrator (d_model >= 128)
+  kernels/fused_decode_nlayer.py     — fused N-layer decode (packed weights/caches)
+  kernels/multi_sm_decode.py         — multi-SM decode with atomic barriers + KV-split
+  kernels/batched_decode.py          — batched multi-SM decode (B sequences, tensor core projections)
+  kernels/persistent_decode.py       — persistent decode (single launch, all steps)
+  kernels/persistent_batched_decode.py — persistent batched (B seq × N steps)
+  kernels/paged_kv.py               — paged KV cache memory management (PagePool)
+
+Inference:
+  generate.py                        — streaming text generation API + CLI
+  serve.py                           — variable-length batched inference server
 
 Benchmarking:
-  profile_kernels.py              — primary profiling tool
-  inference_benchmark.py          — quick throughput + text generation demo
-  baseline_metrics.txt            — current performance numbers
+  profile_kernels.py                 — primary profiling tool
+  inference_benchmark.py             — quick throughput + text generation demo
+  baseline_metrics.txt               — current performance numbers
 ```

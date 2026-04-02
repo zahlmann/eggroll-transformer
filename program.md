@@ -700,24 +700,27 @@ uv run train.py --d-model 512 --n-heads 16 --n-layers 8 \
 ## Files
 
 ```
-program.md                          — this file (read first)
-repo_explained_from_zero.md         — ground-up explanation of GPU kernels + this project
-README.md                           — project overview
-model.py                            — JAX transformer model (inference baseline)
-train.py                   — AdamW training with LR schedule
-data.py                             — Shakespeare + TinyStories (char, GPT-2 BPE, trained BPE)
-kernels/fused_prefill.py            — fused Triton prefill kernel (d_model≤64)
-kernels/fused_decode.py             — fused Triton decode kernel (d_model≤64)
-kernels/block_prefill.py            — multi-block prefill + FlashAttention (d_model≥128)
-kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
-kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
-kernels/multi_sm_decode.py          — multi-SM decode: grid=(N_HEADS×KV_SPLITS,) with atomic barriers
-kernels/batched_decode.py           — batched multi-SM decode: B sequences per launch
-kernels/persistent_decode.py        — persistent decode: single launch for all steps
+program.md                           — this file (read first)
+repo_explained_from_zero.md          — ground-up explanation of GPU kernels + this project
+README.md                            — project overview
+model.py                             — JAX transformer model (inference baseline)
+train.py                    — AdamW training with LR schedule
+data.py                              — Shakespeare + TinyStories (char, GPT-2 BPE, trained BPE)
+kernels/fused_prefill.py             — fused Triton prefill kernel (d_model≤64)
+kernels/fused_decode.py              — fused Triton decode kernel (d_model≤64)
+kernels/block_prefill.py             — multi-block prefill + FlashAttention + GQA (d_model≥128)
+kernels/block_decode.py              — per-layer decode + orchestrator (d_model≥128)
+kernels/fused_decode_nlayer.py       — fully fused N-layer decode (packed weights/caches)
+kernels/multi_sm_decode.py           — multi-SM decode: grid=(N_HEADS×KV_SPLITS,) with atomic barriers
+kernels/batched_decode.py            — batched multi-SM decode: B sequences, tensor core projections
+kernels/persistent_decode.py         — persistent decode: single launch for all steps
 kernels/persistent_batched_decode.py — persistent batched: single launch for B seq × N steps
-profile_kernels.py                  — primary profiling tool (run after every change)
-inference_benchmark.py              — quick throughput benchmark
-baseline_metrics.txt                — current numbers to beat
+kernels/paged_kv.py                  — paged KV cache memory management (PagePool)
+generate.py                          — streaming text generation API + CLI
+serve.py                             — variable-length batched inference server (BatchedServer)
+profile_kernels.py                   — primary profiling tool (run after every change)
+inference_benchmark.py               — quick throughput benchmark
+baseline_metrics.txt                 — current numbers to beat
 ```
 
 ---
