@@ -59,21 +59,22 @@ def train(lr=1e-3, seed=42, tokenizer="char", bpe_vocab_size=512,
     opt_state = optimizer.init(params)
 
     @jax.jit
-    def loss_fn(params, x, y):
-        logits = transformer_forward_batch(params, config, x)
-        return cross_entropy_loss(logits, y)
-
-    @jax.jit
     def train_step(params, opt_state, x, y):
-        loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+        def loss_fn(params):
+            # bf16 forward: cast weights for tensor core matmuls, keep optimizer in f32
+            params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
+            logits = transformer_forward_batch(params_bf16, config, x)
+            return cross_entropy_loss(logits.astype(jnp.float32), y)
+        loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss
 
     @jax.jit
     def eval_loss(params, x, y):
-        logits = transformer_forward_batch(params, config, x)
-        return cross_entropy_loss(logits, y)
+        params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
+        logits = transformer_forward_batch(params_bf16, config, x)
+        return cross_entropy_loss(logits.astype(jnp.float32), y)
 
     print(f"=== Backprop+AdamW LR={lr} wd={weight_decay} warmup={warmup_steps} ===")
     print(f"Model: d={d_model} h={n_heads} l={n_layers} ctx={context_len}")
