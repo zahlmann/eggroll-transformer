@@ -208,13 +208,13 @@ class PagedBatchedServer(BatchedServer):
     positions on demand. Memory is freed when sequences complete, allowing
     the pool to be reused by new sequences.
 
-    This is a Python-level page management wrapper. The kernel still receives
-    contiguous per-sequence KV buffers (converted from pages before each step).
-    Kernel-level paging (page table in the attention loop) is a future optimization.
+    Uses GPU-accelerated paging: JIT-compiled gather/scatter on the GPU pool
+    replaces the slow CPU numpy loops. The decode kernel is unchanged — it
+    receives contiguous KV buffers assembled from pages via GPU gather.
     """
 
     def __init__(self, params, config, batch_size=4, eos_token=None,
-                 pool_pages=None):
+                 pool_pages=None, use_gpu=True):
         super().__init__(params, config, batch_size, eos_token)
         from kernels.paged_kv import PagePool
 
@@ -222,6 +222,7 @@ class PagedBatchedServer(BatchedServer):
             max_pages_per_seq = (self.ctx_len + 63) // 64
             pool_pages = batch_size * max_pages_per_seq + 16  # small margin
         self.page_pool = PagePool(config, pool_pages)
+        self.use_gpu = use_gpu
 
     def add_sequence(self, prompt_ids):
         """Add a sequence with paged KV cache."""
@@ -247,6 +248,8 @@ class PagedBatchedServer(BatchedServer):
 
         # Store KV into page pool
         self.page_pool.store_prefill_kv(slot, k_caches, v_caches, prompt_len)
+        if self.use_gpu:
+            self.page_pool.sync_to_gpu()
 
         self.slots[slot] = {
             "token": first_token,
@@ -273,7 +276,11 @@ class PagedBatchedServer(BatchedServer):
         # Convert paged KV to contiguous for kernel
         token_ids = jnp.array([self.slots[i]["token"] for i in active], dtype=jnp.int32)
         positions = jnp.array([self.slots[i]["position"] for i in active], dtype=jnp.int32)
-        kv_parts = [self.page_pool.to_contiguous(i) for i in active]
+
+        if self.use_gpu:
+            kv_parts = [self.page_pool.to_contiguous_gpu(i) for i in active]
+        else:
+            kv_parts = [self.page_pool.to_contiguous(i) for i in active]
         kv_batch = jnp.concatenate(kv_parts)
 
         # Run batched decode
@@ -291,7 +298,10 @@ class PagedBatchedServer(BatchedServer):
 
             # Update page pool with new KV at the current position
             kv_seq = kv_out[j * self.kv_per_seq:(j + 1) * self.kv_per_seq]
-            self.page_pool.update_from_contiguous(slot_idx, kv_seq, pos)
+            if self.use_gpu:
+                self.page_pool.update_page_gpu(slot_idx, kv_seq, pos)
+            else:
+                self.page_pool.update_from_contiguous(slot_idx, kv_seq, pos)
 
             slot["token"] = tok
             slot["position"] += 1
