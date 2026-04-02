@@ -1,8 +1,9 @@
-# Fused Inference — Agent Program
+# Single-GPU Transformer — Agent Program
 
-*You are a GPU kernel engineer. Your job: build the fastest possible inference for this
-small transformer using custom Triton kernels. The model is trained with standard backprop.
-The focus is on learning to write high-performance GPU kernels for transformer inference.*
+*You are building and optimizing a complete transformer — training, custom GPU kernels,
+and serving — on a single RTX 4080 Super (16GB VRAM, 836 GB/s, 52 TFLOPS FP16).
+The goal: train the smartest possible model that fits on this GPU, and run inference
+as fast as possible using hand-written Triton kernels.*
 
 **IMPORTANT: Commit and push after every meaningful step. Don't batch up changes.**
 
@@ -10,7 +11,7 @@ The focus is on learning to write high-performance GPU kernels for transformer i
 
 ## Mission
 
-Build the fastest possible inference for this transformer using custom Triton kernels.
+Train a high-quality decoder-only transformer on one GPU, serve it with custom Triton kernels.
 
 ### Completed
 
@@ -745,14 +746,63 @@ with these acceptance rates would give 2-3x speedup.
 
 ## What's Next
 
-### On next retraining
+### Phase 1: Training data (highest priority)
+
+The current model trains on TinyStories (487M tokens, simple children's stories).
+This limits the model to one narrow domain. The next step is to curate a
+high-quality, general-knowledge training mix that maximizes capability per token.
+
+**Requirements:**
+- Must fit on RTX 4080 Super (16GB VRAM) without exotic batch tricks — standard
+  data-parallel with gradient checkpointing, bf16 forward, batch_size 16-32 is fine
+- Token budget: ~1-2B tokens (Chinchilla-optimal for 80-200M params)
+- Goal: maximize knowledge density per token. Every token should teach the model
+  something useful. Avoid repetitive, low-information, or noisy data.
+
+**Research the best small-scale training mixes.** Look at what worked for:
+- TinyLlama (1.1B params, 3T tokens — what data mix?)
+- Phi-1/Phi-1.5/Phi-2 (Microsoft — "textbook-quality" data, very token-efficient)
+- LLaMA 1/2/3 data mixes (what proportions of web, books, code, wiki?)
+- SlimPajama, RedPajama, Dolma, FineWeb — which are highest quality?
+- The Pile — which subsets have highest knowledge density?
+
+**Key insight from Phi papers:** synthetic textbook-quality data + filtered web data
+dramatically outperforms raw web scrapes at small scale. Quality > quantity.
+
+**Proposed mix (research and validate):**
+- Wikipedia/encyclopedic content (factual knowledge, high density)
+- Textbook-style content (structured explanations)
+- High-quality web text (filtered, e.g., FineWeb-Edu)
+- Code (reasoning patterns, structured thinking)
+- Math/science text (logical reasoning)
+- Books (long-form coherence)
+
+Target: ~500M-1B high-quality tokens, deduplicated, filtered for quality.
+This replaces TinyStories entirely.
+
+### Phase 2: Scale model to fill the GPU
+
+With better data, scale the model to use available VRAM:
+- Current: 81M params, 3.66 GB VRAM during training (23% utilized)
+- Target: use ~12-14 GB for training (leave headroom for OS/display)
+- This likely means d=1024+ or deeper (more layers)
+- Profile VRAM at different configs to find the sweet spot
+
+### Phase 3: Architecture cleanup (during retraining)
 
 - **Remove FFN biases** (up_bias, down_bias) from model.py, all decode/prefill kernels,
   and repo_explained_from_zero.md. Modern transformers (LLaMA, Mistral) don't use them.
-  At d=768 they're 0.06% of params for zero quality benefit. Simplifies kernel FFN loops
-  (fewer loads/stores per layer).
+  At d=768 they're 0.06% of params for zero quality benefit. Simplifies kernel FFN loops.
 
-### Done
+### Phase 4: Training efficiency
+
+Look for easy wins in the training loop:
+- Current: 53K tok/s with bf16 forward on RTX 4080 Super
+- Gradient accumulation if batch size is memory-limited at larger model
+- Data loading overlap (prefetch next batch while computing)
+- Any other low-hanging fruit
+
+### Kernel architecture (done)
 
 The core kernel architecture is complete. All major optimizations explored:
 - Fused multi-layer decode with multi-SM parallelism
@@ -761,6 +811,7 @@ The core kernel architecture is complete. All major optimizations explored:
 - GPU-accelerated paged KV cache
 - Continuous batching
 - Speculative decoding (acceptance rates validated)
+- Kernels will need minor updates when architecture changes (remove biases, etc.)
 
 ### How to measure progress
 
