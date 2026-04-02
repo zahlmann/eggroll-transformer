@@ -41,6 +41,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 25. Tensor core batched projections (single 2D tl.dot for Q/K/V, +8-12% batched)
 26. Paged KV cache (PagePool, 64-position pages, 87% memory reduction for short seqs)
 27. GPU-accelerated paged KV (JIT gather/scatter, 3.5x faster than CPU paging, 693 tok/s)
+28. Continuous batching (serve_continuous: N prompts through B slots, auto page reuse)
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -683,10 +684,29 @@ which copies the entire pool (~5 MB) to create a new array. The actual GPU scatt
 
 ---
 
+## COMPLETED: Continuous Batching (2026-04-02)
+
+Added `serve_continuous()` to `PagedBatchedServer`. When a sequence finishes
+(EOS or max tokens), its pages are freed and the slot is immediately filled
+with the next pending prompt from the queue. The batch stays full as long as
+there are pending prompts.
+
+```
+8 prompts through 4 slots (d=768, 32 tokens each):
+  Total: 256 tokens in 5.4s = 47 tok/s
+  Pages freed to 0 after all sequences complete (automatic reuse)
+
+6 prompts through 2 slots:
+  Total: 192 tokens in 5.1s = 38 tok/s
+```
+
+CLI: `uv run serve.py --continuous --batch-size 4 --prompts "prompt1" "prompt2" ...`
+
+---
+
 ## What's Next
 
 The core kernel architecture is complete. Potential future directions:
-- **Continuous batching**: replace finished sequences with new ones mid-generation
 - **Speculative decoding revisit**: with larger target model, the speed ratio improves
 
 ### How to measure progress
