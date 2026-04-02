@@ -201,6 +201,128 @@ class BatchedServer:
         self.slots[slot_idx] = None
 
 
+class PagedBatchedServer(BatchedServer):
+    """Batched inference server with paged KV cache memory management.
+
+    Instead of pre-allocating max_seq per sequence, allocates pages of 64
+    positions on demand. Memory is freed when sequences complete, allowing
+    the pool to be reused by new sequences.
+
+    This is a Python-level page management wrapper. The kernel still receives
+    contiguous per-sequence KV buffers (converted from pages before each step).
+    Kernel-level paging (page table in the attention loop) is a future optimization.
+    """
+
+    def __init__(self, params, config, batch_size=4, eos_token=None,
+                 pool_pages=None):
+        super().__init__(params, config, batch_size, eos_token)
+        from kernels.paged_kv import PagePool
+
+        if pool_pages is None:
+            max_pages_per_seq = (self.ctx_len + 63) // 64
+            pool_pages = batch_size * max_pages_per_seq + 16  # small margin
+        self.page_pool = PagePool(config, pool_pages)
+
+    def add_sequence(self, prompt_ids):
+        """Add a sequence with paged KV cache."""
+        slot = -1
+        for i, s in enumerate(self.slots):
+            if s is None:
+                slot = i
+                break
+        if slot == -1:
+            return -1
+
+        prompt_ids = jnp.array(prompt_ids, dtype=jnp.int32)
+        prompt_len = len(prompt_ids)
+        if prompt_len >= self.ctx_len:
+            prompt_ids = prompt_ids[:self.ctx_len - 1]
+            prompt_len = len(prompt_ids)
+
+        x = jnp.pad(prompt_ids, (0, self.ctx_len - prompt_len)).astype(jnp.int32)
+        logits, k_caches, v_caches = prefill_with_kv(self.params, self.config, x)
+        _ = logits.block_until_ready()
+
+        first_token = int(jnp.argmax(logits[prompt_len - 1]))
+
+        # Store KV into page pool
+        self.page_pool.store_prefill_kv(slot, k_caches, v_caches, prompt_len)
+
+        self.slots[slot] = {
+            "token": first_token,
+            "position": prompt_len,
+            "done": False,
+            "tokens": [first_token],
+        }
+
+        self._warmup()
+        return slot
+
+    def step(self):
+        """Run one decode step using paged KV cache."""
+        active = self._active_indices()
+        if not active:
+            return []
+
+        n_active = len(active)
+
+        # Ensure pages allocated for current positions
+        for i in active:
+            self.page_pool.ensure_page_for_pos(i, self.slots[i]["position"])
+
+        # Convert paged KV to contiguous for kernel
+        token_ids = jnp.array([self.slots[i]["token"] for i in active], dtype=jnp.int32)
+        positions = jnp.array([self.slots[i]["position"] for i in active], dtype=jnp.int32)
+        kv_parts = [self.page_pool.to_contiguous(i) for i in active]
+        kv_batch = jnp.concatenate(kv_parts)
+
+        # Run batched decode
+        next_tokens, _, kv_out = batched_decode_nlayer(
+            self.w, self.config, token_ids, positions,
+            kv_batch, self.vocab_size, n_active)
+
+        next_toks = next_tokens.tolist()
+
+        results = []
+        for j, slot_idx in enumerate(active):
+            tok = next_toks[j]
+            slot = self.slots[slot_idx]
+            pos = slot["position"]
+
+            # Update page pool with new KV at the current position
+            kv_seq = kv_out[j * self.kv_per_seq:(j + 1) * self.kv_per_seq]
+            self.page_pool.update_from_contiguous(slot_idx, kv_seq, pos)
+
+            slot["token"] = tok
+            slot["position"] += 1
+            slot["tokens"].append(tok)
+
+            is_done = False
+            if self.eos_token is not None and tok == self.eos_token:
+                is_done = True
+            if slot["position"] >= self.ctx_len:
+                is_done = True
+            slot["done"] = is_done
+
+            results.append((slot_idx, tok, is_done))
+
+        return results
+
+    def remove_sequence(self, slot_idx):
+        """Remove sequence and free its pages."""
+        self.page_pool.free_seq_pages(slot_idx)
+        self.slots[slot_idx] = None
+
+    @property
+    def memory_stats(self):
+        return {
+            "pages_used": self.page_pool.pages_used,
+            "pages_total": self.page_pool.max_pages,
+            "memory_used_mb": self.page_pool.memory_used_mb,
+            "memory_pool_mb": self.page_pool.memory_allocated_mb,
+        }
+
+
 def main():
     import argparse
     import pickle
@@ -216,6 +338,8 @@ def main():
                         help="Prompts to generate from (one per batch slot)")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--weights", type=str, default="weights.pkl")
+    parser.add_argument("--paged", action="store_true",
+                        help="Use paged KV cache (page-level memory management)")
     args = parser.parse_args()
 
     # Load model
@@ -237,7 +361,11 @@ def main():
     print(f"Batch size: {batch_size}", file=sys.stderr)
     print(file=sys.stderr)
 
-    server = BatchedServer(params, config, batch_size=batch_size)
+    if args.paged:
+        server = PagedBatchedServer(params, config, batch_size=batch_size)
+        print(f"Using paged KV cache ({server.page_pool.max_pages} pages)", file=sys.stderr)
+    else:
+        server = BatchedServer(params, config, batch_size=batch_size)
 
     # Add all prompts
     for i, prompt in enumerate(args.prompts):
@@ -266,6 +394,11 @@ def main():
 
     print(f"\n[{total_tokens} tokens in {elapsed*1000:.0f}ms = {tok_per_s:.0f} tok/s"
           f" ({tok_per_s/batch_size:.0f} per seq)]", file=sys.stderr)
+    if args.paged:
+        stats = server.memory_stats
+        print(f"[Paged KV: {stats['pages_used']}/{stats['pages_total']} pages,"
+              f" {stats['memory_used_mb']:.1f}/{stats['memory_pool_mb']:.1f} MB]",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":
