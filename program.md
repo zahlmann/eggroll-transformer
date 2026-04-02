@@ -38,6 +38,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 22. Streaming text generation API (generate.py, 966 tok/s streaming at d=768)
 23. Variable-length batched inference (serve.py, per-sequence position tracking)
 24. Triton prefill kernel for GQA + D_BLOCK padding (12.9ms vs JAX 30.4ms, 2.4x)
+25. Tensor core batched projections (single 2D tl.dot for Q/K/V, +8-12% batched)
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -55,10 +56,12 @@ Build the fastest possible inference for this transformer using custom Triton ke
 ```
 XXL model (d=768, h=24, l=12, ctx=512, GQA 6 KV heads, 81.1M params, ppl=2.60):
   Multi-SM sync:       1024 tok/s (0.98 ms/tok, 20% BW util)
-  Pipelined:           1472 tok/s (0.68 ms/tok, ~29% BW util)
-  Persistent:          1368 tok/s (0.73 ms/tok)
-  Batched B=4 persist: 2261 tok/s (1.77 ms/step)
-  Batched B=8 persist: 2455 tok/s (3.26 ms/step)
+  Pipelined:           1503 tok/s (0.67 ms/tok, ~30% BW util)
+  Persistent:          1370 tok/s (0.73 ms/tok)
+  Pipelined B=4:       2306 tok/s (1.74 ms/step)
+  Persist B=4:         2436 tok/s (1.64 ms/step)
+  Pipelined B=8:       2571 tok/s (3.11 ms/step)
+  Persist B=8:         2687 tok/s (2.98 ms/step)
   Prefill (128 tok):   30.9 ms   (4148 tok/s)
   Weight buffer:       162.2 MB  (bf16, exceeds L2!)
   KV cache:            4.7 MB    (bf16, per sequence)
@@ -593,17 +596,39 @@ UPDATED (d=768, 12L, GQA 6 KV heads, 81.1M params):
 - d=768 Triton prefill: 12.9ms vs JAX 30.4ms (2.4x speedup)
 - Entire inference pipeline now uses custom Triton kernels (no JAX fallback)
 
-## YOUR NEXT TASK: Frontier Kernel Techniques
+## COMPLETED: Tensor Core Batched Projections (2026-04-02)
 
-**C1. Tensor core batched projections (B >= 16)**
+Replaced per-sequence Q/K/V projection loops with single batched `tl.dot`:
+`(BATCH_SIZE, D_BLOCK) @ (D_BLOCK, D_HEAD)` instead of B × `(1, D_BLOCK) @ (D_BLOCK, D_HEAD)`.
 
-With B>=16, QKV/O projections become real matmuls: (B, D_MODEL) @ (D_MODEL, D_HEAD).
-This activates tensor cores.
+At B>=16, this activates tensor cores. At B<16, it still reduces loop overhead and
+improves memory coalescing by loading all B h_norms as a 2D (B, D_BLOCK) batch.
+
+Applied to both `batched_decode.py` and `persistent_batched_decode.py`.
+
+```
+UPDATED (d=768, tensor core projections):
+  Batched B=4 sync:    1896 tok/s (2.11 ms/step)  ← was 1758 (+7.9%)
+  Batched B=8 sync:    2245 tok/s (3.56 ms/step)  ← was 2025 (+10.9%)
+  Batched B=16 sync:   2461 tok/s (6.50 ms/step)  ← was 2212 (+11.3%)
+  Pipelined B=4:       2306 tok/s (1.74 ms/step)  ← was 2115 (+9.0%)
+  Pipelined B=8:       2571 tok/s (3.11 ms/step)  ← was 2290 (+12.3%)
+  Persist B=4:         2436 tok/s (1.64 ms/step)  ← was 2261 (+7.7%)
+  Persist B=8:         2687 tok/s (2.98 ms/step)  ← was 2455 (+9.4%)
+```
+
+O projection not batched (output (B, D_BLOCK) would overflow shared memory at B>=16).
+
+---
+
+## YOUR NEXT TASK: Paged KV Cache
 
 **C2. Paged KV cache**
 
 For serving multiple sequences with different lengths, paged attention avoids pre-
-allocating max_seq × d_head per sequence.
+allocating max_seq × d_head per sequence. Instead, KV cache is allocated in pages
+and the attention kernel follows page table pointers. This is how vLLM serves models
+efficiently.
 
 ### How to measure progress
 
@@ -983,6 +1008,13 @@ baseline_metrics.txt                — current numbers to beat
     Double-buffered: 128KB > 101KB shared memory limit. Warp specialization would need
     CUDA, not Triton. The 1024-wide D_BLOCK (padding for d=768) is the fundamental
     constraint — it makes every 2D tile large.
+
+56. **Batched projections via 2D tl.dot give 8-12% across all batch sizes.** Replacing
+    `for b in range(B): Q[b] = dot(h[b], wq)` with `Q = dot(h_batch, wq)` where
+    h_batch is (B, D_BLOCK) eliminates B-1 loop iterations and improves memory access
+    patterns. At B>=16, tensor cores activate for the (16, 1024)@(1024, 32) matmul.
+    At B=4, tensor cores don't activate (M=4 < 16) but the 2D load/store pattern still
+    helps. O projection can't be batched: output (B, D_BLOCK) overflows shared memory.
 
 55. **GQA prefill: separate Q/K/V loops give 2.4x over JAX.** The Triton prefill
     kernel loops Q projections over N_HEADS (24) and K/V over N_KV_HEADS (6). Each
