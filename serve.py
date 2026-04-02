@@ -323,6 +323,71 @@ class PagedBatchedServer(BatchedServer):
         self.page_pool.free_seq_pages(slot_idx)
         self.slots[slot_idx] = None
 
+    def serve_continuous(self, prompts, max_tokens_per_seq=128, callback=None):
+        """Process a queue of prompts with continuous batching.
+
+        When a sequence finishes (EOS or max tokens), its slot and pages are
+        freed and immediately filled with the next pending prompt. The batch
+        stays full as long as there are pending prompts.
+
+        Args:
+            prompts: list of token ID lists (pre-tokenized prompts)
+            max_tokens_per_seq: max tokens to generate per sequence
+            callback: optional fn(slot_idx, token_id, is_done, prompt_idx)
+
+        Returns:
+            dict mapping prompt index to list of generated tokens
+        """
+        queue = list(enumerate(prompts))  # (prompt_idx, token_ids)
+        completed = {}  # prompt_idx -> tokens
+        slot_to_prompt = {}  # slot_idx -> (prompt_idx, tokens_generated)
+
+        # Fill initial batch
+        while queue:
+            free_slot = None
+            for i, s in enumerate(self.slots):
+                if s is None:
+                    free_slot = i
+                    break
+            if free_slot is None:
+                break
+            prompt_idx, prompt_ids = queue.pop(0)
+            slot = self.add_sequence(prompt_ids)
+            if slot >= 0:
+                slot_to_prompt[slot] = (prompt_idx, 0)
+
+        total_tokens = 0
+        while self._active_indices():
+            results = self.step()
+
+            for slot_idx, tok, is_done in results:
+                prompt_idx, n_gen = slot_to_prompt[slot_idx]
+                n_gen += 1
+                slot_to_prompt[slot_idx] = (prompt_idx, n_gen)
+                total_tokens += 1
+
+                if callback:
+                    callback(slot_idx, tok, is_done, prompt_idx)
+
+                # Check per-sequence token limit
+                if n_gen >= max_tokens_per_seq:
+                    is_done = True
+                    self.slots[slot_idx]["done"] = True
+
+                if is_done:
+                    completed[prompt_idx] = self.get_tokens(slot_idx)
+                    self.remove_sequence(slot_idx)
+                    del slot_to_prompt[slot_idx]
+
+                    # Fill freed slot with next prompt
+                    if queue:
+                        next_idx, next_ids = queue.pop(0)
+                        new_slot = self.add_sequence(next_ids)
+                        if new_slot >= 0:
+                            slot_to_prompt[new_slot] = (next_idx, 0)
+
+        return completed, total_tokens
+
     @property
     def memory_stats(self):
         return {
@@ -345,11 +410,15 @@ def main():
     parser.add_argument("--prompts", nargs="+",
                         default=["Once upon a time", "The cat sat on the",
                                  "In a galaxy far", "She opened the door"],
-                        help="Prompts to generate from (one per batch slot)")
+                        help="Prompts to generate from")
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Batch size (default: number of prompts)")
     parser.add_argument("--weights", type=str, default="weights.pkl")
     parser.add_argument("--paged", action="store_true",
                         help="Use paged KV cache (page-level memory management)")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Use continuous batching (requires --paged)")
     args = parser.parse_args()
 
     # Load model
@@ -365,10 +434,14 @@ def main():
     tok = Tokenizer.from_file(bpe_vocab["tokenizer_path"])
     encode_fn = lambda text: tok.encode(text).ids
 
-    batch_size = len(args.prompts)
+    if args.continuous and not args.paged:
+        args.paged = True
+        print("--continuous implies --paged", file=sys.stderr)
+
+    batch_size = args.batch_size or len(args.prompts)
     print(f"Model: d={config['d_model']} h={config['n_heads']} l={config['n_layers']}",
           file=sys.stderr)
-    print(f"Batch size: {batch_size}", file=sys.stderr)
+    print(f"Batch size: {batch_size}, Prompts: {len(args.prompts)}", file=sys.stderr)
     print(file=sys.stderr)
 
     if args.paged:
@@ -377,33 +450,58 @@ def main():
     else:
         server = BatchedServer(params, config, batch_size=batch_size)
 
-    # Add all prompts
-    for i, prompt in enumerate(args.prompts):
-        prompt_ids = encode_fn(prompt)
-        slot = server.add_sequence(prompt_ids)
-        print(f"[Slot {slot}] prompt ({len(prompt_ids)} tokens): {prompt}", file=sys.stderr)
+    # Tokenize all prompts
+    all_prompt_ids = [encode_fn(p) for p in args.prompts]
 
-    print(file=sys.stderr)
+    if args.continuous:
+        # Continuous batching: process all prompts through batch_size slots
+        print(f"Continuous batching: {len(args.prompts)} prompts through "
+              f"{batch_size} slots", file=sys.stderr)
 
-    # Generate
-    t0 = time.perf_counter()
-    total_tokens = 0
-    for step_results in server.generate(max_tokens=args.max_tokens):
-        total_tokens += len(step_results)
+        t0 = time.perf_counter()
+        completed, total_tokens = server.serve_continuous(
+            all_prompt_ids, max_tokens_per_seq=args.max_tokens)
+        elapsed = time.perf_counter() - t0
+        tok_per_s = total_tokens / elapsed
 
-    elapsed = time.perf_counter() - t0
-    tok_per_s = total_tokens / elapsed
+        for prompt_idx in sorted(completed.keys()):
+            tokens = completed[prompt_idx]
+            text = decode_fn(tokens)
+            prompt = args.prompts[prompt_idx]
+            print(f"\n--- Prompt {prompt_idx} ({len(tokens)} tokens) ---")
+            print(f"{prompt}{text}")
 
-    # Print results
-    for i in range(batch_size):
-        tokens = server.get_tokens(i)
-        text = decode_fn(tokens)
-        prompt = args.prompts[i]
-        print(f"\n--- Slot {i} ({len(tokens)} tokens) ---")
-        print(f"{prompt}{text}")
+        print(f"\n[{total_tokens} tokens in {elapsed*1000:.0f}ms = {tok_per_s:.0f} tok/s"
+              f" ({len(args.prompts)} prompts, batch_size={batch_size})]",
+              file=sys.stderr)
 
-    print(f"\n[{total_tokens} tokens in {elapsed*1000:.0f}ms = {tok_per_s:.0f} tok/s"
-          f" ({tok_per_s/batch_size:.0f} per seq)]", file=sys.stderr)
+    else:
+        # Static batching: one prompt per slot
+        for i, prompt_ids in enumerate(all_prompt_ids[:batch_size]):
+            slot = server.add_sequence(prompt_ids)
+            print(f"[Slot {slot}] prompt ({len(prompt_ids)} tokens): "
+                  f"{args.prompts[i]}", file=sys.stderr)
+
+        print(file=sys.stderr)
+
+        t0 = time.perf_counter()
+        total_tokens = 0
+        for step_results in server.generate(max_tokens=args.max_tokens):
+            total_tokens += len(step_results)
+
+        elapsed = time.perf_counter() - t0
+        tok_per_s = total_tokens / elapsed
+
+        for i in range(min(batch_size, len(args.prompts))):
+            tokens = server.get_tokens(i)
+            text = decode_fn(tokens)
+            prompt = args.prompts[i]
+            print(f"\n--- Slot {i} ({len(tokens)} tokens) ---")
+            print(f"{prompt}{text}")
+
+        print(f"\n[{total_tokens} tokens in {elapsed*1000:.0f}ms = {tok_per_s:.0f} tok/s"
+              f" ({tok_per_s/batch_size:.0f} per seq)]", file=sys.stderr)
+
     if args.paged:
         stats = server.memory_stats
         print(f"[Paged KV: {stats['pages_used']}/{stats['pages_total']} pages,"
