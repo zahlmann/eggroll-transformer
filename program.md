@@ -647,8 +647,6 @@ this overhead and is the logical next optimization.
 
 The core kernel architecture is complete. Potential future directions:
 - **Kernel-level paged KV**: pass page table to attention loop for zero-copy paging
-- **int4/int8 weight quantization**: would reduce HBM bandwidth bottleneck at d=768
-- **Multi-GPU**: tensor parallelism across GPUs for larger models
 - **Continuous batching**: replace finished sequences with new ones mid-generation
 - **Speculative decoding revisit**: with larger target model, the speed ratio improves
 
