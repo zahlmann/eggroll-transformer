@@ -746,61 +746,43 @@ with these acceptance rates would give 2-3x speedup.
 
 ## What's Next
 
-### Phase 1: Training data (highest priority)
+### Epoch 2: Fresh data with more code (next task)
 
-The current model trains on TinyStories (487M tokens, simple children's stories).
-This limits the model to one narrow domain. The next step is to curate a
-high-quality, general-knowledge training mix that maximizes capability per token.
+Epoch 1 trained d=1024/l=16 (242M params) on 1.77B tokens for 13.7h.
+Result: val_loss=3.04, ppl=20.91. Code quality was weak (only 6% code in mix).
 
-**Requirements:**
-- Must fit on RTX 4080 Super (16GB VRAM) without exotic batch tricks — standard
-  data-parallel with gradient checkpointing, bf16 forward, batch_size 16-32 is fine
-- Token budget: ~1-2B tokens (Chinchilla-optimal for 80-200M params)
-- Goal: maximize knowledge density per token. Every token should teach the model
-  something useful. Avoid repetitive, low-information, or noisy data.
+**Epoch 2 must use entirely fresh tokens (no repetition of epoch 1 data).**
+All sources have far more data available than what we used.
 
-**Research the best small-scale training mixes.** Look at what worked for:
-- TinyLlama (1.1B params, 3T tokens — what data mix?)
-- Phi-1/Phi-1.5/Phi-2 (Microsoft — "textbook-quality" data, very token-efficient)
-- LLaMA 1/2/3 data mixes (what proportions of web, books, code, wiki?)
-- SlimPajama, RedPajama, Dolma, FineWeb — which are highest quality?
-- The Pile — which subsets have highest knowledge density?
+**Data mix for epoch 2 (~2B new tokens):**
+- 50% FineWeb-Edu (1B tokens) — download NEW docs from `sample-10BT`, skip docs
+  already used in epoch 1 (track by document ID or byte offset in the stream).
+  Score >= 3 filter stays.
+- 20% Code from StarCoder (400M tokens) — `bigcode/starcoderdata` (HF login
+  configured, access granted). Languages: Python, JavaScript, TypeScript, Java,
+  C, C++, Rust, Go. Filter: 100-50K chars per file. StarCoder data is
+  high-quality and deduplicated.
+- 15% Wikipedia (300M tokens) — fresh articles not used in epoch 1.
+- 15% Cosmopedia v2 (300M tokens) — fresh docs from `smollm-corpus/cosmopedia-v2`.
 
-**Key insight from Phi papers:** synthetic textbook-quality data + filtered web data
-dramatically outperforms raw web scrapes at small scale. Quality > quantity.
+**Implementation:**
+- Update `prepare_data.py` to accept `--epoch 2` flag that skips already-used docs
+- Replace `code_search_net` with `bigcode/starcoderdata` (much larger, better quality)
+- Save tokenized epoch 2 as `data/tokens/combined_epoch2.npz`
+- Resume training from epoch 1 weights (`weights.pkl`) with fresh data
+- Use same tokenizer (`data/tokenizer_32000.json`) — do NOT retrain it
 
-**Proposed mix (research and validate):**
-- Wikipedia/encyclopedic content (factual knowledge, high density)
-- Textbook-style content (structured explanations)
-- High-quality web text (filtered, e.g., FineWeb-Edu)
-- Code (reasoning patterns, structured thinking)
-- Math/science text (logical reasoning)
-- Books (long-form coherence)
+**Training command (after data prep):**
+```
+uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 16 \
+  --context-len 512 --epochs 1 --batch-size 16 --lr 1e-4 --warmup-steps 500 \
+  --dataset combined --resume weights.pkl
+```
+Note: lower LR (1e-4 vs 3e-4) and shorter warmup for continued training.
+The `--resume` flag needs to be added to train.py (load params + opt_state from
+checkpoint instead of random init).
 
-Target: ~500M-1B high-quality tokens, deduplicated, filtered for quality.
-This replaces TinyStories entirely.
-
-### Phase 2: Scale model to fill the GPU
-
-With better data, scale the model to use available VRAM:
-- Current: 81M params, 3.66 GB VRAM during training (23% utilized)
-- Target: use ~12-14 GB for training (leave headroom for OS/display)
-- This likely means d=1024+ or deeper (more layers)
-- Profile VRAM at different configs to find the sweet spot
-
-### Phase 3: Architecture cleanup (during retraining)
-
-- **Remove FFN biases** (up_bias, down_bias) from model.py, all decode/prefill kernels,
-  and repo_explained_from_zero.md. Modern transformers (LLaMA, Mistral) don't use them.
-  At d=768 they're 0.06% of params for zero quality benefit. Simplifies kernel FFN loops.
-
-### Phase 4: Training efficiency
-
-Look for easy wins in the training loop:
-- Current: 53K tok/s with bf16 forward on RTX 4080 Super
-- Gradient accumulation if batch size is memory-limited at larger model
-- Data loading overlap (prefetch next batch while computing)
-- Any other low-hanging fruit
+After epoch 2, the model will have seen ~3.8B unique tokens total (vs 1.77B repeated).
 
 ### Kernel architecture (done)
 
