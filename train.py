@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--dataset", default="tinystories",
                         choices=["shakespeare", "tinystories", "combined", "combined_epoch2"])
     parser.add_argument("--tokenizer", default="trained_bpe", choices=["char", "bpe", "trained_bpe"])
-    parser.add_argument("--bpe-vocab", type=int, default=4096)
+    parser.add_argument("--bpe-vocab", type=int, default=32000)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to weights.pkl checkpoint to resume from")
     parser.add_argument("--d-ff", type=int, default=None,
