@@ -1270,14 +1270,94 @@ to standard next-token prediction. Loss = L1 + λ₂L₂ + λ₃L₃ + λ₄L₄
 - **Gradient accumulation**: if batch size > VRAM allows, accumulate gradients
 - **Data mix tuning**: measure per-domain loss, adjust ratios
 
+#### Step D7: Custom Triton training kernels
+
+Profiling results (24L pure attn, bs=16, ctx=512, d=1024, vocab=4096):
+```
+Full training step: 629ms (13.0K tok/s)
+  Forward:  161ms (25% of step)
+  Backward: 574ms (75% of step, includes gradient checkpointing recompute)
+  Bwd/Fwd ratio: 3.6x (checkpoint recomputes each layer's forward during bwd)
+
+GPU utilization: 31.2 TFLOPS = 60% of 52 TFLOPS peak
+  → 40% headroom from kernel overhead, memory latency, launch gaps
+
+Per-layer forward breakdown (6.73ms per layer):
+  Attention (QKV proj + QK^T + softmax + AV + O proj): 3.53ms (52%)
+  SwiGLU FFN (gate + up + SiLU*mul + down):            1.71ms (25%)
+  Other (RMSNorm, residual, RoPE, overhead):            1.49ms (22%)
+
+Memory: 8.8GB peak (4.4GB static: weights+grads+optimizer, 4.4GB activations)
+
+Vocab scaling (critical for D4 larger vocab):
+  vocab= 4096: output+CE  1.1ms, logits tensor  134MB
+  vocab=16384: output+CE  4.1ms, logits tensor  537MB
+  vocab=32768: output+CE  7.0ms, logits tensor 1074MB ← would OOM at bs=16!
+```
+
+**Kernel opportunities (estimated savings on the full fwd+bwd+optimizer step):**
+
+**D7a. Fused cross-entropy (CRITICAL for vocab=32K)**
+- Currently materializes full (bs, seq, vocab) logits tensor in float32
+- At vocab=32K: 1.1GB tensor → OOM. At vocab=16K: 537MB → tight.
+- Fused kernel: compute log_softmax + CE loss + backward WITHOUT materializing logits.
+  Stream through vocab dimension in tiles, accumulate loss and gradients online.
+- **Must implement before increasing vocab size.** Without this, vocab stays at 4096.
+- Reference: Liger-Kernel fused CE (PyTorch), or Triton online softmax pattern.
+- Saves: ~1GB memory, enables vocab=32K, also ~5ms/step at vocab=4K.
+
+**D7b. FlashAttention for training (fwd + bwd kernel)**
+- Attention is 52% of per-layer forward time (3.53ms) and dominates backward too.
+- XLA generates decent attention but not FlashAttention-level tiling.
+- Custom FlashAttention fwd+bwd Triton kernel with O(n) memory instead of O(n²).
+- At ctx=512 with 16 Q-heads: the attention scores matrix is 16×512×512×4 = 16MB per
+  sample. FlashAttention avoids materializing this (tiles along seq dimension).
+- Expected savings: ~23% of step time (144ms) from better attention + memory savings.
+  Memory savings could enable bs=32 (double throughput if compute-bound).
+- Reference: our existing prefill FlashAttention kernel (block_prefill.py _flash_attn_kernel)
+  already does forward. Need to add backward pass.
+- Complexity: HIGH. FlashAttention backward is the hardest Triton kernel to write correctly.
+  Alternative: use `jax.nn.dot_product_attention` which may use cuDNN FlashAttention.
+
+**D7c. Fused RMSNorm + linear projection**
+- Currently: RMSNorm writes h_norm to HBM, linear projection reads it back.
+  Two separate XLA kernels with a full HBM round-trip between them.
+- Fused: compute RMSNorm and the following matmul (Q/K/V proj or FFN) in one kernel.
+  h_norm stays in registers/shared memory, never touches HBM.
+- 2 fusions per layer (pre-attn norm+QKV, pre-FFN norm+gate/up) × 24 layers = 48 fusions.
+- Saves: ~9% of step time (58ms). Each fusion saves ~1MB HBM traffic.
+- Complexity: MEDIUM. The matmul part is a standard GEMM, just with fused normalization
+  as a prologue. Can use Triton's tl.dot for the matmul.
+
+**D7d. Fused SwiGLU**
+- Currently: gate = h@Wg, up = h@Wu, act = silu(gate)*up → 3 separate XLA kernels,
+  materializing gate and up (each bs×seq×d_ff = 16×512×2816×2 = 46MB bf16) to HBM.
+- Fused: compute gate and up in one kernel, apply SiLU*mul inline, feed to down proj.
+  Or at minimum: fuse the SiLU*mul element-wise op to avoid one materialization.
+- Saves: ~8% of step time (48ms), ~92MB activation memory per layer.
+- Complexity: LOW for the element-wise fusion (just fuse silu*mul). HIGH for fusing
+  with the matmuls (requires tiled GEMM + inline activation).
+
+**D7e. Test jax.nn.dot_product_attention (free FlashAttention?)**
+- JAX 0.4.31+ has `jax.nn.dot_product_attention` which may dispatch to cuDNN
+  FlashAttention automatically. This could give FlashAttention-level performance
+  without writing a custom kernel.
+- Test: replace our manual attention with this API, measure throughput and memory.
+- Complexity: TRIVIAL to test. If it works, skip D7b entirely.
+
 #### Implementation order
 
 1. **D1** (revert DeltaNet): immediate, verify throughput
-2. **D4** (larger vocab): do before training starts (changes tokenization)
-3. **D2** (sequence packing): implement before training
-4. **D3** (sequence length warmup): implement in training loop
-5. **D5** (MTP): add after base training is stable
-6. **D6** (recipe tuning): ongoing during training
+2. **D7e** (test jax FlashAttention): trivial, potentially huge win
+3. **D7a** (fused cross-entropy): MUST do before vocab increase
+4. **D4** (larger vocab): do before training starts (changes tokenization)
+5. **D2** (sequence packing): implement before training
+6. **D3** (sequence length warmup): implement in training loop
+7. **D7c** (fused RMSNorm+linear): nice-to-have, 9% speedup
+8. **D7d** (fused SwiGLU): nice-to-have, 8% speedup
+9. **D5** (MTP): add after base training is stable
+10. **D6** (recipe tuning): ongoing during training
+11. **D7b** (FlashAttention training bwd): complex, do if D7e doesn't work
 
 **Target throughput:** 20-30K tok/s effective (accounting for packing + curriculum).
 **Target training:** 10B tokens in 4-6 days.
