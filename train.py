@@ -44,6 +44,8 @@ def main():
                         help="FFN hidden dim (default: auto from SwiGLU formula)")
     parser.add_argument("--use-deltanet", action="store_true",
                         help="Enable DeltaNet hybrid layers (default: pure attention)")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Sequence length curriculum: start short (128), grow to full ctx")
     args = parser.parse_args()
 
     # data
@@ -100,17 +102,21 @@ def main():
     use_fused_ce = config["vocab_size"] >= 8192
     ce_chunk = min(4096, config["vocab_size"])
 
-    @jax.jit
-    def train_step(params, opt_state, x, y):
-        def loss_fn(params):
-            params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
-            if use_fused_ce:
-                return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
-            logits = transformer_forward_batch(params_bf16, config, x)
-            return cross_entropy_loss(logits.astype(jnp.float32), y)
-        loss, grads = jax.value_and_grad(loss_fn)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, loss
+    def make_train_step(phase_config):
+        """Create JIT-compiled train step for a specific context length."""
+        pc = {**config, "context_len": phase_config["ctx"]}
+        @jax.jit
+        def step(params, opt_state, x, y):
+            def loss_fn(params):
+                params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
+                if use_fused_ce:
+                    return transformer_loss_fused(params_bf16, pc, x, y, ce_chunk)
+                logits = transformer_forward_batch(params_bf16, pc, x)
+                return cross_entropy_loss(logits.astype(jnp.float32), y)
+            loss, grads = jax.value_and_grad(loss_fn)(params)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            return optax.apply_updates(params, updates), opt_state, loss
+        return step
 
     @jax.jit
     def eval_loss(params, x, y):
@@ -119,6 +125,23 @@ def main():
             return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
         logits = transformer_forward_batch(params_bf16, config, x)
         return cross_entropy_loss(logits.astype(jnp.float32), y)
+
+    # curriculum schedule: phases with (fraction_of_training, ctx, bs_multiplier)
+    if args.curriculum and args.context_len >= 256:
+        phases = [
+            {"frac": 0.10, "ctx": args.context_len // 4, "bs_mult": 4},
+            {"frac": 0.20, "ctx": args.context_len // 2, "bs_mult": 2},
+            {"frac": 0.70, "ctx": args.context_len,      "bs_mult": 1},
+        ]
+        print(f"Curriculum: {' -> '.join(f'ctx={p['ctx']}(bs×{p['bs_mult']})' for p in phases)}")
+    else:
+        phases = [{"frac": 1.0, "ctx": args.context_len, "bs_mult": 1}]
+
+    # pre-compile train steps for each unique context length
+    phase_steps = {}
+    for p in phases:
+        if p["ctx"] not in phase_steps:
+            phase_steps[p["ctx"]] = make_train_step(p)
 
     layer_types = config.get("layer_types", ["attn"] * args.n_layers)
     n_delta = sum(1 for t in layer_types if t == "delta")
@@ -131,29 +154,71 @@ def main():
 
     # train with prefetch: overlap host→device transfer with compute
     t_start = time.perf_counter()
+    global_step = 0
     for epoch in range(args.epochs):
         perm = np.random.default_rng(args.seed + epoch).permutation(len(train_x))
         sx, sy = train_x[perm], train_y[perm]
         eloss = 0.0
         t_epoch = time.perf_counter()
-        # prefetch first batch
-        s = 0
-        next_bx = jax.device_put(jnp.array(sx[s:s + args.batch_size]))
-        next_by = jax.device_put(jnp.array(sy[s:s + args.batch_size]))
-        for bi in range(n_batches):
-            bx, by = next_bx, next_by
-            # prefetch next batch while current step runs
-            if bi + 1 < n_batches:
-                s = (bi + 1) * args.batch_size
-                next_bx = jax.device_put(jnp.array(sx[s:s + args.batch_size]))
-                next_by = jax.device_put(jnp.array(sy[s:s + args.batch_size]))
-            params, opt_state, loss = train_step(params, opt_state, bx, by)
-            eloss += float(loss)
-            if bi > 0 and bi % 1000 == 0:
-                avg = eloss / bi
-                sps = bi / (time.perf_counter() - t_epoch)
-                eta = (n_batches - bi) / sps / 60
-                print(f"    step {bi}/{n_batches}  loss={avg:.4f}  {sps:.1f} steps/s  eta={eta:.0f}min")
+
+        # determine phase for each step based on global position
+        bi = 0
+        while bi < n_batches:
+            # determine current phase
+            progress = global_step / total_steps
+            cur_phase = phases[-1]
+            cumfrac = 0.0
+            for p in phases:
+                cumfrac += p["frac"]
+                if progress < cumfrac:
+                    cur_phase = p
+                    break
+
+            ctx = cur_phase["ctx"]
+            bs = args.batch_size * cur_phase["bs_mult"]
+            train_step = phase_steps[ctx]
+
+            # how many steps to run in this phase before checking again
+            next_frac = 0.0
+            for p in phases:
+                next_frac += p["frac"]
+                if p is cur_phase:
+                    break
+            steps_until_phase_end = max(1, int(next_frac * total_steps) - global_step)
+            steps_in_epoch = n_batches - bi
+            chunk_steps = min(steps_until_phase_end, steps_in_epoch)
+
+            # prefetch first batch for this chunk
+            s = bi * args.batch_size
+            bx_np = sx[s:s + bs, :ctx]
+            by_np = sy[s:s + bs, :ctx]
+            next_bx = jax.device_put(jnp.array(bx_np))
+            next_by = jax.device_put(jnp.array(by_np))
+
+            for ci in range(chunk_steps):
+                bx, by = next_bx, next_by
+                # prefetch next batch
+                if ci + 1 < chunk_steps:
+                    s = (bi + ci + 1) * args.batch_size
+                    if s + bs <= len(sx):
+                        next_bx = jax.device_put(jnp.array(sx[s:s + bs, :ctx]))
+                        next_by = jax.device_put(jnp.array(sy[s:s + bs, :ctx]))
+
+                params, opt_state, loss = train_step(params, opt_state, bx, by)
+                eloss += float(loss)
+                global_step += 1
+
+                step_in_epoch = bi + ci
+                if step_in_epoch > 0 and step_in_epoch % 1000 == 0:
+                    avg = eloss / (step_in_epoch + 1)
+                    sps = (step_in_epoch + 1) / (time.perf_counter() - t_epoch)
+                    eta = (n_batches - step_in_epoch) / sps / 60
+                    phase_info = f"ctx={ctx}" if len(phases) > 1 else ""
+                    print(f"    step {step_in_epoch}/{n_batches}  loss={avg:.4f}  "
+                          f"{sps:.1f} steps/s  eta={eta:.0f}min  {phase_info}")
+
+            bi += chunk_steps
+
         vl = float(eval_loss(params, val_x, val_y))
         print(f"  epoch {epoch+1}/{args.epochs}  train={eloss/n_batches:.4f}  "
               f"val={vl:.4f}  ppl={np.exp(vl):.2f}")
