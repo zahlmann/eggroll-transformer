@@ -730,6 +730,370 @@ with these acceptance rates would give 2-3x speedup.
 
 ## What's Next
 
+### Phase C: Modern Architecture Redesign (next task)
+
+The current model (242M params, d=1024, 16 layers) uses 2020-era architecture. Frontier
+small models (Qwen 3.5-0.8B, SmolLM2, TinyLlama) use fundamentally better building
+blocks that deliver more quality per FLOP and more tokens per second. This phase
+redesigns the model architecture, updates all Triton kernels, and trains on 10-20B tokens.
+
+**Current training throughput:** 36K tok/s (4.4 steps/s × 16 batch × 512 ctx).
+Already ~96% compute-bound at 52 TFLOPS. Architectural efficiency is the lever, not
+raw FLOPS.
+
+**Reference: Qwen 3.5-0.8B** (closest SOTA to our scale):
+- 24 layers, d=1024, 248K vocab
+- 75% Gated DeltaNet (linear attention O(n)) + 25% standard attention
+- Multi-Token Prediction (2-4x inference via self-speculative decode)
+- MROP (Multi-Resolution RoPE), SwiGLU, RMSNorm, no biases, tied embeddings
+
+---
+
+#### Step C1: RMSNorm (replace LayerNorm)
+
+**What:** Replace `layer_norm(x, scale, bias)` with `rms_norm(x, scale)`. Remove all
+LN bias parameters.
+
+**Why:** 10-15% faster (no mean subtraction, no bias add). Same quality. Used by every
+modern LLM (Llama, Qwen, Gemma, etc.).
+
+**Formula:**
+```
+RMSNorm(x) = scale * x / sqrt(mean(x²) + eps)
+```
+
+**Changes needed:**
+- `model.py`: replace `layer_norm()`, remove `.ln1.bias`, `.ln2.bias`, `ln_final.bias`
+- All decode kernels: update LN computation (remove mean subtraction + bias)
+- All prefill kernels: same
+- `prepare_decode_weights_nlayer()`: update packed weight layout (no bias slots)
+
+**Kernel impact:** Slightly fewer ops per LN. Register pressure unchanged.
+
+---
+
+#### Step C2: RoPE (replace learned positional embeddings)
+
+**What:** Replace learned `pos_emb (context_len, d_model)` with Rotary Position
+Embeddings applied to Q and K after projection.
+
+**Why:** Better extrapolation to unseen lengths. Saves `context_len × d_model` params.
+Encodes relative position (not absolute). Standard in all modern LLMs.
+
+**Formula (per head, per position m):**
+```
+For dimension pair i (i = 0, 1, ..., d_head/2 - 1):
+  θ_i = base^(-2i/d_head)        # base = 10000 (standard) or 1000000 (Qwen extended)
+
+  q'[2i]   = q[2i]·cos(m·θ_i) - q[2i+1]·sin(m·θ_i)
+  q'[2i+1] = q[2i]·sin(m·θ_i) + q[2i+1]·cos(m·θ_i)
+
+  Same for k' (using position n).
+```
+
+Dot product `q'_m · k'_n` depends only on relative position `(m-n)`, not absolute.
+
+**Changes needed:**
+- `model.py`: remove `pos_emb` param, add `apply_rope(q, k, positions)` after QK projection
+- Precompute `cos_table, sin_table` of shape `(max_seq, d_head//2)` — pass to kernels
+- All decode kernels: apply RoPE to Q (current pos) and K (tile positions) inside
+  attention loop. This replaces the pos_emb lookup at the start.
+- All prefill kernels: apply RoPE to Q and K after projection, before attention
+- `prepare_decode_weights_nlayer()`: remove pos_emb from packed weights, add cos/sin tables
+
+**Kernel impact:** Adds ~4 ops per Q/K element (2 mul + 1 add per pair), but removes
+the pos_emb load. Net neutral or slightly faster.
+
+**Implementation reference:**
+- EleutherAI blog: https://blog.eleuther.ai/rotary-embeddings/
+- Use `base = 10000` for ctx=512, can increase to 1000000 for longer contexts later
+
+---
+
+#### Step C3: SwiGLU FFN (replace GELU FFN)
+
+**What:** Replace `GELU(x @ W_up) @ W_down` with
+`(SiLU(x @ W_gate) * (x @ W_up)) @ W_down`. Three weight matrices instead of two.
+
+**Why:** ~15% better quality per FLOP. The gating mechanism allows the FFN to learn
+which features to pass through. Used by Llama, Qwen, Gemma, etc.
+
+**Formula:**
+```
+SwiGLU(x) = (SiLU(x @ W_gate) ⊙ (x @ W_up)) @ W_down
+
+where SiLU(z) = z * sigmoid(z)
+```
+
+**Dimension change:** To keep param count equivalent to standard `d -> 4d -> d`:
+```
+Standard:  2 matrices × d × 4d = 8d² params
+SwiGLU:    3 matrices × d × d_ff = 3 × d × d_ff params
+Match:     d_ff = (8/3)d ≈ 2.67d
+
+For d=1024:  d_ff = 2730  (round to multiple of 128: 2816)
+```
+
+**Changes needed:**
+- `model.py`: add `W_gate` param per layer, change FFN forward pass, update `d_ff`
+- All decode kernels: fuse SiLU + elementwise multiply into FFN section. The gate and
+  up projections can share the K-tiling loop (load both weight tiles per K iteration).
+- All prefill kernels: same
+- `prepare_decode_weights_nlayer()`: pack 3 FFN matrices instead of 2
+
+**Kernel impact:** Three matmuls instead of two in FFN, but d_ff is 33% smaller (2816
+vs 4096). Net compute is similar: 3 × d × 2816 = 8448d vs 2 × d × 4096 = 8192d.
+The SiLU + multiply is fused into the existing FFN loop body (negligible cost).
+
+**Implementation reference:**
+- Fused Triton SwiGLU: https://github.com/fattorib/fusedswiglu
+- Liger-Kernel (LinkedIn): https://github.com/linkedin/Liger-Kernel
+
+---
+
+#### Step C4: Remove biases, tie embeddings
+
+**What:**
+1. Remove all bias terms from attention projections and FFN projections
+2. Tie output projection to token embedding: `logits = h @ token_emb.T`
+
+**Why:**
+- No biases: modern standard (Llama, Qwen, Gemma). Saves params, simplifies kernels.
+- Tied embeddings: saves `d_model × vocab_size` params (32M for d=1024, vocab=32K).
+  Quality impact is negligible at this scale; Qwen 0.8B ties embeddings.
+
+**Changes needed:**
+- `model.py`: remove all bias params, remove separate `output_proj`
+- All kernels: remove bias loads/adds from FFN and attention
+- Output projection in decode kernels: use `token_emb.T` instead of `output_proj`
+
+**Kernel impact:** Fewer loads, slightly less register pressure. Pure win.
+
+---
+
+#### Step C5: Deeper model (24 layers)
+
+**What:** Increase from 16 to 24 layers (matching Qwen 3.5-0.8B). Reduce d_model if
+needed to fit in 16GB VRAM with batch_size=16.
+
+**Why:** Deeper models learn more complex representations per parameter. Qwen 0.8B uses
+24 layers at d=1024. With the parameter savings from tied embeddings and removed biases,
+we can add layers without increasing total params significantly.
+
+**Parameter budget (target ~250M total):**
+```
+Current (16L, d=1024, separate output proj):
+  Embeddings: 32K × 1024 = 32.8M
+  Per layer:  ~13M (QKV+O + FFN + norms + biases)
+  16 layers:  ~208M
+  Output proj: 1024 × 32K = 32.8M
+  Total:      ~242M
+
+New (24L, d=1024, SwiGLU d_ff=2816, tied emb, no bias):
+  Embeddings: 32K × 1024 = 32.8M (shared with output)
+  Per layer:  ~12M (QKV+O no bias + SwiGLU 3×1024×2816 no bias + RMSNorm scale only)
+  24 layers:  ~288M
+  Total:      ~321M  ← slightly over, may need d_ff=2560 or d=896
+```
+
+Adjust d_ff or d_model to hit ~250-300M params within 16GB VRAM.
+
+---
+
+#### Step C6: Gated DeltaNet layers (75% of layers)
+
+**What:** Replace 75% of standard attention layers with Gated DeltaNet linear attention.
+Keep every 4th layer as standard attention (same pattern as Qwen 3.5).
+
+For 24 layers: 18 DeltaNet + 6 standard attention. Pattern:
+`[D, D, D, A, D, D, D, A, D, D, D, A, D, D, D, A, D, D, D, A, D, D, D, A]`
+
+**Why:** O(n) complexity instead of O(n²). Fixed-size state instead of growing KV cache.
+75% less KV cache memory. The key innovation behind Qwen 3.5's efficiency.
+
+**Gated DeltaNet recurrence (per head):**
+```
+State update:
+  S_t = (I - β_t · k_t · k_t^T) · diag(α_t) · S_{t-1} + β_t · k_t · v_t^T
+
+Output:
+  y_t = S_t · q_t
+
+Where:
+  S_t:  state matrix (d_head × d_head), fixed size regardless of sequence length
+  α_t:  decay gate vector (d_head,), controls forgetting. α = sigmoid(x @ W_alpha)
+  β_t:  update strength scalar, controls new info. β = sigmoid(x @ W_beta)
+  k_t:  key vector, L2-normalized (not softmax). k = normalize(x @ W_k)
+  v_t:  value vector. v = x @ W_v
+  q_t:  query vector. q = x @ W_q
+```
+
+**The delta rule explained:**
+- `S_{t-1} · k_t` retrieves the current memory's prediction for key k_t
+- `β_t · k_t · v_t^T` writes the new association (k_t → v_t)
+- `(I - β_t · k_t · k_t^T)` erases the old association for k_t before writing new one
+- `diag(α_t)` decays old memories (adaptive forgetting)
+- Unlike vanilla linear attention (S += k·v^T which can only accumulate), DeltaNet
+  can selectively update and erase associations
+
+**Training (parallel form via WY representation):**
+The recurrence can be parallelized for training using chunked computation:
+- Split sequence into chunks of size C (e.g., C=64)
+- Within each chunk, compute the product of (I - β_t·k_t·k_t^T) matrices using the
+  WY representation: ∏(I - β_i·k_i·k_i^T) = I - W·Y^T (compact form)
+- This avoids materializing O(L·d²) intermediate matrices
+- Between chunks, propagate the state S using the compact form
+
+**Extra parameters per DeltaNet layer (vs standard attention):**
+```
+Standard attention layer: W_q, W_k, W_v, W_o (4 × d × d_head × n_heads)
+DeltaNet layer:           W_q, W_k, W_v, W_o, W_alpha, W_beta + short_conv
+  W_alpha: (d_model, d_head) — decay gate projection
+  W_beta:  (d_model, 1) — update strength projection (scalar per token)
+  short_conv: 1D conv on Q/K (kernel_size=4, per head) — local position encoding
+```
+
+**Changes needed:**
+- `model.py`: add DeltaNet layer type, `init_deltanet_layer()`, forward pass with
+  recurrence (sequential) and chunked parallel (training)
+- New kernel: `kernels/deltanet_decode.py` — fused DeltaNet decode. Instead of
+  attention over KV cache, maintain state matrix S and update per token. Much simpler
+  than attention decode (no KV tile loop, no online softmax).
+- New kernel: `kernels/deltanet_prefill.py` — chunked parallel DeltaNet for training.
+  Process chunks of C tokens, propagate state between chunks.
+- Modify multi-SM decode: hybrid dispatch — DeltaNet layers use state update,
+  attention layers use existing KV-cache attention
+- `prepare_decode_weights_nlayer()`: pack both layer types
+
+**Kernel design for DeltaNet decode (single token):**
+```
+Per DeltaNet layer:
+  1. Load h, compute q, k, v, alpha, beta from projections
+  2. Apply short conv to q, k (load last 3 positions from conv buffer)
+  3. L2-normalize k
+  4. alpha = sigmoid(alpha), beta = sigmoid(beta)
+  5. Load state S (d_head × d_head per head)
+  6. Update: S = (I - beta * outer(k, k)) * diag(alpha) * S + beta * outer(k, v)
+  7. Output: y = S @ q
+  8. Store updated S
+  9. Apply output projection, residual add
+```
+
+The state S is d_head × d_head = 64 × 64 = 4096 f32 values = 16KB per head.
+With 16 heads: 256KB total state per layer (vs 8.4MB KV cache per layer at ctx=512).
+
+**Implementation references:**
+- Paper: "Gated Delta Networks: Improving Mamba2 with Delta Rule" (arXiv:2412.06464)
+- Parallel training: "Parallelizing Linear Transformers with the Delta Rule" (arXiv:2406.06484)
+- Official code: https://github.com/NVlabs/GatedDeltaNet
+- Flash Linear Attention (Triton kernels): https://github.com/fla-org/flash-linear-attention
+  - Key file: `fla/layers/delta_net.py` and `fla/ops/delta_rule/`
+- Author's blog posts (excellent math explanations):
+  - Part 1: https://sustcsonglin.github.io/blog/2024/deltanet-1/
+  - Part 2: https://sustcsonglin.github.io/blog/2024/deltanet-2/
+  - Part 3: https://sustcsonglin.github.io/blog/2024/deltanet-3/
+- Qwen 3.5 integration analysis: https://gist.github.com/justinchuby/0213aa253664fb72e9adb0089816de15
+- Educational implementation: https://github.com/rasbt/LLMs-from-scratch/blob/main/ch04/08_deltanet/
+- Qwen 3.5 Triton reference: https://github.com/RightNow-AI/qwen3.5-triton
+
+---
+
+#### Step C7: Multi-Token Prediction (MTP)
+
+**What:** Train the model to predict not just the next token, but the next K tokens
+simultaneously (K=4). At inference, use the extra prediction heads for self-speculative
+decoding (2-4x throughput without a separate draft model).
+
+**Why:** 12-17% better code generation quality (Meta's results). Free 2-4x inference
+speedup via self-speculative decode. Used by Qwen 3.5 and DeepSeek-V3.
+
+**Training objective:**
+```
+L_total = L_1 + λ₂·L_2 + λ₃·L_3 + λ₄·L_4
+
+where L_k = cross_entropy(head_k(h), target_{t+k})
+
+head_1: standard output projection (shared with embedding if tied)
+head_2, head_3, head_4: additional linear projections (d_model → vocab_size)
+```
+
+Each head shares the same transformer trunk but has its own output projection.
+λ values typically 1.0 (equal weighting) or decaying (0.5, 0.25 for further tokens).
+
+**Extra parameters:** 3 additional output projections = 3 × d_model × vocab_size.
+With d=1024 and vocab=32K: 3 × 33M = 99M extra params. These are only used during
+training and optionally during inference for speculative decode.
+
+**Inference (self-speculative decode):**
+```
+1. Run transformer trunk once
+2. head_1 predicts token t+1, head_2 predicts t+2, head_3 predicts t+3, head_4 predicts t+4
+3. Feed t+1 through the model to verify
+4. If model's next-token prediction matches head_2's prediction, accept t+2
+5. Continue accepting until a mismatch → standard decode from there
+6. Acceptance rate is typically 60-80%, giving 2-3x throughput
+```
+
+**Changes needed:**
+- `model.py`: add 3 extra output projection matrices
+- `train.py`: compute 4 losses (shifted targets), sum them
+- `generate.py`: add MTP speculative decode mode
+- Decode kernels: add output heads (4 vocab projections instead of 1 per step)
+- No change to transformer trunk or attention layers
+
+**Implementation reference:**
+- Meta paper: "Better & Faster LLMs via Multi-token Prediction" (arXiv:2404.19737)
+- DeepSeek-V3 MTP: https://arxiv.org/abs/2412.19437
+
+---
+
+#### Step C8: Training speed optimizations
+
+**What:** Maximize tokens/second during training.
+
+**Changes:**
+1. **Re-enable Triton GEMM** — remove `XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"`
+   from train.py. This was disabled early on but modern JAX+Triton is stable. +10-15%.
+
+2. **Remove gradient checkpointing if VRAM allows** — `jax.checkpoint()` recomputes
+   the forward pass during backprop, saving memory but costing ~20% throughput. With
+   tied embeddings (-32M params) and no biases, VRAM may fit without it. Test first.
+
+3. **Prefetch batches to GPU** — current code creates `jnp.array()` inside the training
+   loop (host→device transfer per step). Use a prefetch buffer or `jax.device_put()`
+   ahead of time.
+
+4. **Sequence length curriculum** — start training with shorter sequences (ctx=128),
+   gradually increase to ctx=512. Recent research shows 6x training acceleration.
+   Reference: "Dataset Decomposition" (arXiv:2405.13226).
+
+**Expected improvement:** 36K → 50-55K tok/s combined.
+
+---
+
+#### Implementation order
+
+1. **C1-C4** (RMSNorm + RoPE + SwiGLU + no bias + tied emb): Do together as one
+   architecture update. These are straightforward changes to model.py and all kernels.
+   Train a small test model to verify correctness before scaling up.
+
+2. **C5** (24 layers): Adjust dimensions, verify VRAM fits, train test model.
+
+3. **C8** (training speed): Apply before the big training run.
+
+4. **C6** (DeltaNet): This is the big one. Implement DeltaNet layer in model.py first
+   (JAX-only, no Triton). Verify training works. Then write fused Triton kernels.
+   The FLA library and NVLabs repo have reference Triton kernels to study.
+
+5. **C7** (MTP): Add after DeltaNet is working. Straightforward loss modification +
+   extra output heads.
+
+6. **Train on 10-20B tokens** (3-5 days on RTX 4080 Super at ~50K tok/s).
+
+**Commit and push after every step. Don't batch changes.**
+
+---
+
 ### COMPLETED: Epoch 2 — Fresh data with more code (2026-04-04)
 
 Epoch 1: d=1024/l=16 (242M params) on 1.77B tokens, val_loss=3.04, ppl=20.91.
