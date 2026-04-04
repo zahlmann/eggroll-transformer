@@ -1,14 +1,16 @@
 """
 Multi-SM fused N-layer decode kernel with KV-split parallelism.
 
+Phase C architecture: RMSNorm, RoPE, SwiGLU, no biases, tied embeddings, GQA.
+
 Architecture:
   grid = (N_HEADS * KV_SPLITS,)  — multiple blocks per attention head
 
   Per layer:
-    Phase 1 (all blocks): LN1 + QKV proj + attention (split KV tiles) + O proj
-      → write normalized O-proj + online softmax state (m, l) to scratch buffer
+    Phase 1 (all blocks): RMSNorm1 + QKV proj + RoPE + attention (split KV) + O proj
+      → write O-proj + online softmax state (m, l) to scratch buffer
       → split barrier (counter + done flag on separate cache lines)
-    Phase 2 (all blocks): merge KV splits + reduce attention + residual + LN2 + FFN
+    Phase 2 (all blocks): merge KV splits + reduce attention + residual + RMSNorm2 + SwiGLU FFN
       → write FFN partial to scratch buffer → barrier
     Phase 3 (all blocks): reduce FFN + residual → h ready for next layer
 
@@ -27,16 +29,17 @@ import jax_triton as jt
 BLOCK_K      = tl.constexpr(16)
 KV_TILE      = tl.constexpr(64)
 OUTPUT_VTILE = tl.constexpr(32)
-PROJ_TILE    = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEAD > 64KB
+PROJ_TILE    = tl.constexpr(512)
 
 
 @triton.jit
 def _multi_sm_decode(
     # Inputs
-    token_emb_ptr, pos_emb_ptr,
+    token_emb_ptr,
     packed_w_ptr,
-    lnf_s_ptr, lnf_b_ptr,
+    lnf_s_ptr,
     output_proj_ptr,
+    cos_ptr, sin_ptr,
     token_id_ptr, pos_ptr,
     kv_in_ptr,
     workspace_ptr,
@@ -46,7 +49,7 @@ def _multi_sm_decode(
     next_token_ptr,
     # Config
     D_MODEL: tl.constexpr,
-    D_BLOCK: tl.constexpr,   # next power of 2 >= D_MODEL
+    D_BLOCK: tl.constexpr,
     D_HEAD: tl.constexpr,
     D_FF: tl.constexpr,
     N_HEADS: tl.constexpr,
@@ -79,21 +82,22 @@ def _multi_sm_decode(
     done_ptr = workspace_ptr + DONE_OFF
     argmax_ptr = workspace_ptr + ARGMAX_OFF
 
-    # ── Embedding ──
-    h = (tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
-       + tl.load(pos_emb_ptr + pos * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32))
+    # ── Embedding (no positional — RoPE applied in attention) ──
+    h = tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
 
     LAYER_W_SIZE: tl.constexpr = (
-        D_MODEL + D_MODEL +
-        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +
-        D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF * D_MODEL
+        D_MODEL +                                                                    # ln1 scale
+        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +  # qkvo
+        D_MODEL +                                                                    # ln2 scale
+        D_MODEL * D_FF + D_MODEL * D_FF + D_FF * D_MODEL                            # gate, up, down
     )
     LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
-    scale = 0.17677669529663689
+    scale = 1.0 / (D_HEAD ** 0.5)
     dh = tl.arange(0, D_HEAD)
     GQA_GROUP: tl.constexpr = N_HEADS // N_KV_HEADS
+    D_HALF: tl.constexpr = D_HEAD // 2
+    rope_lo = tl.arange(0, D_HALF)
 
     for layer in tl.range(N_LAYERS):
         w_base = layer * LAYER_W_SIZE
@@ -103,23 +107,20 @@ def _multi_sm_decode(
 
         off = w_base
         ln1_s_off = off;    off += D_MODEL
-        ln1_b_off = off;    off += D_MODEL
         wq_off = off;       off += D_MODEL * D_MODEL
         wk_off = off;       off += D_MODEL * D_KV
         wv_off = off;       off += D_MODEL * D_KV
         wo_off = off;       off += D_MODEL * D_MODEL
         ln2_s_off = off;    off += D_MODEL
-        ln2_b_off = off;    off += D_MODEL
+        gate_off = off;     off += D_MODEL * D_FF
         up_off = off;       off += D_MODEL * D_FF
-        down_off = off;     off += D_FF * D_MODEL
+        down_off = off
 
-        # ── PHASE 1: LN1 + Attention ──
+        # ── PHASE 1: RMSNorm1 + Attention ──
         ln_s = tl.load(packed_w_ptr + ln1_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln1_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        mean = tl.sum(h) / D_MODEL
-        hc = tl.where(d_mask, h - mean, 0.0)
+        h_sq = tl.where(d_mask, h * h, 0.0)
         h_norm = tl.where(d_mask,
-                          ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                          ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                           0.0)
 
         hd = head_id * D_HEAD + dh
@@ -127,10 +128,7 @@ def _multi_sm_decode(
         kv_hd = kv_head * D_HEAD + dh
         cache_off = kv_head * MAX_SEQ * D_HEAD
 
-        # Tile Q/K/V projections along D_BLOCK to fit in shared memory.
-        # At D_BLOCK=1024, D_HEAD=64: full (1024,64) bf16 = 128KB > 101KB smem.
-        # PROJ_TILE=512: (512,64) bf16 = 64KB, fits.
-        # Store h_norm to workspace so we can reload per tile.
+        # Store h_norm for tiled projections
         tl.store(partial_ptr + pid * D_BLOCK + d, h_norm, mask=d_mask)
 
         Q = tl.zeros((D_HEAD,), dtype=tl.float32)
@@ -151,9 +149,32 @@ def _multi_sm_decode(
                            mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
             V_new += tl.dot(h_tile[None, :], wv_t).to(tl.float32).sum(axis=0)
 
+        # ── RoPE on Q and K_new via scratch buffer ──
+        cos_val = tl.load(cos_ptr + pos * D_HALF + rope_lo).to(tl.float32)
+        sin_val = tl.load(sin_ptr + pos * D_HALF + rope_lo).to(tl.float32)
+
+        scratch = partial_ptr + pid * D_BLOCK
+        # Rotate Q
+        tl.store(scratch + dh, Q)
+        q_lo = tl.load(scratch + rope_lo)
+        q_hi = tl.load(scratch + D_HALF + rope_lo)
+        tl.store(scratch + rope_lo, q_lo * cos_val - q_hi * sin_val)
+        tl.store(scratch + D_HALF + rope_lo, q_lo * sin_val + q_hi * cos_val)
+        Q = tl.load(scratch + dh)
+
+        # Rotate K_new
+        tl.store(scratch + dh, K_new)
+        k_lo = tl.load(scratch + rope_lo)
+        k_hi = tl.load(scratch + D_HALF + rope_lo)
+        tl.store(scratch + rope_lo, k_lo * cos_val - k_hi * sin_val)
+        tl.store(scratch + D_HALF + rope_lo, k_lo * sin_val + k_hi * cos_val)
+        K_new = tl.load(scratch + dh)
+
+        # Store K_new (with RoPE) and V_new to output cache
         tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
         tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
 
+        # ── Split KV attention with online softmax ──
         m_i = tl.full((1,), value=-1e9, dtype=tl.float32)
         l_i = tl.zeros((1,), dtype=tl.float32)
         o_i = tl.zeros((D_HEAD,), dtype=tl.float32)
@@ -192,7 +213,7 @@ def _multi_sm_decode(
 
         attn_out = o_i / tl.maximum(l_i, 1e-10)
 
-        # Tile O projection along D_BLOCK (same shared memory constraint as Q/K/V)
+        # Tile O projection along D_BLOCK
         for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
             dt = dd + tl.arange(0, PROJ_TILE)
             dt_mask = dt < D_MODEL
@@ -203,7 +224,7 @@ def _multi_sm_decode(
         tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
         tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 
-        # Split barrier: counter and done flag on separate cache lines
+        # Split barrier
         b0 = layer * 2
         old_cnt = tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
         if old_cnt >= TOTAL_BLOCKS - 1:
@@ -212,7 +233,7 @@ def _multi_sm_decode(
         while tl.atomic_add(done_ptr + b0, 0.0, sem='acquire', scope='gpu') < 1.0:
             pass
 
-        # ── PHASE 2: Merge attention + LN2 + FFN ──
+        # ── PHASE 2: Merge attention + RMSNorm2 + SwiGLU FFN ──
         attn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
         for head in tl.range(N_HEADS):
             m_max_val = tl.full((), -1e9, dtype=tl.float32)
@@ -231,25 +252,33 @@ def _multi_sm_decode(
             attn_total = attn_total + o_merged / l_total
         h = h + attn_total
 
+        # RMSNorm2
         ln_s = tl.load(packed_w_ptr + ln2_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln2_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        mean = tl.sum(h) / D_MODEL
-        hc = tl.where(d_mask, h - mean, 0.0)
+        h_sq = tl.where(d_mask, h * h, 0.0)
         h_norm = tl.where(d_mask,
-                          ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                          ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                           0.0)
         h_norm_2d = h_norm[None, :].to(tl.bfloat16)
 
+        # SwiGLU FFN (distributed across blocks)
         ff_start = pid * FF_PER_BLOCK
         ffn_partial = tl.zeros((D_BLOCK,), dtype=tl.float32)
         for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
             kk = ff_start + k + tl.arange(0, BLOCK_K)
+            ff_mask = kk < D_FF
+            # Gate projection
+            gate_w = tl.load(packed_w_ptr + gate_off + d[:, None] * D_FF + kk[None, :],
+                             mask=d_mask[:, None] & ff_mask[None, :], other=0.0).to(tl.bfloat16)
+            gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
+            # Up projection
             up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
-                           mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+                           mask=d_mask[:, None] & ff_mask[None, :], other=0.0).to(tl.bfloat16)
             up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-            act = up * tl.sigmoid(1.702 * up)
+            # SwiGLU: SiLU(gate) * up
+            act = (gate * tl.sigmoid(gate)) * up
+            # Down projection
             down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
-                             mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
+                             mask=ff_mask[:, None] & d_mask[None, :], other=0.0).to(tl.bfloat16)
             ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
         tl.store(partial_ptr + pid * D_BLOCK + d, ffn_partial, mask=d_mask)
@@ -268,13 +297,11 @@ def _multi_sm_decode(
             ffn_total += tl.load(partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
         h = h + ffn_total
 
-    # ── OUTPUT ──
+    # ── OUTPUT: final RMSNorm + tied output projection ──
     ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
-    ln_b = tl.load(lnf_b_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
-    mean = tl.sum(h) / D_MODEL
-    hc = tl.where(d_mask, h - mean, 0.0)
+    h_sq = tl.where(d_mask, h * h, 0.0)
     h_final = tl.where(d_mask,
-                       ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                       ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                        0.0)
     h_final_2d = h_final[None, :].to(tl.bfloat16)
 
@@ -318,15 +345,7 @@ def _multi_sm_decode(
         tl.store(next_token_ptr, global_best_idx.to(tl.int32))
 
 
-# NOTE: An in-kernel paged KV variant (_multi_sm_decode_paged) was tried
-# but the Triton compiler generated 2.5x slower code with indirect page table
-# addressing. The GPU-accelerated paging approach in paged_kv.py (JIT-compiled
-# gather/scatter) is used instead — it keeps the fast contiguous decode kernel
-# unchanged and adds only ~0.4ms overhead per step.
-
-
 def _next_power_of_2(n):
-    """Return smallest power of 2 >= n."""
     p = 1
     while p < n:
         p *= 2
@@ -344,28 +363,32 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
     n_kv_heads = config.get("n_kv_heads", n_heads)
     d_kv = n_kv_heads * d_head
     n_layers = config["n_layers"]
-    d_ff = 4 * d_model
+    d_ff = config["d_ff"]
     max_seq = config["context_len"]
     vocab_pad = w["vocab_pad"]
     total_kv_size = n_layers * 2 * n_kv_heads * max_seq * d_head
     total_blocks = n_heads * kv_splits
-    ff_per_block = d_ff // total_blocks
 
-    # Workspace: partials | attn_ml | barriers | done_flags | argmax
-    # Partials use D_BLOCK stride for power-of-2 alignment
+    # FF_PER_BLOCK: ceiling division, padded to BLOCK_K for clean loop
+    block_k = 16
+    raw_ff = (d_ff + total_blocks - 1) // total_blocks
+    ff_per_block = ((raw_ff + block_k - 1) // block_k) * block_k
+
+    # Workspace layout
     attn_ml_off = total_blocks * d_block
     barrier_off = attn_ml_off + total_blocks * 2
-    done_off = barrier_off + 32   # separate cache line
+    done_off = barrier_off + 32
     argmax_off = done_off + 32
     workspace_size = argmax_off + 2 * total_blocks
 
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
 
     logits_pad, kv_out, next_token = jt.triton_call(
-        w["token_emb"], w["pos_emb"],
+        w["token_emb"],
         w["packed_w"],
-        w["lnf_s"], w["lnf_b"],
+        w["lnf_s"],
         w["output_proj_padded"],
+        w["cos"], w["sin"],
         jnp.int32(token_id), jnp.int32(pos),
         kv_packed,
         workspace,

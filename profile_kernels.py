@@ -212,26 +212,25 @@ def compute_memory_stats(config, vocab_size):
     n_layers = config["n_layers"]
     d_head = config["d_head"]
     d_kv = n_kv_heads * d_head
-    d_ff = 4 * d
+    d_ff = config.get("d_ff", 4 * d)
     ctx = config["context_len"]
 
-    # Weight buffer (bf16) — Q/O use d_model, K/V use d_kv (GQA)
+    # Weight buffer (bf16) — Phase C: RMSNorm (scale only), SwiGLU (3 FFN matrices), tied emb
     per_layer = (
-        d + d +             # ln1 scale, bias
+        d +                 # ln1 scale (RMSNorm, no bias)
         d * d +             # Q
         d * d_kv +          # K (GQA: smaller)
         d * d_kv +          # V (GQA: smaller)
         d * d +             # O
-        d + d +             # ln2 scale, bias
+        d +                 # ln2 scale (RMSNorm, no bias)
+        d * d_ff +          # ffn gate (SwiGLU)
         d * d_ff +          # ffn up
         d_ff * d            # ffn down
     )
     total_weights = (
-        config["vocab_size"] * d +   # token_emb
-        ctx * d +                     # pos_emb
+        config["vocab_size"] * d +   # token_emb (also output proj via tying)
         n_layers * per_layer +        # layers
-        d + d +                       # ln_final
-        d * vocab_size                # output_proj
+        d                             # ln_final scale
     )
     weight_bytes = total_weights * 2  # bf16
 

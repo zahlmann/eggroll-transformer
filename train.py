@@ -40,6 +40,8 @@ def main():
     parser.add_argument("--bpe-vocab", type=int, default=4096)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to weights.pkl checkpoint to resume from")
+    parser.add_argument("--d-ff", type=int, default=None,
+                        help="FFN hidden dim (default: auto from SwiGLU formula)")
     args = parser.parse_args()
 
     # data
@@ -69,6 +71,19 @@ def main():
         params, config = init_transformer(
             init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
             n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads)
+        if args.d_ff is not None:
+            # override auto-computed d_ff
+            from model import _swiglu_d_ff
+            old_d_ff = config["d_ff"]
+            config["d_ff"] = args.d_ff
+            # reinit FFN weights with new d_ff if different
+            if args.d_ff != old_d_ff:
+                for layer in range(args.n_layers):
+                    p = f"layer{layer}"
+                    key, k1, k2, k3 = jax.random.split(key, 4)
+                    params[f"{p}.ffn.gate"] = jax.random.normal(k1, (args.d_model, args.d_ff)) * (args.d_model ** -0.5)
+                    params[f"{p}.ffn.up"] = jax.random.normal(k2, (args.d_model, args.d_ff)) * (args.d_model ** -0.5)
+                    params[f"{p}.ffn.down"] = jax.random.normal(k3, (args.d_ff, args.d_model)) * (args.d_ff ** -0.5)
 
     # optimizer: linear warmup + cosine decay
     schedule = optax.join_schedules(

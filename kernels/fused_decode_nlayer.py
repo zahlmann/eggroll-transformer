@@ -1,28 +1,23 @@
 """
 Fully fused N-layer decode kernel: embedding → N layers → output in ONE launch.
 
-Generalizes fused_decode_2layer.py to any number of layers. Uses a packed weight
-buffer and packed KV caches to avoid passing 50+ individual pointers.
-
-With M=1 (single token decode), register pressure is trivial (~35KB peak)
-regardless of d_model or n_layers. The kernel processes layers sequentially,
-loading each layer's weights from the packed buffer.
+Phase C architecture: RMSNorm, RoPE, SwiGLU, no biases, tied embeddings, GQA.
 
 Weight packing layout (all bf16):
-  Per layer (10 tensors):
+  Per layer:
     ln1_scale:  D_MODEL
-    ln1_bias:   D_MODEL
     wq:         D_MODEL * D_MODEL
-    wk:         D_MODEL * D_MODEL
-    wv:         D_MODEL * D_MODEL
+    wk:         D_MODEL * D_KV
+    wv:         D_MODEL * D_KV
     wo:         D_MODEL * D_MODEL
     ln2_scale:  D_MODEL
-    ln2_bias:   D_MODEL
+    ffn_gate:   D_MODEL * D_FF
     ffn_up:     D_MODEL * D_FF
     ffn_down:   D_FF * D_MODEL
 
 KV cache packing: all layers concatenated.
-  Per layer: k_cache (N_HEADS * MAX_SEQ * D_HEAD) + v_cache (same)
+  Per layer: k_cache (N_KV_HEADS * MAX_SEQ * D_HEAD) + v_cache (same)
+  Note: K values in cache have RoPE already applied.
 """
 
 import triton
@@ -31,22 +26,26 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
+from model import precompute_rope_table
+
 BLOCK_K      = tl.constexpr(32)
 VOCAB_TILE   = tl.constexpr(128)
 KV_TILE      = tl.constexpr(64)
-# Smaller output tile for large D_MODEL to avoid (D_MODEL, VOCAB_TILE) intermediate overflow
 OUTPUT_VTILE = tl.constexpr(32)
 
 
 @triton.jit
 def _fused_decode_nlayer(
     # Embedding weights
-    token_emb_ptr, pos_emb_ptr,
+    token_emb_ptr,
     # Packed per-layer weights (all layers concatenated, bf16)
     packed_w_ptr,
-    # Final LN + output
-    lnf_s_ptr, lnf_b_ptr,
+    # Final RMSNorm scale
+    lnf_s_ptr,
+    # Output projection (tied: token_emb.T, padded)
     output_proj_ptr,
+    # RoPE tables
+    cos_ptr, sin_ptr,
     # Decode inputs
     token_id_ptr, pos_ptr,
     # Packed KV caches: all layers concatenated (bf16)
@@ -59,6 +58,8 @@ def _fused_decode_nlayer(
     D_HEAD: tl.constexpr,
     D_FF: tl.constexpr,
     N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    D_KV: tl.constexpr,
     N_LAYERS: tl.constexpr,
     MAX_SEQ: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
@@ -68,71 +69,93 @@ def _fused_decode_nlayer(
     token_id = tl.load(token_id_ptr)
     pos = tl.load(pos_ptr)
 
-    # ── Embedding ──
-    h = (tl.load(token_emb_ptr + token_id * D_MODEL + d).to(tl.float32)
-       + tl.load(pos_emb_ptr + pos * D_MODEL + d).to(tl.float32))
+    # ── Embedding (no positional — RoPE is applied in attention) ──
+    h = tl.load(token_emb_ptr + token_id * D_MODEL + d).to(tl.float32)
 
     # Per-layer weight size in elements (bf16)
     LAYER_W_SIZE: tl.constexpr = (
-        D_MODEL + D_MODEL +                      # ln1 scale, bias
-        4 * D_MODEL * D_MODEL +                   # wq, wk, wv, wo
-        D_MODEL + D_MODEL +                       # ln2 scale, bias
-        D_MODEL * D_FF +                          # ffn_up
-        D_FF * D_MODEL                            # ffn_down
+        D_MODEL +                                                        # ln1 scale
+        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +  # qkvo
+        D_MODEL +                                                        # ln2 scale
+        D_MODEL * D_FF + D_MODEL * D_FF + D_FF * D_MODEL                # gate, up, down
     )
 
     # Per-layer KV cache size in elements (bf16)
-    LAYER_KV_SIZE: tl.constexpr = 2 * N_HEADS * MAX_SEQ * D_HEAD
+    LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
-    scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
+    scale = 1.0 / (D_HEAD ** 0.5)
     dh = tl.arange(0, D_HEAD)
+    D_HALF: tl.constexpr = D_HEAD // 2
+    dh_lo = tl.arange(0, D_HALF)
+    dh_hi = D_HALF + tl.arange(0, D_HALF)
+    GQA_GROUP: tl.constexpr = N_HEADS // N_KV_HEADS
 
     for layer in tl.static_range(N_LAYERS):
         w_base = layer * LAYER_W_SIZE
         kv_base = layer * LAYER_KV_SIZE
         kc_base = kv_base
-        vc_base = kv_base + N_HEADS * MAX_SEQ * D_HEAD
+        vc_base = kv_base + N_KV_HEADS * MAX_SEQ * D_HEAD
 
         # Weight offsets within this layer
         off = w_base
-        ln1_s_off = off;          off += D_MODEL
-        ln1_b_off = off;          off += D_MODEL
-        wq_off = off;             off += D_MODEL * D_MODEL
-        wk_off = off;             off += D_MODEL * D_MODEL
-        wv_off = off;             off += D_MODEL * D_MODEL
-        wo_off = off;             off += D_MODEL * D_MODEL
-        ln2_s_off = off;          off += D_MODEL
-        ln2_b_off = off;          off += D_MODEL
-        up_off = off;             off += D_MODEL * D_FF
+        ln1_s_off = off;    off += D_MODEL
+        wq_off = off;       off += D_MODEL * D_MODEL
+        wk_off = off;       off += D_MODEL * D_KV
+        wv_off = off;       off += D_MODEL * D_KV
+        wo_off = off;       off += D_MODEL * D_MODEL
+        ln2_s_off = off;    off += D_MODEL
+        gate_off = off;     off += D_MODEL * D_FF
+        up_off = off;       off += D_MODEL * D_FF
         down_off = off
 
-        # ── LN1 ──
+        # ── RMSNorm 1 ──
         ln_s = tl.load(packed_w_ptr + ln1_s_off + d).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln1_b_off + d).to(tl.float32)
-        mean = tl.sum(h) / D_MODEL
-        hc = h - mean
-        h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+        h_norm = ln_s * h * tl.math.rsqrt(tl.sum(h * h) / D_MODEL + 1e-5)
 
-        # ── Attention (tiled KV with online softmax) ──
-        # Use tl.dot for projections: (1, D_MODEL) @ (D_MODEL, D_HEAD) avoids
-        # materializing (D_MODEL, D_HEAD) intermediate that overflows registers at d=512.
+        # ── Attention with RoPE and GQA ──
         attn_accum = tl.zeros((D_MODEL,), dtype=tl.float32)
-        h_norm_2d = h_norm[None, :].to(tl.bfloat16)  # (1, D_MODEL) bf16
+        h_norm_2d = h_norm[None, :].to(tl.bfloat16)
+
+        # Load RoPE cos/sin for current position
+        cos_val = tl.load(cos_ptr + pos * D_HALF + dh_lo).to(tl.float32)
+        sin_val = tl.load(sin_ptr + pos * D_HALF + dh_lo).to(tl.float32)
 
         for head in tl.range(N_HEADS):
-            hd = head * D_HEAD + dh
-            cache_off = head * MAX_SEQ * D_HEAD
+            kv_head = head // GQA_GROUP
+            hd_lo = head * D_HEAD + dh_lo
+            hd_hi = head * D_HEAD + dh_hi
+            kv_hd_lo = kv_head * D_HEAD + dh_lo
+            kv_hd_hi = kv_head * D_HEAD + dh_hi
+            cache_off = kv_head * MAX_SEQ * D_HEAD
 
-            # Q/K/V projections via tl.dot: (1, D_MODEL) @ (D_MODEL, D_HEAD) → (1, D_HEAD)
-            wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
-            Q = tl.dot(h_norm_2d, wq).to(tl.float32).sum(axis=0)  # (D_HEAD,)
-            wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
-            K_new = tl.dot(h_norm_2d, wk).to(tl.float32).sum(axis=0)
-            wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+            # Q projection in two halves for RoPE
+            wq_lo = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd_lo[None, :]).to(tl.bfloat16)
+            q_lo = tl.dot(h_norm_2d, wq_lo).to(tl.float32).sum(axis=0)
+            wq_hi = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd_hi[None, :]).to(tl.bfloat16)
+            q_hi = tl.dot(h_norm_2d, wq_hi).to(tl.float32).sum(axis=0)
+
+            # RoPE on Q
+            Q_lo = q_lo * cos_val - q_hi * sin_val
+            Q_hi = q_lo * sin_val + q_hi * cos_val
+
+            # K projection in two halves for RoPE
+            wk_lo = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd_lo[None, :]).to(tl.bfloat16)
+            k_lo = tl.dot(h_norm_2d, wk_lo).to(tl.float32).sum(axis=0)
+            wk_hi = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd_hi[None, :]).to(tl.bfloat16)
+            k_hi = tl.dot(h_norm_2d, wk_hi).to(tl.float32).sum(axis=0)
+
+            # RoPE on K_new
+            K_new_lo = k_lo * cos_val - k_hi * sin_val
+            K_new_hi = k_lo * sin_val + k_hi * cos_val
+
+            # V projection (no RoPE)
+            kv_hd = kv_head * D_HEAD + dh
+            wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :]).to(tl.bfloat16)
             V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)
 
-            # Write new K/V to output cache
-            tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
+            # Store K_new (with RoPE) and V_new to output cache
+            tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh_lo, K_new_lo.to(tl.bfloat16))
+            tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh_hi, K_new_hi.to(tl.bfloat16))
             tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
 
             # Online softmax over tiled KV cache
@@ -144,19 +167,28 @@ def _fused_decode_nlayer(
                 tile_pos = t + tl.arange(0, KV_TILE)
                 tile_mask = tile_pos <= pos
 
-                K_tile = tl.load(kv_in_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
-                                mask=tile_mask[:, None], other=0.0).to(tl.float32)
-                K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
-                tl.store(kv_out_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
-                        K_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+                # Load K tile in two halves (RoPE already applied in cache)
+                K_tile_lo = tl.load(kv_in_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh_lo[None, :],
+                                   mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                K_tile_hi = tl.load(kv_in_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh_hi[None, :],
+                                   mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                K_tile_lo = tl.where(tile_pos[:, None] == pos, K_new_lo[None, :], K_tile_lo)
+                K_tile_hi = tl.where(tile_pos[:, None] == pos, K_new_hi[None, :], K_tile_hi)
+                tl.store(kv_out_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh_lo[None, :],
+                        K_tile_lo.to(tl.bfloat16), mask=tile_mask[:, None])
+                tl.store(kv_out_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh_hi[None, :],
+                        K_tile_hi.to(tl.bfloat16), mask=tile_mask[:, None])
 
+                # V tile (full D_HEAD)
                 V_tile = tl.load(kv_in_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
                                 mask=tile_mask[:, None], other=0.0).to(tl.float32)
                 V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
                 tl.store(kv_out_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
                         V_tile.to(tl.bfloat16), mask=tile_mask[:, None])
 
-                s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
+                # Score = Q_lo · K_lo + Q_hi · K_hi
+                s = (tl.sum(Q_lo[None, :] * K_tile_lo, axis=1)
+                   + tl.sum(Q_hi[None, :] * K_tile_hi, axis=1)) * scale
                 s = tl.where(tile_mask, s, -1e9)
 
                 m_ij = tl.max(s)
@@ -167,43 +199,43 @@ def _fused_decode_nlayer(
                 o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)
                 m_i = m_new
 
-            attn_out = o_i / l_i  # (D_HEAD,)
+            attn_out = o_i / l_i
 
-            # O projection via tl.dot: (1, D_HEAD) @ (D_HEAD, D_MODEL) → (1, D_MODEL)
+            # O projection
+            hd = head * D_HEAD + dh
             wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
             attn_accum += tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
 
         h = h + attn_accum
 
-        # ── LN2 + FFN (also use tl.dot for projections) ──
+        # ── RMSNorm 2 + SwiGLU FFN ──
         ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
-        mean = tl.sum(h) / D_MODEL
-        hc = h - mean
-        h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+        h_norm = ln_s * h * tl.math.rsqrt(tl.sum(h * h) / D_MODEL + 1e-5)
         h_norm_2d = h_norm[None, :].to(tl.bfloat16)
 
         ffn_accum = tl.zeros((D_MODEL,), dtype=tl.float32)
         for k in tl.range(0, D_FF, BLOCK_K):
             kk = k + tl.arange(0, BLOCK_K)
+            # Gate projection
+            gate_w = tl.load(packed_w_ptr + gate_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+            gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
+            # Up projection
             up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
-            up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)  # (BLOCK_K,)
-            act = up * tl.sigmoid(1.702 * up)
+            up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
+            # SwiGLU: SiLU(gate) * up
+            act = (gate * tl.sigmoid(gate)) * up
+            # Down projection
             down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
             ffn_accum += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
         h = h + ffn_accum
 
     # ════════════════════════════════════════════
-    # OUTPUT
+    # OUTPUT: final RMSNorm + tied output projection
     # ════════════════════════════════════════════
 
     ln_s = tl.load(lnf_s_ptr + d).to(tl.float32)
-    ln_b = tl.load(lnf_b_ptr + d).to(tl.float32)
-    mean = tl.sum(h) / D_MODEL
-    hc = h - mean
-    h_final = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+    h_final = ln_s * h * tl.math.rsqrt(tl.sum(h * h) / D_MODEL + 1e-5)
 
-    # Output via tl.dot: (1, D_MODEL) @ (D_MODEL, OUTPUT_VTILE) → (1, OUTPUT_VTILE)
     h_final_2d = h_final[None, :].to(tl.bfloat16)
     for v_start in tl.range(0, VOCAB_PAD, OUTPUT_VTILE):
         vv = v_start + tl.arange(0, OUTPUT_VTILE)
@@ -216,34 +248,32 @@ def _fused_decode_nlayer(
 # ──────────────────────────────────────────────────────────────────────
 
 def pack_weights(params, config):
-    """Pack per-layer weights into a single bf16 buffer."""
-    n_layers = config["n_layers"]
-    d_model = config["d_model"]
-    d_ff = 4 * d_model
+    """Pack per-layer weights into a single bf16 buffer.
 
+    Layout per layer: ln1_s, wq, wk, wv, wo, ln2_s, gate, up, down
+    """
+    n_layers = config["n_layers"]
     layer_tensors = []
     for i in range(n_layers):
         p = f"layer{i}"
         layer_tensors.extend([
             params[f"{p}.ln1.scale"].reshape(-1),
-            params[f"{p}.ln1.bias"].reshape(-1),
             params[f"{p}.attn.q"].reshape(-1),
             params[f"{p}.attn.k"].reshape(-1),
             params[f"{p}.attn.v"].reshape(-1),
             params[f"{p}.attn.o"].reshape(-1),
             params[f"{p}.ln2.scale"].reshape(-1),
-            params[f"{p}.ln2.bias"].reshape(-1),
+            params[f"{p}.ffn.gate"].reshape(-1),
             params[f"{p}.ffn.up"].reshape(-1),
             params[f"{p}.ffn.down"].reshape(-1),
         ])
-
     return jnp.concatenate(layer_tensors).astype(jnp.bfloat16)
 
 
 def pack_kv_caches(k_caches, v_caches):
     """Pack per-layer KV caches into a single bf16 buffer.
 
-    Input: k_caches[i] shape (n_heads, max_seq, d_head) bf16
+    Input: k_caches[i] shape (n_kv_heads, max_seq, d_head) bf16
     Output: flat buffer with layout [layer0_k, layer0_v, layer1_k, layer1_v, ...]
     """
     parts = []
@@ -253,36 +283,39 @@ def pack_kv_caches(k_caches, v_caches):
     return jnp.concatenate(parts)
 
 
-def unpack_kv_caches(packed, n_layers, n_heads, max_seq, d_head):
+def unpack_kv_caches(packed, n_layers, n_kv_heads, max_seq, d_head):
     """Unpack flat KV buffer back to per-layer caches."""
-    layer_kv_size = 2 * n_heads * max_seq * d_head
-    cache_size = n_heads * max_seq * d_head
+    layer_kv_size = 2 * n_kv_heads * max_seq * d_head
+    cache_size = n_kv_heads * max_seq * d_head
     k_caches = []
     v_caches = []
     for i in range(n_layers):
         base = i * layer_kv_size
-        k_caches.append(packed[base:base + cache_size].reshape(n_heads, max_seq, d_head))
-        v_caches.append(packed[base + cache_size:base + layer_kv_size].reshape(n_heads, max_seq, d_head))
+        k_caches.append(packed[base:base + cache_size].reshape(n_kv_heads, max_seq, d_head))
+        v_caches.append(packed[base + cache_size:base + layer_kv_size].reshape(n_kv_heads, max_seq, d_head))
     return k_caches, v_caches
 
 
 def prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=2):
-    """Precompute packed weights, bf16 embeddings, padded output proj."""
-    # vocab_pad must be divisible by OUTPUT_VTILE * TOTAL_BLOCKS for tiled output projection.
-    # TOTAL_BLOCKS = n_heads * kv_splits, OUTPUT_VTILE = 32.
+    """Precompute packed weights, bf16 embeddings, RoPE tables, tied output proj."""
     n_heads = config["n_heads"]
+    d_head = config["d_head"]
     output_vtile = 32
     total_blocks = n_heads * kv_splits
-    align = output_vtile * total_blocks  # e.g., 32*32=1024 for d=512, 32*48=1536 for d=768
+    align = output_vtile * total_blocks
     vocab_pad = ((vocab_size + align - 1) // align) * align
     pad_v = vocab_pad - vocab_size
+
+    cos, sin = precompute_rope_table(config["context_len"], d_head)
+
+    emb_T = params["token_emb"].T  # (d_model, vocab) — tied output projection
     return {
         "token_emb": params["token_emb"].astype(jnp.bfloat16),
-        "pos_emb": params["pos_emb"].astype(jnp.bfloat16),
         "packed_w": pack_weights(params, config),
         "lnf_s": params["ln_final.scale"].astype(jnp.bfloat16),
-        "lnf_b": params["ln_final.bias"].astype(jnp.bfloat16),
-        "output_proj_padded": jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16),
+        "cos": cos.astype(jnp.bfloat16),
+        "sin": sin.astype(jnp.bfloat16),
+        "output_proj_padded": jnp.pad(emb_T, [(0, 0), (0, pad_v)]).astype(jnp.bfloat16),
         "vocab_pad": vocab_pad,
     }
 
@@ -306,17 +339,20 @@ def fused_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
     d_model = config["d_model"]
     d_head = config["d_head"]
     n_heads = config["n_heads"]
+    n_kv_heads = config.get("n_kv_heads", n_heads)
+    d_kv = n_kv_heads * d_head
     n_layers = config["n_layers"]
-    d_ff = 4 * d_model
+    d_ff = config["d_ff"]
     max_seq = config["context_len"]
     vocab_pad = w["vocab_pad"]
-    total_kv_size = n_layers * 2 * n_heads * max_seq * d_head
+    total_kv_size = n_layers * 2 * n_kv_heads * max_seq * d_head
 
     logits_pad, kv_out = jt.triton_call(
-        w["token_emb"], w["pos_emb"],
+        w["token_emb"],
         w["packed_w"],
-        w["lnf_s"], w["lnf_b"],
+        w["lnf_s"],
         w["output_proj_padded"],
+        w["cos"], w["sin"],
         jnp.int32(token_id), jnp.int32(pos),
         kv_packed,
         kernel=_fused_decode_nlayer,
@@ -327,7 +363,8 @@ def fused_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
         grid=(1,),
         num_warps=4, num_stages=1,
         D_MODEL=d_model, D_HEAD=d_head, D_FF=d_ff,
-        N_HEADS=n_heads, N_LAYERS=n_layers, MAX_SEQ=max_seq,
+        N_HEADS=n_heads, N_KV_HEADS=n_kv_heads, D_KV=d_kv,
+        N_LAYERS=n_layers, MAX_SEQ=max_seq,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
     )
 
