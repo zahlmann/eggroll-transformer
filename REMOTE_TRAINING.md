@@ -35,16 +35,13 @@ Stored as `data/tokens_v2/train.bin` (flat int32 binary, memory-mapped) + `data/
 
 ## Setup
 
-```bash
-# 1. Clone the repo
-git clone https://github.com/zahlmann/transformer.git
-cd transformer
+The repo is already cloned. You're running inside it.
 
-# 2. Install dependencies (uses uv)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+```bash
+# 1. Install dependencies (uses uv — should already be available)
 uv sync
 
-# 3. Download and prepare all training data
+# 2. Download and prepare all training data
 # This downloads from HuggingFace, tokenizes everything, and combines.
 # Takes 1-2 hours depending on network speed. Needs ~50GB disk, ~16GB RAM.
 # Downloads: FineWeb-Edu, Wikipedia, Cosmopedia, StarCoder, OpenWebMath
