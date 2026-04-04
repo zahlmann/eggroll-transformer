@@ -1094,6 +1094,46 @@ training and optionally during inference for speculative decode.
 
 ---
 
+### COMPLETED: Phase C Architecture Redesign (2026-04-04)
+
+All steps C1-C7 implemented and verified.
+
+**C1-C4 (RMSNorm, RoPE, SwiGLU, no biases, tied embeddings):**
+- Updated model.py and all 8 Triton kernel files
+- JAX vs Triton prefill: max logit diff 0.013 (bf16 precision)
+- Training verified: loss converges normally
+
+**C5 (24 layers):**
+- 294M params (was 242M at 16L), 10.6GB VRAM at bs=16
+- tl.range for layer loops (avoids slow compilation with tl.static_range at 24L)
+
+**C6 (Gated DeltaNet):**
+- Hybrid architecture: 75% DeltaNet + 25% attention (pattern: D,D,D,A,D,D,D,A,...)
+- 24 layers: 18 DeltaNet + 6 standard attention
+- Naive recurrent with chunked scan (64-step chunks, checkpointed between chunks)
+- Full unroll within chunks (unroll=64) → 1.85x speedup
+- Features: Mamba2-style decay gate, sigmoid beta, depthwise causal conv1d (kernel=4),
+  L2-normalized Q/K, output gating (RMSNorm * SiLU(gate))
+
+**C7 (MTP):** Not yet implemented (straightforward loss modification + extra output heads).
+
+**C8 (Training speed):**
+- Removed dead XLA triton_gemm flag (no effect)
+- Added batch prefetch in training loop
+- Triton GEMM and gradient checkpointing removal tested (no improvement / OOM)
+
+**Current training throughput (RTX 4080 Super, bs=16, ctx=512):**
+```
+Attention-only 16L: 19.3K tok/s, 6.3GB VRAM
+Attention-only 24L: 13.2K tok/s, 8.8GB VRAM
+Hybrid 16L (12D+4A): 12.9K tok/s, 7.5GB VRAM
+Hybrid 24L (18D+6A):  8.6K tok/s, 10.6GB VRAM
+```
+
+**Next:** Train hybrid 24L on data, write Triton DeltaNet decode kernel for inference.
+
+---
+
 ### COMPLETED: Epoch 2 — Fresh data with more code (2026-04-04)
 
 Epoch 1: d=1024/l=16 (242M params) on 1.77B tokens, val_loss=3.04, ppl=20.91.
