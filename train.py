@@ -41,6 +41,8 @@ def main():
                         help="Path to weights.pkl checkpoint to resume from")
     parser.add_argument("--d-ff", type=int, default=None,
                         help="FFN hidden dim (default: auto from SwiGLU formula)")
+    parser.add_argument("--use-deltanet", action="store_true",
+                        help="Use hybrid DeltaNet/attention architecture (75%% DeltaNet + 25%% attn)")
     args = parser.parse_args()
 
     # data
@@ -69,7 +71,8 @@ def main():
         key, init_key = jax.random.split(jax.random.key(args.seed))
         params, config = init_transformer(
             init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
-            n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads)
+            n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads,
+            use_deltanet=args.use_deltanet)
         if args.d_ff is not None:
             # override auto-computed d_ff
             from model import _swiglu_d_ff
@@ -108,8 +111,12 @@ def main():
         logits = transformer_forward_batch(params_bf16, config, x)
         return cross_entropy_loss(logits.astype(jnp.float32), y)
 
+    layer_types = config.get("layer_types", ["attn"] * args.n_layers)
+    n_delta = sum(1 for t in layer_types if t == "delta")
+    n_attn = sum(1 for t in layer_types if t == "attn")
     print(f"d={args.d_model} h={args.n_heads} kv_h={args.n_kv_heads} l={args.n_layers} "
-          f"ctx={args.context_len} bs={args.batch_size}")
+          f"ctx={args.context_len} bs={args.batch_size}"
+          + (f" ({n_delta}D+{n_attn}A)" if n_delta > 0 else ""))
     print(f"{args.dataset} {args.tokenizer} vocab={vocab_size}")
     print(f"{count_params(params):,} params, {n_batches} steps/epoch, {total_steps} total")
 

@@ -247,7 +247,9 @@ def deltanet_attention(x, wq, wk, wv, wo, a_proj, b_proj, A_log, dt_bias, g_proj
     # output gate
     gate = jax.nn.silu(x @ g_proj)  # (seq, d_model)
 
-    # recurrence via scan (per KV head)
+    # recurrence via scan with checkpointing (recompute intermediates during backward
+    # instead of storing all 512 states — reduces memory from O(T*d²) to O(d²))
+    @jax.checkpoint
     def step(state, inputs):
         """state: (n_kv_heads, d_head, d_head). inputs: per-timestep values."""
         q_t, k_t, v_t, beta_t, decay_t = inputs
