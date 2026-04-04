@@ -315,16 +315,20 @@ def _prepare_combined(context_len, epoch=1):
 
 
 def _prepare_combined_v2(context_len):
-    """Load v2 tokenized data (with EOS tokens, better mix)."""
+    """Load v2 tokenized data (with EOS tokens, better mix).
+
+    Uses memory-mapped flat binary for train data to handle large datasets.
+    """
     from tokenizers import Tokenizer
 
     token_dir = os.path.join(DATA_DIR, "tokens_v2")
-    combined_path = os.path.join(token_dir, "combined.npz")
+    train_bin = os.path.join(token_dir, "train.bin")
+    val_npy = os.path.join(token_dir, "val.npy")
     meta_path = os.path.join(token_dir, "metadata.json")
 
-    if not os.path.exists(combined_path):
+    if not os.path.exists(train_bin):
         raise FileNotFoundError(
-            f"V2 dataset not found at {combined_path}. "
+            f"V2 dataset not found at {train_bin}. "
             "Run: uv run prepare_data_v2.py"
         )
 
@@ -336,17 +340,20 @@ def _prepare_combined_v2(context_len):
     print(f"  Sources: {', '.join(f'{k} ({v/1e9:.1f}B)' for k, v in meta['sources'].items())}")
     print(f"  EOS between docs: {meta.get('has_eos_between_docs', False)}")
 
-    data = np.load(combined_path)
-    train_data = data["train"]
-    val_data = data["val"]
+    # memory-map train data (doesn't load into RAM)
+    train_mmap = np.memmap(train_bin, dtype=np.int32, mode="r")
+    val_data = np.load(val_npy)
 
     vocab_size = meta["vocab_size"]
-    tok = Tokenizer.from_file(meta["tokenizer_path"])
 
-    train_x, train_y = _make_sequences(train_data, context_len)
+    # create sequences from memmaped data — this DOES copy to RAM
+    # but only the x,y arrays (each half the size of raw data)
+    train_x, train_y = _make_sequences(train_mmap, context_len)
     val_x, val_y = _make_sequences(val_data, context_len)
 
     print(f"  {len(train_x):,} train seqs, {len(val_x):,} val seqs, vocab={vocab_size}")
+
+    tok = Tokenizer.from_file(meta["tokenizer_path"])
 
     def decode_tokens(ids):
         return tok.decode(list(int(i) for i in ids))

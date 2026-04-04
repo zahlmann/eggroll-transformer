@@ -522,43 +522,90 @@ def tokenize_all():
         sname, n_tokens = _tokenize_source(name, raw_path, str(tok_path), target)
         source_stats[sname] = n_tokens
 
-    # combine
+    # combine: memory-efficient pipeline using flat binary + memmap
     print("\n--- Combining ---")
-    all_train = []
-    all_val = []
+    train_sizes = {}
+    val_sizes = {}
     for name in source_configs:
         cache = TOKEN_DIR / f"{name}.npz"
         if cache.exists():
             data = np.load(cache)
-            all_train.append(data["train"])
-            all_val.append(data["val"])
-            print(f"  {name}: {len(data['train'])/1e9:.2f}B train, {len(data['val'])/1e6:.1f}M val")
+            train_sizes[name] = len(data["train"])
+            val_sizes[name] = len(data["val"])
+            print(f"  {name}: {train_sizes[name]/1e9:.2f}B train, {val_sizes[name]/1e6:.1f}M val")
+            del data
 
-    train_combined = np.concatenate(all_train)
-    val_combined = np.concatenate(all_val)
-    del all_train, all_val
+    total_train = sum(train_sizes.values())
+    total_val = sum(val_sizes.values())
+    print(f"  Total: {total_train/1e9:.2f}B train, {total_val/1e6:.1f}M val")
 
-    # shuffle in 512-token chunks
-    print("Shuffling...")
-    rng = np.random.default_rng(42)
+    # write val (small, fits in memory)
+    val_parts = []
+    for name in source_configs:
+        cache = TOKEN_DIR / f"{name}.npz"
+        if cache.exists():
+            val_parts.append(np.load(cache)["val"])
+    val_combined = np.concatenate(val_parts)
+    del val_parts
+    np.save(TOKEN_DIR / "val.npy", val_combined)
+
+    # write train to flat binary, one source at a time
+    train_bin = TOKEN_DIR / "train.bin"
+    print(f"Writing train data to flat binary...")
+    with open(train_bin, "wb") as f:
+        for name in source_configs:
+            cache = TOKEN_DIR / f"{name}.npz"
+            if cache.exists():
+                arr = np.load(cache)["train"]
+                arr.tofile(f)
+                print(f"  wrote {name}: {len(arr)/1e9:.2f}B tokens")
+                del arr
+
+    # shuffle via memmap: permute 512-token chunk indices, write shuffled output
+    print("Shuffling (memory-mapped, chunk-by-chunk)...")
+    src = np.memmap(train_bin, dtype=np.int32, mode="r")
     chunk_size = 512
-    n_chunks = len(train_combined) // chunk_size
-    train_chunked = train_combined[:n_chunks * chunk_size].reshape(n_chunks, chunk_size)
-    perm = rng.permutation(n_chunks)
-    train_combined = train_chunked[perm].reshape(-1)
+    n_chunks = len(src) // chunk_size
+    usable = n_chunks * chunk_size
 
-    combined_path = TOKEN_DIR / "combined.npz"
-    np.savez(combined_path, train=train_combined, val=val_combined)
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(n_chunks)
+
+    # write shuffled data in batches to avoid loading all into RAM
+    shuffled_bin = TOKEN_DIR / "train_shuffled.bin"
+    dst = np.memmap(shuffled_bin, dtype=np.int32, mode="w+", shape=(usable,))
+    batch = 100000  # process 100K chunks at a time (~200MB)
+    for i in range(0, n_chunks, batch):
+        end = min(i + batch, n_chunks)
+        idx = perm[i:end]
+        # gather chunks from source
+        for j, ci in enumerate(idx):
+            dst[(i+j)*chunk_size:(i+j+1)*chunk_size] = src[ci*chunk_size:(ci+1)*chunk_size]
+        if (i // batch) % 10 == 0:
+            print(f"  shuffled {end}/{n_chunks} chunks ({end*chunk_size/1e9:.2f}B tokens)")
+    dst.flush()
+    del src, dst
+
+    # replace original with shuffled
+    train_bin.unlink()
+    shuffled_bin.rename(train_bin)
+
+    # keep flat binary for memory-mapped loading (no npz — too large for RAM)
+    print(f"Final train data: {train_bin} ({usable} tokens, {usable*4/1e9:.1f}GB)")
+
+    total_train_tok = usable
+    total_val_tok = len(np.load(TOKEN_DIR / "val.npy"))
 
     meta = {
         "vocab_size": VOCAB_SIZE,
         "tokenizer_path": str(tok_path),
         "sources": source_stats,
-        "total_train_tokens": int(len(train_combined)),
-        "total_val_tokens": int(len(val_combined)),
+        "total_train_tokens": total_train_tok,
+        "total_val_tokens": total_val_tok,
         "val_fraction": VAL_FRACTION,
         "eos_token_id": EOS_TOKEN_ID,
         "has_eos_between_docs": True,
+        "format": "flat_binary",  # train.bin = flat int32 array, val.npy = numpy
     }
     meta_path = TOKEN_DIR / "metadata.json"
     with open(meta_path, "w") as f:
@@ -566,13 +613,13 @@ def tokenize_all():
 
     print(f"\n{'='*60}")
     print(f"FINAL DATASET:")
-    print(f"  Train: {len(train_combined):,} tokens ({len(train_combined)/1e9:.2f}B)")
-    print(f"  Val:   {len(val_combined):,} tokens ({len(val_combined)/1e6:.1f}M)")
+    print(f"  Train: {total_train_tok:,} tokens ({total_train_tok/1e9:.2f}B)")
+    print(f"  Val:   {total_val_tok:,} tokens ({total_val_tok/1e6:.1f}M)")
     for name, n in source_stats.items():
         pct = n / sum(source_stats.values()) * 100
         print(f"  {name}: {n/1e9:.2f}B ({pct:.0f}%)")
     print(f"  EOS tokens between all documents")
-    print(f"  Saved to {combined_path}")
+    print(f"  Format: train.bin (flat int32) + val.npy")
     print(f"{'='*60}")
 
 
