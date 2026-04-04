@@ -27,7 +27,7 @@ def _layer_types(n_layers):
 
 
 def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context_len=128,
-                     n_kv_heads=None, use_deltanet=True):
+                     n_kv_heads=None, use_deltanet=False):
     """Initialize a decoder-only transformer. Returns a flat dict of params.
 
     Architecture: RMSNorm, RoPE, SwiGLU FFN, no biases, tied embeddings.
