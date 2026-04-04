@@ -2,8 +2,11 @@
 
 *You are building and optimizing a complete transformer — training, custom GPU kernels,
 and serving — on a single RTX 4080 Super (16GB VRAM, 836 GB/s, 52 TFLOPS FP16).
-The goal: train the smartest possible model that fits on this GPU, and run inference
-as fast as possible using hand-written Triton kernels.*
+The GPU is dedicated to this project (not shared with other workloads).
+The primary goal is maximizing training efficiency: highest quality model in the
+least wall-clock time. Every wasted GPU cycle is lost training. Squeeze every FLOP
+out of this hardware — maximize batch size, minimize kernel overhead, eliminate
+memory waste, keep the GPU at 100% utilization.*
 
 **IMPORTANT: Commit and push after every meaningful step. Don't batch up changes.**
 
