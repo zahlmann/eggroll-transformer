@@ -59,7 +59,7 @@ Train a high-quality decoder-only transformer on one GPU, serve it with custom T
 ### Current Performance (RTX 4080 Super)
 
 ```
-CURRENT MODEL (d=1024, h=16, l=16, ctx=512, GQA 4 KV heads, 242M params, ppl=20.91):
+CURRENT MODEL (d=1024, h=16, l=16, ctx=512, GQA 4 KV heads, 242M params, 3.49B tokens, train_loss=2.70):
   Multi-SM sync:       501 tok/s (2.00 ms/tok, 30% BW util)
   Pipelined:           618 tok/s (1.62 ms/tok, 1.23x)
   Persistent:          613 tok/s (1.63 ms/tok, 1.22x)
@@ -730,43 +730,32 @@ with these acceptance rates would give 2-3x speedup.
 
 ## What's Next
 
-### Epoch 2: Fresh data with more code (next task)
+### COMPLETED: Epoch 2 — Fresh data with more code (2026-04-04)
 
-Epoch 1 trained d=1024/l=16 (242M params) on 1.77B tokens for 13.7h.
-Result: val_loss=3.04, ppl=20.91. Code quality was weak (only 6% code in mix).
+Epoch 1: d=1024/l=16 (242M params) on 1.77B tokens, val_loss=3.04, ppl=20.91.
+Epoch 2: resumed from epoch 1 weights on 1.72B fresh tokens, 13.4h on RTX 4080 Super.
 
-**Epoch 2 must use entirely fresh tokens (no repetition of epoch 1 data).**
-All sources have far more data available than what we used.
+**Data mix (1.72B fresh tokens, no repetition):**
+- 51% FineWeb-Edu (883M tokens) — new docs from `sample-10BT`, skipped 981K epoch 1 docs
+- 18% StarCoder code (315M tokens) — `bigcode/starcoderdata` (Python, JS, TS, Java, C, C++, Rust, Go)
+- 17% Wikipedia (295M tokens) — fresh articles after epoch 1 docs
+- 14% Cosmopedia v2 (236M tokens) — fresh docs from `smollm-corpus/cosmopedia-v2`
 
-**Data mix for epoch 2 (~2B new tokens):**
-- 50% FineWeb-Edu (1B tokens) — download NEW docs from `sample-10BT`, skip docs
-  already used in epoch 1 (track by document ID or byte offset in the stream).
-  Score >= 3 filter stays.
-- 20% Code from StarCoder (400M tokens) — `bigcode/starcoderdata` (HF login
-  configured, access granted). Languages: Python, JavaScript, TypeScript, Java,
-  C, C++, Rust, Go. Filter: 100-50K chars per file. StarCoder data is
-  high-quality and deduplicated.
-- 15% Wikipedia (300M tokens) — fresh articles not used in epoch 1.
-- 15% Cosmopedia v2 (300M tokens) — fresh docs from `smollm-corpus/cosmopedia-v2`.
-
-**Implementation:**
-- Update `prepare_data.py` to accept `--epoch 2` flag that skips already-used docs
-- Replace `code_search_net` with `bigcode/starcoderdata` (much larger, better quality)
-- Save tokenized epoch 2 as `data/tokens/combined_epoch2.npz`
-- Resume training from epoch 1 weights (`weights.pkl`) with fresh data
-- Use same tokenizer (`data/tokenizer_32000.json`) — do NOT retrain it
-
-**Training command (after data prep):**
+**Results:**
 ```
-uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 16 \
-  --context-len 512 --epochs 1 --batch-size 16 --lr 1e-4 --warmup-steps 500 \
-  --dataset combined --resume weights.pkl
+Epoch 2 (d=1024, h=16, kv_h=4, l=16, ctx=512, 242M params):
+  Train loss: 2.705 (was 3.04 after epoch 1)
+  Val loss:   3.338, ppl=28.16 (epoch 1 val: 3.04, ppl=20.91)
+  Time:       13.4h (48,067s), 7.9GB peak VRAM
+  Speed:      4.4 steps/s, 210K steps
+  Total tokens seen: 3.49B unique (1.77B epoch 1 + 1.72B epoch 2)
 ```
-Note: lower LR (1e-4 vs 3e-4) and shorter warmup for continued training.
-The `--resume` flag needs to be added to train.py (load params + opt_state from
-checkpoint instead of random init).
 
-After epoch 2, the model will have seen ~3.8B unique tokens total (vs 1.77B repeated).
+**Key finding:** Val ppl regressed (20.91 → 28.16) despite much lower train loss
+(3.04 → 2.70). The validation set was drawn from epoch 1's data mix (60% FineWeb,
+5% code_search_net), but epoch 2's mix has 20% StarCoder code and different source
+proportions. The model improved on the training distribution but the val set doesn't
+reflect the new mix. A fairer evaluation would use a val set from epoch 2's distribution.
 
 ### Kernel architecture (done)
 
@@ -850,6 +839,7 @@ profile_vram.py                      — VRAM profiling for model scaling decisi
 prepare_data.py                      — multi-source training data download + tokenization
 baseline_metrics.txt                 — current numbers to beat
 training_log_d1024.txt               — epoch 1 training log
+training_log_d1024_epoch2.txt        — epoch 2 training log
 ```
 
 ---
