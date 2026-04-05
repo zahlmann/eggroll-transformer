@@ -1,7 +1,7 @@
 """Small decoder-only transformer in JAX (pure functional).
 
-Phase C architecture: RMSNorm, RoPE, SwiGLU, no biases, tied embeddings.
-Hybrid: 75% Gated DeltaNet (linear attention) + 25% standard attention.
+Architecture: RMSNorm, RoPE, GQA, SwiGLU, no biases, tied embeddings.
+Supports multi-token prediction (MTP) heads.
 """
 
 import jax
@@ -18,31 +18,18 @@ def _swiglu_d_ff(d_model):
     return ((8 * d_model // 3 + 127) // 128) * 128
 
 
-def _layer_types(n_layers):
-    """Return list of layer types: every 4th layer is 'attn', rest are 'delta'.
-
-    Pattern: [D, D, D, A, D, D, D, A, ...]
-    """
-    return ["attn" if (i % 4 == 3) else "delta" for i in range(n_layers)]
-
-
 def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context_len=128,
-                     n_kv_heads=None, use_deltanet=False, n_mtp_heads=0):
-    """Initialize a decoder-only transformer. Returns a flat dict of params.
+                     n_kv_heads=2, n_mtp_heads=0):
+    """Initialize a decoder-only transformer. Returns (params dict, config dict).
 
-    Architecture: RMSNorm, RoPE, SwiGLU FFN, no biases, tied embeddings.
-    Hybrid: 75% Gated DeltaNet + 25% standard attention (Qwen 3.5 pattern).
-    use_deltanet: if False, use all standard attention layers (for comparison).
-    n_kv_heads: number of KV heads for GQA. If None, defaults to n_heads.
+    n_kv_heads: number of KV heads for GQA.
+    n_mtp_heads: number of extra multi-token prediction heads.
     """
     assert d_model % n_heads == 0
     d_head = d_model // n_heads
-    if n_kv_heads is None:
-        n_kv_heads = n_heads
     assert n_heads % n_kv_heads == 0
 
     d_ff = _swiglu_d_ff(d_model)
-    layer_types = _layer_types(n_layers) if use_deltanet else ["attn"] * n_layers
 
     params = {}
     config = {
@@ -54,7 +41,7 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
         "d_head": d_head,
         "d_ff": d_ff,
         "context_len": context_len,
-        "layer_types": layer_types,
+        "n_mtp_heads": n_mtp_heads,
     }
 
     # token embedding: (vocab_size, d_model) — also used as output projection (tied)
@@ -65,64 +52,24 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
 
     for layer in range(n_layers):
         prefix = f"layer{layer}"
-        ltype = layer_types[layer]
 
-        # RMSNorm 1 (pre-attention/deltanet) — scale only
+        # RMSNorm 1 (pre-attention)
         params[f"{prefix}.ln1.scale"] = jnp.ones(d_model)
 
-        if ltype == "attn":
-            # standard attention: Q, O use n_heads; K, V use n_kv_heads (GQA)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.q"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.k"] = jax.random.normal(k, (d_model, d_kv)) * (d_model ** -0.5)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.v"] = jax.random.normal(k, (d_model, d_kv)) * (d_model ** -0.5)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.o"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
+        # Q, O use n_heads; K, V use n_kv_heads (GQA)
+        key, k = jax.random.split(key)
+        params[f"{prefix}.attn.q"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
+        key, k = jax.random.split(key)
+        params[f"{prefix}.attn.k"] = jax.random.normal(k, (d_model, d_kv)) * (d_model ** -0.5)
+        key, k = jax.random.split(key)
+        params[f"{prefix}.attn.v"] = jax.random.normal(k, (d_model, d_kv)) * (d_model ** -0.5)
+        key, k = jax.random.split(key)
+        params[f"{prefix}.attn.o"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
 
-        elif ltype == "delta":
-            # Gated DeltaNet: same Q/K/V/O projections + gates + convolutions
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.q"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.k"] = jax.random.normal(k, (d_model, d_kv)) * (d_model ** -0.5)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.v"] = jax.random.normal(k, (d_model, d_kv)) * (d_model ** -0.5)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.attn.o"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
-
-            # decay gate: alpha = exp(-A * softplus(a_proj(x) + dt_bias))
-            key, k = jax.random.split(key)
-            params[f"{prefix}.delta.a_proj"] = jax.random.normal(k, (d_model, n_kv_heads)) * 0.01
-            params[f"{prefix}.delta.A_log"] = jnp.log(jax.random.uniform(
-                jax.random.split(key)[1], (n_kv_heads,), minval=1.0, maxval=16.0))
-            params[f"{prefix}.delta.dt_bias"] = jnp.log(jnp.exp(jax.random.uniform(
-                jax.random.split(key)[0], (n_kv_heads,), minval=0.001, maxval=0.1)) - 1.0)
-
-            # beta gate: beta = sigmoid(b_proj(x))
-            key, k = jax.random.split(key)
-            params[f"{prefix}.delta.b_proj"] = jax.random.normal(k, (d_model, n_kv_heads)) * 0.01
-
-            # output gate: o = rms_norm(o) * silu(g_proj(x))
-            key, k = jax.random.split(key)
-            params[f"{prefix}.delta.g_proj"] = jax.random.normal(k, (d_model, d_model)) * (d_model ** -0.5)
-
-            # short convolutions (depthwise, kernel_size=4)
-            key, k = jax.random.split(key)
-            params[f"{prefix}.delta.conv_q"] = jax.random.normal(k, (4, d_model)) * 0.1
-            key, k = jax.random.split(key)
-            params[f"{prefix}.delta.conv_k"] = jax.random.normal(k, (4, d_kv)) * 0.1
-            key, k = jax.random.split(key)
-            params[f"{prefix}.delta.conv_v"] = jax.random.normal(k, (4, d_kv)) * 0.1
-
-            # RMSNorm for output (before output gate multiply)
-            params[f"{prefix}.delta.o_norm"] = jnp.ones(d_model)
-
-        # RMSNorm 2 (pre-FFN) — scale only
+        # RMSNorm 2 (pre-FFN)
         params[f"{prefix}.ln2.scale"] = jnp.ones(d_model)
 
-        # SwiGLU FFN (same for both layer types)
+        # SwiGLU FFN
         key, k = jax.random.split(key)
         params[f"{prefix}.ffn.gate"] = jax.random.normal(k, (d_model, d_ff)) * (d_model ** -0.5)
         key, k = jax.random.split(key)
@@ -134,8 +81,6 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
     params["ln_final.scale"] = jnp.ones(d_model)
 
     # MTP heads: small projection (d_model -> d_model) per extra head
-    # logits_k = rms_norm(h @ mtp_proj_k) @ token_emb.T
-    config["n_mtp_heads"] = n_mtp_heads
     for k_idx in range(n_mtp_heads):
         key, k1, k2 = jax.random.split(key, 3)
         params[f"mtp.{k_idx}.proj"] = jax.random.normal(k1, (d_model, d_model)) * (d_model ** -0.5)
@@ -145,8 +90,7 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
 
 
 def rms_norm(x, scale, eps=1e-5):
-    """RMSNorm: scale * x / sqrt(mean(x²) + eps)."""
-    # compute variance in f32 for numerical stability, cast back to input dtype
+    """RMSNorm: scale * x / sqrt(mean(x^2) + eps)."""
     x_f32 = x.astype(jnp.float32)
     rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + eps).astype(x.dtype)
     return scale * (x / rms)
@@ -164,39 +108,26 @@ def precompute_rope_table(context_len, d_head, base=10000.0):
 def apply_rope(x, cos, sin):
     """Apply RoPE to x. x: (..., d_head), cos/sin: (seq, d_head//2) or (d_head//2,)."""
     half = x.shape[-1] // 2
-    x_even = x[..., :half]
-    x_odd = x[..., half:]
+    x_even, x_odd = x[..., :half], x[..., half:]
     return jnp.concatenate([
         x_even * cos - x_odd * sin,
         x_even * sin + x_odd * cos,
     ], axis=-1)
 
 
-# ─── causal depthwise conv1d ───
-
-def _causal_conv1d(x, weight):
-    """Causal depthwise 1D convolution. x: (seq, channels), weight: (kernel_size, channels)."""
-    K = weight.shape[0]
-    x_padded = jnp.pad(x, ((K - 1, 0), (0, 0)))
-    out = sum(x_padded[K - 1 - i:x.shape[0] + K - 1 - i] * weight[i] for i in range(K))
-    return out
-
-
-# ─── standard causal attention ───
+# ─── causal attention ───
 
 def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads, cos, sin):
     """Multi-head causal self-attention with GQA and RoPE. x: (seq_len, d_model)."""
     seq_len, d_model = x.shape
     d_head = d_model // n_heads
 
-    # (seq, n_heads, d_head) layout for jax.nn.dot_product_attention
     q = (x @ wq).reshape(seq_len, n_heads, d_head)
     k = (x @ wk).reshape(seq_len, n_kv_heads, d_head)
     v = (x @ wv).reshape(seq_len, n_kv_heads, d_head)
 
     cos_seq = cos[:seq_len]
     sin_seq = sin[:seq_len]
-    # apply_rope expects (n_heads, seq, d_head), transpose in and out
     q = apply_rope(q.transpose(1, 0, 2), cos_seq[None, :, :], sin_seq[None, :, :]).transpose(1, 0, 2)
     k = apply_rope(k.transpose(1, 0, 2), cos_seq[None, :, :], sin_seq[None, :, :]).transpose(1, 0, 2)
 
@@ -210,85 +141,6 @@ def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads, cos, sin):
         out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
     return out.reshape(seq_len, d_model) @ wo
-
-
-# ─── gated deltanet attention ───
-
-def deltanet_attention(x, wq, wk, wv, wo, a_proj, b_proj, A_log, dt_bias, g_proj,
-                       conv_q, conv_k, conv_v, o_norm_scale,
-                       n_heads, n_kv_heads):
-    """Gated DeltaNet linear attention (naive recurrent). x: (seq_len, d_model).
-
-    Uses recurrent state S (d_head × d_head per KV head) instead of KV cache.
-    O(T * d²) per layer — linear in sequence length.
-    """
-    seq_len, d_model = x.shape
-    d_head = d_model // n_heads
-    d_kv = n_kv_heads * d_head
-    gqa_group = n_heads // n_kv_heads
-
-    # project Q, K, V
-    q = x @ wq  # (seq, d_model)
-    k = x @ wk  # (seq, d_kv)
-    v = x @ wv  # (seq, d_kv)
-
-    # short causal convolution + SiLU activation
-    q = jax.nn.silu(_causal_conv1d(q, conv_q))
-    k = jax.nn.silu(_causal_conv1d(k, conv_k))
-    v = jax.nn.silu(_causal_conv1d(v, conv_v))
-
-    # reshape to heads: Q has n_heads, K/V have n_kv_heads
-    q = q.reshape(seq_len, n_heads, d_head)      # (seq, n_heads, d_head)
-    k = k.reshape(seq_len, n_kv_heads, d_head)   # (seq, n_kv_heads, d_head)
-    v = v.reshape(seq_len, n_kv_heads, d_head)   # (seq, n_kv_heads, d_head)
-
-    # L2 normalize Q and K, scale Q
-    q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6) * (d_head ** -0.5)
-    k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
-
-    # compute gates
-    # decay: alpha = exp(-A * softplus(a_proj(x) + dt_bias))
-    A = jnp.exp(A_log)  # (n_kv_heads,)
-    dt = jax.nn.softplus(x @ a_proj + dt_bias)  # (seq, n_kv_heads)
-    decay = jnp.exp(-A[None, :] * dt)  # (seq, n_kv_heads), in (0, 1)
-    # beta: update strength
-    beta = jax.nn.sigmoid(x @ b_proj)  # (seq, n_kv_heads)
-
-    # output gate
-    gate = jax.nn.silu(x @ g_proj)  # (seq, d_model)
-
-    # Chunked recurrence with per-chunk checkpointing and full unroll.
-    # 8 chunks of 64 steps, checkpoint between chunks → O(8 * state_size) memory.
-    CHUNK = 64
-    n_chunks = seq_len // CHUNK
-    gqa_idx = jnp.arange(n_heads) // gqa_group
-
-    def step(state, inputs):
-        q_t, k_t, v_t, beta_t, decay_t = inputs
-        state = state * decay_t[:, None, None]
-        retrieved = jnp.einsum('hkv,hk->hv', state, k_t)
-        delta = (v_t - retrieved) * beta_t[:, None]
-        state = state + jnp.einsum('hk,hv->hkv', k_t, delta)
-        o_t = jnp.einsum('hkv,hk->hv', state[gqa_idx], q_t)
-        return state, o_t
-
-    @jax.checkpoint
-    def scan_chunk(state, chunk_inputs):
-        return jax.lax.scan(step, state, chunk_inputs, unroll=CHUNK)
-
-    initial_state = jnp.zeros((n_kv_heads, d_head, d_head), dtype=jnp.float32)
-    inputs_chunked = jax.tree.map(
-        lambda x: x.reshape(n_chunks, CHUNK, *x.shape[1:]),
-        (q, k, v, beta, decay))
-    _, outputs_chunked = jax.lax.scan(scan_chunk, initial_state, inputs_chunked)
-    outputs = outputs_chunked.reshape(seq_len, n_heads, d_head)
-
-    # reshape to (seq, d_model)
-    o = outputs.reshape(seq_len, d_model)
-
-    # output: rms_norm(o) * gate, then output projection
-    o = rms_norm(o, o_norm_scale) * gate
-    return o @ wo
 
 
 # ─── transformer layers ───
@@ -306,60 +158,28 @@ def _attn_layer(h, ln1_s, wq, wk, wv, wo,
     return h + h_ff
 
 
-def _delta_layer(h, ln1_s, wq, wk, wv, wo,
-                 a_proj, b_proj, A_log, dt_bias, g_proj,
-                 conv_q, conv_k, conv_v, o_norm_scale,
-                 ln2_s, ffn_gate, ffn_up, ffn_down,
-                 n_heads, n_kv_heads):
-    """Gated DeltaNet transformer layer."""
-    h_norm = rms_norm(h, ln1_s)
-    delta_out = deltanet_attention(
-        h_norm, wq, wk, wv, wo,
-        a_proj, b_proj, A_log, dt_bias, g_proj,
-        conv_q, conv_k, conv_v, o_norm_scale,
-        n_heads, n_kv_heads)
-    h = h + delta_out
-    h_norm2 = rms_norm(h, ln2_s)
-    h_ff = (jax.nn.silu(h_norm2 @ ffn_gate) * (h_norm2 @ ffn_up)) @ ffn_down
-    return h + h_ff
-
-
 def _transformer_trunk(params, config, x):
     """Run transformer layers. Returns final hidden states (seq_len, d_model)."""
     h = params["token_emb"][x]
     n_heads = config["n_heads"]
-    n_kv_heads = config.get("n_kv_heads", n_heads)
+    n_kv_heads = config["n_kv_heads"]
     d_head = config["d_head"]
     context_len = config["context_len"]
-    layer_types = config.get("layer_types", ["attn"] * config["n_layers"])
+    use_checkpoint = config.get("gradient_checkpoint", True)
+
+    maybe_checkpoint = jax.checkpoint if use_checkpoint else lambda f, **kw: f
 
     for layer in range(config["n_layers"]):
         p = f"layer{layer}"
-        if layer_types[layer] == "delta":
-            h = jax.checkpoint(_delta_layer, static_argnums=(19, 20))(
-                h,
-                params[f"{p}.ln1.scale"],
-                params[f"{p}.attn.q"], params[f"{p}.attn.k"],
-                params[f"{p}.attn.v"], params[f"{p}.attn.o"],
-                params[f"{p}.delta.a_proj"], params[f"{p}.delta.b_proj"],
-                params[f"{p}.delta.A_log"], params[f"{p}.delta.dt_bias"],
-                params[f"{p}.delta.g_proj"],
-                params[f"{p}.delta.conv_q"], params[f"{p}.delta.conv_k"],
-                params[f"{p}.delta.conv_v"], params[f"{p}.delta.o_norm"],
-                params[f"{p}.ln2.scale"],
-                params[f"{p}.ffn.gate"], params[f"{p}.ffn.up"], params[f"{p}.ffn.down"],
-                n_heads, n_kv_heads,
-            )
-        else:
-            h = jax.checkpoint(_attn_layer, static_argnums=(10, 11, 12, 13))(
-                h,
-                params[f"{p}.ln1.scale"],
-                params[f"{p}.attn.q"], params[f"{p}.attn.k"],
-                params[f"{p}.attn.v"], params[f"{p}.attn.o"],
-                params[f"{p}.ln2.scale"],
-                params[f"{p}.ffn.gate"], params[f"{p}.ffn.up"], params[f"{p}.ffn.down"],
-                n_heads, n_kv_heads, context_len, d_head,
-            )
+        h = maybe_checkpoint(_attn_layer, static_argnums=(10, 11, 12, 13))(
+            h,
+            params[f"{p}.ln1.scale"],
+            params[f"{p}.attn.q"], params[f"{p}.attn.k"],
+            params[f"{p}.attn.v"], params[f"{p}.attn.o"],
+            params[f"{p}.ln2.scale"],
+            params[f"{p}.ffn.gate"], params[f"{p}.ffn.up"], params[f"{p}.ffn.down"],
+            n_heads, n_kv_heads, context_len, d_head,
+        )
 
     return rms_norm(h, params["ln_final.scale"])
 
@@ -371,74 +191,42 @@ def transformer_forward(params, config, x):
 
 
 def prefill_with_kv(params, config, x):
-    """Forward pass that also returns KV caches for decode.
-
-    For attention layers: returns standard KV caches.
-    For DeltaNet layers: returns DeltaNet state matrices as "caches".
-    """
+    """Forward pass returning KV caches for decode. Used by inference kernels."""
     seq_len = x.shape[0]
-    n_heads = config["n_heads"]
-    n_kv_heads = config.get("n_kv_heads", n_heads)
-    d_head = config["d_head"]
-    max_seq = config["context_len"]
-    layer_types = config.get("layer_types", ["attn"] * config["n_layers"])
-
+    n_heads, n_kv_heads = config["n_heads"], config["n_kv_heads"]
+    d_head, max_seq = config["d_head"], config["context_len"]
     cos, sin = precompute_rope_table(max_seq, d_head)
 
     h = params["token_emb"][x]
     k_caches, v_caches = [], []
 
     for layer in range(config["n_layers"]):
-        prefix = f"layer{layer}"
-        ltype = layer_types[layer]
+        p = f"layer{layer}"
+        h_norm = rms_norm(h, params[f"{p}.ln1.scale"])
 
-        if ltype == "attn":
-            h_norm = rms_norm(h, params[f"{prefix}.ln1.scale"])
+        k_proj = (h_norm @ params[f"{p}.attn.k"]).reshape(seq_len, n_kv_heads, d_head)
+        v_proj = (h_norm @ params[f"{p}.attn.v"]).reshape(seq_len, n_kv_heads, d_head)
+        k_proj = apply_rope(k_proj, cos[:seq_len, None, :], sin[:seq_len, None, :])
 
-            k_proj = (h_norm @ params[f"{prefix}.attn.k"]).reshape(seq_len, n_kv_heads, d_head)
-            v_proj = (h_norm @ params[f"{prefix}.attn.v"]).reshape(seq_len, n_kv_heads, d_head)
-            cos_seq = cos[:seq_len]
-            sin_seq = sin[:seq_len]
-            k_proj = apply_rope(k_proj, cos_seq[:, None, :], sin_seq[:, None, :])
+        k_cache = jnp.zeros((n_kv_heads, max_seq, d_head), dtype=jnp.bfloat16)
+        v_cache = jnp.zeros((n_kv_heads, max_seq, d_head), dtype=jnp.bfloat16)
+        k_cache = k_cache.at[:, :seq_len, :].set(k_proj.transpose(1, 0, 2).astype(jnp.bfloat16))
+        v_cache = v_cache.at[:, :seq_len, :].set(v_proj.transpose(1, 0, 2).astype(jnp.bfloat16))
+        k_caches.append(k_cache)
+        v_caches.append(v_cache)
 
-            k_cache = jnp.zeros((n_kv_heads, max_seq, d_head), dtype=jnp.bfloat16)
-            v_cache = jnp.zeros((n_kv_heads, max_seq, d_head), dtype=jnp.bfloat16)
-            k_cache = k_cache.at[:, :seq_len, :].set(k_proj.transpose(1, 0, 2).astype(jnp.bfloat16))
-            v_cache = v_cache.at[:, :seq_len, :].set(v_proj.transpose(1, 0, 2).astype(jnp.bfloat16))
-            k_caches.append(k_cache)
-            v_caches.append(v_cache)
+        attn_out = causal_attention(
+            h_norm, params[f"{p}.attn.q"], params[f"{p}.attn.k"],
+            params[f"{p}.attn.v"], params[f"{p}.attn.o"],
+            n_heads, n_kv_heads, cos, sin)
+        h = h + attn_out
 
-            attn_out = causal_attention(
-                h_norm, params[f"{prefix}.attn.q"], params[f"{prefix}.attn.k"],
-                params[f"{prefix}.attn.v"], params[f"{prefix}.attn.o"],
-                n_heads, n_kv_heads, cos, sin)
-
-            h = h + attn_out
-
-        elif ltype == "delta":
-            h_norm = rms_norm(h, params[f"{prefix}.ln1.scale"])
-            delta_out = deltanet_attention(
-                h_norm,
-                params[f"{prefix}.attn.q"], params[f"{prefix}.attn.k"],
-                params[f"{prefix}.attn.v"], params[f"{prefix}.attn.o"],
-                params[f"{prefix}.delta.a_proj"], params[f"{prefix}.delta.b_proj"],
-                params[f"{prefix}.delta.A_log"], params[f"{prefix}.delta.dt_bias"],
-                params[f"{prefix}.delta.g_proj"],
-                params[f"{prefix}.delta.conv_q"], params[f"{prefix}.delta.conv_k"],
-                params[f"{prefix}.delta.conv_v"], params[f"{prefix}.delta.o_norm"],
-                n_heads, n_kv_heads)
-            h = h + delta_out
-            # DeltaNet layers don't use KV caches — placeholder zeros
-            k_caches.append(jnp.zeros((n_kv_heads, max_seq, d_head), dtype=jnp.bfloat16))
-            v_caches.append(jnp.zeros((n_kv_heads, max_seq, d_head), dtype=jnp.bfloat16))
-
-        h_norm2 = rms_norm(h, params[f"{prefix}.ln2.scale"])
-        h_ff = (jax.nn.silu(h_norm2 @ params[f"{prefix}.ffn.gate"]) *
-                (h_norm2 @ params[f"{prefix}.ffn.up"])) @ params[f"{prefix}.ffn.down"]
+        h_norm2 = rms_norm(h, params[f"{p}.ln2.scale"])
+        h_ff = (jax.nn.silu(h_norm2 @ params[f"{p}.ffn.gate"]) *
+                (h_norm2 @ params[f"{p}.ffn.up"])) @ params[f"{p}.ffn.down"]
         h = h + h_ff
 
-    h = rms_norm(h, params["ln_final.scale"])
-    logits = h @ params["token_emb"].T
+    logits = rms_norm(h, params["ln_final.scale"]) @ params["token_emb"].T
     return logits, k_caches, v_caches
 
 
@@ -455,7 +243,6 @@ def transformer_loss_fused(params, config, x_batch, targets, chunk_size=4096):
     Critical for vocab >= 16K (avoids OOM from full logits tensor).
     Supports MTP: computes loss for next-token + extra prediction heads.
     """
-    # run trunk for all batch elements
     h_batch = jax.vmap(lambda x: _transformer_trunk(params, config, x))(x_batch)
     token_emb = params["token_emb"]
 
@@ -465,13 +252,10 @@ def transformer_loss_fused(params, config, x_batch, targets, chunk_size=4096):
     # MTP extra heads: predict tokens t+k using h @ mtp_proj_k
     n_mtp = config.get("n_mtp_heads", 0)
     for k_idx in range(n_mtp):
-        # shift targets: head k predicts token at position t+k+1
-        # h[:, :-k-1] predicts targets[:, k+1:]
         shift = k_idx + 1
         h_shifted = h_batch[:, :-shift, :]
         tgt_shifted = targets[:, shift:]
 
-        # project through MTP head: h -> h_k = rms_norm(h @ proj)
         proj = params[f"mtp.{k_idx}.proj"]
         norm_scale = params[f"mtp.{k_idx}.norm"]
         h_proj = rms_norm(h_shifted @ proj, norm_scale)
@@ -479,7 +263,7 @@ def transformer_loss_fused(params, config, x_batch, targets, chunk_size=4096):
         mtp_loss = fused_output_and_loss(h_proj, token_emb, tgt_shifted, chunk_size)
         loss = loss + mtp_loss
 
-    return loss / (1 + n_mtp)  # average over all heads
+    return loss / (1 + n_mtp)
 
 
 def cross_entropy_loss(logits, targets):
@@ -500,25 +284,22 @@ def _chunked_ce_fwd(h, weight, targets, chunk_size):
     N, d = h.shape
     vocab = weight.shape[0]
 
-    # target logits: each token's logit for its target class
-    target_emb = weight[targets]  # (N, d)
-    target_logits = jnp.sum(h * target_emb, axis=-1)  # (N,)
+    target_emb = weight[targets]
+    target_logits = jnp.sum(h * target_emb, axis=-1)
 
-    # online logsumexp over vocab chunks
     max_logit = jnp.full(N, -1e30)
     sum_exp = jnp.zeros(N)
 
     for start in range(0, vocab, chunk_size):
         end = min(start + chunk_size, vocab)
-        chunk_logits = h @ weight[start:end].T  # (N, chunk)
-        chunk_max = chunk_logits.max(axis=-1)  # (N,)
+        chunk_logits = h @ weight[start:end].T
+        chunk_max = chunk_logits.max(axis=-1)
         new_max = jnp.maximum(max_logit, chunk_max)
         sum_exp = sum_exp * jnp.exp(max_logit - new_max) + jnp.sum(jnp.exp(chunk_logits - new_max[:, None]), axis=-1)
         max_logit = new_max
 
     logsumexp = max_logit + jnp.log(sum_exp)
-    loss = jnp.mean(logsumexp - target_logits)
-    return loss
+    return jnp.mean(logsumexp - target_logits)
 
 
 @jax.custom_vjp
@@ -543,7 +324,6 @@ def _fused_ce_bwd(res, g):
     """
     h, weight, targets, chunk_size = res
     h_dtype, w_dtype = h.dtype, weight.dtype
-    # compute in f32
     h = h.astype(jnp.float32)
     weight = weight.astype(jnp.float32)
     N, d = h.shape
@@ -568,15 +348,15 @@ def _fused_ce_bwd(res, g):
 
     for start in range(0, vocab, chunk_size):
         end = min(start + chunk_size, vocab)
-        w_chunk = weight[start:end]  # (chunk, d)
-        chunk_logits = h @ w_chunk.T  # (N, chunk)
-        softmax_chunk = jnp.exp(chunk_logits - logsumexp[:, None])  # (N, chunk)
+        w_chunk = weight[start:end]
+        chunk_logits = h @ w_chunk.T
+        softmax_chunk = jnp.exp(chunk_logits - logsumexp[:, None])
 
         grad_h = grad_h + (softmax_chunk @ w_chunk) * scale
         grad_weight = grad_weight.at[start:end].add((softmax_chunk.T @ h) * scale)
 
     # subtract target contribution
-    target_emb = weight[targets]  # (N, d)
+    target_emb = weight[targets]
     grad_h = grad_h - target_emb * scale
     grad_weight = grad_weight.at[targets].add(-h * scale)
 
@@ -587,7 +367,7 @@ fused_cross_entropy.defvjp(_fused_ce_fwd, _fused_ce_bwd)
 
 
 def fused_output_and_loss(h, token_emb, targets, chunk_size=4096):
-    """Fused final norm output projection + CE loss for large vocabs.
+    """Fused final output projection + CE loss for large vocabs.
 
     h: (batch, seq, d_model), token_emb: (vocab, d_model), targets: (batch, seq).
     Returns scalar mean loss.
