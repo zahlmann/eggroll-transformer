@@ -48,8 +48,14 @@ NVIDIA B200 (bs=256):   ~341K tok/s
 ## Quick Start
 
 ```bash
-# generate text (streaming)
-uv run generate.py --prompt "Once upon a time"
+# generate text (streaming, with sampling)
+uv run generate.py --prompt "Once upon a time" --temp 0.7 --top-p 0.95 --rep-penalty 1.2
+
+# greedy decoding
+uv run generate.py --prompt "The capital of France is"
+
+# code generation (low temperature)
+uv run generate.py --prompt "def fibonacci(n):" --temp 0.3 --top-p 0.9 --rep-penalty 1.1
 
 # batched inference with paged KV cache
 uv run serve.py --paged --prompts "Once upon a time" "The cat sat"

@@ -480,78 +480,107 @@ weights: `cp weights_dXXX.pkl weights.pkl`.
 
 ---
 
-## Current Task: Fix Triton Decode Kernels for Inference
+## Completed: Fix Triton Decode Kernels for Inference
 
-The model is trained (3 epochs, val loss 2.86, ppl 17.42). weights.pkl is ready.
-JAX forward pass in model.py produces correct, coherent text. But `generate.py`
-produces garbage because the Triton decode kernels don't match the current architecture.
+Fixed. `generate.py` now produces coherent text matching JAX reference quality.
 
-### What's broken
+Bugs found and fixed in `kernels/multi_sm_decode.py`:
+1. **Workspace barrier slots too small**: hardcoded 32, needed 73+ for 24 layers.
+   Barriers overflowed into adjacent memory (done flags, argmax region).
+2. **Shared buffer race condition**: attention O-projection and FFN partials shared
+   the same workspace region. Fast blocks overwrote attention data before slow blocks
+   finished reading. Fix: separate `attn_partial` and `ffn_partial` buffers.
+3. **Store visibility across SMs**: Triton compiler reorders `tl.store` after atomic
+   barriers. Other blocks pass the barrier but read stale data. Fix: `membar.gl`
+   (global memory fence via inline PTX) before each barrier.
+4. **KV-split non-determinism**: `kv_splits=2` (32 blocks) caused too much barrier
+   interaction noise. Fix: use `kv_splits=1` (16 blocks) for reliable synchronization.
+5. **Redundant KV cache writes**: multiple blocks wrote identical data to the same
+   KV cache positions. Fix: only one block per kv_head writes.
 
-`generate.py` uses the Triton decode path:
-1. `prefill_with_kv()` (model.py) — runs JAX prefill, returns KV caches
-2. `prepare_decode_weights_nlayer()` (kernels/fused_decode_nlayer.py) — packs weights into flat buffer
-3. `multi_sm_decode_nlayer()` (kernels/multi_sm_decode.py) — runs fused Triton decode
+Also fixed: `prepare_data_v2.py` saves relative tokenizer path; `data.py` resolves
+relative paths for portability.
 
-The Triton kernels were last tested with a 16-layer model before the SwiGLU/RoPE/GQA
-modernization (Phase C). The current 24-layer model has different weight names and
-FFN structure (3 matrices: gate/up/down instead of 2: w1/w2). The weight packing in
-`fused_decode_nlayer.py` likely doesn't match what the kernel expects.
+Best sampling settings:
+- Creative: `--temp 0.7 --top-p 0.95 --rep-penalty 1.2`
+- Factual:  `--temp 0.5 --top-p 0.9 --rep-penalty 1.1`
+- Code:     `--temp 0.3 --top-p 0.9 --rep-penalty 1.1`
 
-### What to fix
+---
 
-1. **Fix `prepare_decode_weights_nlayer()`** in `kernels/fused_decode_nlayer.py`:
-   ensure it correctly packs the current model's weights (SwiGLU gate/up/down,
-   RMSNorm scales, Q/K/V/O projections, RoPE tables) into the flat buffer format
-   the decode kernel expects. Compare param key names in weights.pkl against what
-   the packing function reads.
+## Current Task: Research and Prepare Data for Continued Training
 
-2. **Fix the Triton decode kernel** in `kernels/multi_sm_decode.py` if the FFN
-   computation doesn't match SwiGLU: `output = (SiLU(x @ gate) * (x @ up)) @ down`.
-   The old kernel may use a 2-matrix FFN (`ReLU(x @ w1) @ w2`).
+The model has completed 3 epochs on 7.85B tokens (val_loss=2.86, ppl=17.42).
+The Triton decode kernel works and generates coherent text. The question now:
+**how do we continue training to improve quality?**
 
-3. **Fix `prefill_with_kv()`** in model.py if KV cache format doesn't match what
-   the decode kernel reads. The prefill output feeds directly into the Triton kernel.
+### Context
 
-4. **Test**: run `uv run generate.py --prompt "The capital of France is" --temp 0.8 --top-p 0.95 --rep-penalty 1.2`
-   and verify coherent output. Compare against the JAX reference:
-
-```python
-# JAX reference (known working):
-import pickle, jax, jax.numpy as jnp, numpy as np
-from model import transformer_forward
-from tokenizers import Tokenizer
-with open('weights.pkl', 'rb') as f:
-    d = pickle.load(f)
-params = {k: jnp.array(v) for k, v in d['params'].items()}
-config = d['config']
-params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
-tok = Tokenizer.from_file('data/tokenizer_32000.json')
-prompt = 'The capital of France is'
-ids = tok.encode(prompt).ids
-x = list(ids)
-np.random.seed(42)
-for _ in range(128):
-    logits = transformer_forward(params_bf16, config, jnp.array(x[-512:]))
-    next_tok = int(jnp.argmax(logits[-1]))
-    x.append(next_tok)
-print(tok.decode(x))
+```
+Current model: 306M params, d=1024, h=16, kv=4, l=24, ctx=512
+Training so far: 3 epochs × 7.85B tokens = 23.5B tokens seen
+Current data mix:
+  34% FineWeb-Edu (quality-filtered web, score >= 3)
+  30% StarCoder code (13 languages)
+  19% OpenWebMath (math with LaTeX)
+   9% Wikipedia
+   8% Cosmopedia (synthetic textbooks)
+val_loss=2.86, ppl=17.42 (after 3 epochs)
 ```
 
-   This should print coherent text about Paris. If generate.py matches this quality,
-   the fix is correct.
+The model has seen each training token ~3 times. Scaling laws (Chinchilla, etc.)
+suggest ~6B tokens would be compute-optimal for 306M params, so we're well past that
+at 23.5B. But quality can still improve with better data.
 
-5. **Also fix `prepare_data_v2.py`**: the metadata.json tokenizer_path is saved as an
-   absolute path (e.g. `/root/transformer/data/tokenizer_32000.json`). Change it to
-   save a relative path so the dataset is portable across machines.
+### What to research
+
+1. **Should we train more epochs on the same data?** Diminishing returns? At what
+   point does overfit set in for a 306M model with 7.85B unique tokens?
+
+2. **Should we change the data mix?** The current mix is heavy on code (30%) and
+   math (19%). For a general-purpose model, is this optimal? Look at what Llama 3,
+   SmolLM2, Phi, and other recent small models use.
+
+3. **Should we add new data sources?** Consider:
+   - Instruction-following data (FLAN, OpenAssistant, UltraChat)
+   - More diverse web data (RedPajama, Dolma, DCLM)
+   - Conversation/dialogue data
+   - Books (Project Gutenberg, BookCorpus alternatives)
+   - Reasoning traces (GSM8K with chain-of-thought)
+
+4. **Should we do a second training phase?** Many modern models use multi-phase:
+   - Phase 1: large-scale pretraining on web data
+   - Phase 2: "annealing" on high-quality curated data at lower LR
+   - Phase 3: instruction tuning / alignment
+   Would a Phase 2 annealing pass on curated data improve our model?
+
+5. **Context length**: currently 512. Should we extend to 1024 or 2048 for the
+   next training phase? What data considerations does this require?
+
+### What to do
+
+1. Research the above questions. Check Llama 3 paper, SmolLM2 paper, Phi papers,
+   Chinchilla scaling laws, and any other relevant work. Use web search.
+
+2. Write a concrete recommendation: what data, what mix, how much, what training
+   schedule (LR, epochs, curriculum, phases).
+
+3. Implement the data preparation:
+   - Add new data sources to `prepare_data_v2.py` if needed
+   - Adjust the data mix ratios
+   - Create a new combined dataset (e.g. `data/tokens_v3/`)
+   - Update the training command in this file
+
+4. Save research findings and recommendations to a file (e.g. `data_research.md`)
+   so the rationale is documented.
 
 ### What NOT to do
 
-- Don't change the model architecture or training code
-- Don't retrain the model
-- Don't change the JAX forward pass in model.py (it's correct)
-- Don't modify batched/persistent/paged decode variants yet — just fix the basic
-  `multi_sm_decode.py` path that `generate.py` uses
+- Don't change the model architecture (keep 306M, d=1024, etc.)
+- Don't change the training code (train.py is working)
+- Don't change the tokenizer (keep the 32K BPE already trained)
+- Don't start training — just prepare the data and document the plan
+- Don't delete existing data in `data/tokens_v2/`
 
 ---
 
