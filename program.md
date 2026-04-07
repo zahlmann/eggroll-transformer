@@ -480,6 +480,81 @@ weights: `cp weights_dXXX.pkl weights.pkl`.
 
 ---
 
+## Current Task: Fix Triton Decode Kernels for Inference
+
+The model is trained (3 epochs, val loss 2.86, ppl 17.42). weights.pkl is ready.
+JAX forward pass in model.py produces correct, coherent text. But `generate.py`
+produces garbage because the Triton decode kernels don't match the current architecture.
+
+### What's broken
+
+`generate.py` uses the Triton decode path:
+1. `prefill_with_kv()` (model.py) — runs JAX prefill, returns KV caches
+2. `prepare_decode_weights_nlayer()` (kernels/fused_decode_nlayer.py) — packs weights into flat buffer
+3. `multi_sm_decode_nlayer()` (kernels/multi_sm_decode.py) — runs fused Triton decode
+
+The Triton kernels were last tested with a 16-layer model before the SwiGLU/RoPE/GQA
+modernization (Phase C). The current 24-layer model has different weight names and
+FFN structure (3 matrices: gate/up/down instead of 2: w1/w2). The weight packing in
+`fused_decode_nlayer.py` likely doesn't match what the kernel expects.
+
+### What to fix
+
+1. **Fix `prepare_decode_weights_nlayer()`** in `kernels/fused_decode_nlayer.py`:
+   ensure it correctly packs the current model's weights (SwiGLU gate/up/down,
+   RMSNorm scales, Q/K/V/O projections, RoPE tables) into the flat buffer format
+   the decode kernel expects. Compare param key names in weights.pkl against what
+   the packing function reads.
+
+2. **Fix the Triton decode kernel** in `kernels/multi_sm_decode.py` if the FFN
+   computation doesn't match SwiGLU: `output = (SiLU(x @ gate) * (x @ up)) @ down`.
+   The old kernel may use a 2-matrix FFN (`ReLU(x @ w1) @ w2`).
+
+3. **Fix `prefill_with_kv()`** in model.py if KV cache format doesn't match what
+   the decode kernel reads. The prefill output feeds directly into the Triton kernel.
+
+4. **Test**: run `uv run generate.py --prompt "The capital of France is" --temp 0.8 --top-p 0.95 --rep-penalty 1.2`
+   and verify coherent output. Compare against the JAX reference:
+
+```python
+# JAX reference (known working):
+import pickle, jax, jax.numpy as jnp, numpy as np
+from model import transformer_forward
+from tokenizers import Tokenizer
+with open('weights.pkl', 'rb') as f:
+    d = pickle.load(f)
+params = {k: jnp.array(v) for k, v in d['params'].items()}
+config = d['config']
+params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
+tok = Tokenizer.from_file('data/tokenizer_32000.json')
+prompt = 'The capital of France is'
+ids = tok.encode(prompt).ids
+x = list(ids)
+np.random.seed(42)
+for _ in range(128):
+    logits = transformer_forward(params_bf16, config, jnp.array(x[-512:]))
+    next_tok = int(jnp.argmax(logits[-1]))
+    x.append(next_tok)
+print(tok.decode(x))
+```
+
+   This should print coherent text about Paris. If generate.py matches this quality,
+   the fix is correct.
+
+5. **Also fix `prepare_data_v2.py`**: the metadata.json tokenizer_path is saved as an
+   absolute path (e.g. `/root/transformer/data/tokenizer_32000.json`). Change it to
+   save a relative path so the dataset is portable across machines.
+
+### What NOT to do
+
+- Don't change the model architecture or training code
+- Don't retrain the model
+- Don't change the JAX forward pass in model.py (it's correct)
+- Don't modify batched/persistent/paged decode variants yet — just fix the basic
+  `multi_sm_decode.py` path that `generate.py` uses
+
+---
+
 ## Training the model
 
 ### Full training run
