@@ -1,14 +1,14 @@
 """Prepare training data v3 — expanded dataset for continued training.
 
 Based on research from data_research.md (April 2026).
+Targeting a coding/reasoning agent model — keeps original v2 distribution.
 
-Main dataset (~28B tokens, rebalanced mix):
-  36% FineWeb-Edu (score >= 3)    10.0B — quality-filtered web
-  18% DCLM-Edu                     5.0B — NEW: edu-classified web (DataComp)
-  20% StarCoder code               5.5B — deduplicated, 13 languages
-  11% OpenWebMath                   3.0B — math with LaTeX
-   7% Wikipedia                     2.0B — full English wiki
-   9% Cosmopedia v2                 2.5B — synthetic textbooks
+Main dataset (~50B tokens, same ratios as v2):
+  34% FineWeb-Edu (score >= 3)    17.0B — quality-filtered web
+  30% StarCoder code              15.0B — deduplicated, 13 languages
+  19% OpenWebMath                  9.5B — math with LaTeX
+   9% Wikipedia                    4.5B — full English wiki
+   8% Cosmopedia v2                4.0B — synthetic textbooks
 
 Annealing dataset (~3B tokens, highest quality only):
   50% FineWeb-Edu score >= 4       1.5B
@@ -16,9 +16,8 @@ Annealing dataset (~3B tokens, highest quality only):
   23% Stack-Edu (educational code) 0.7B
 
 Changes from v2:
-  - 3.6x more total tokens (28B vs 7.85B)
-  - Added DCLM-Edu (new high-quality web source)
-  - Rebalanced: more web (70% vs 44%), less code (20% vs 29%), less math (11% vs 19%)
+  - 6.4x more total tokens (50B vs 7.85B)
+  - Same distribution: heavy code (30%) + math (19%) for reasoning
   - Separate annealing dataset for cooldown phase
   - Reuses existing raw downloads where possible
 
@@ -44,19 +43,18 @@ VOCAB_SIZE = 32000
 VAL_FRACTION = 0.002  # smaller val fraction since dataset is larger
 EOS_TOKEN_ID = 1
 
-# --- Main dataset targets (~28B tokens) ---
+# --- Main dataset targets (~50B tokens, same ratios as v2) ---
 TARGETS = {
     "web": {
-        "fineweb_edu":  10_000_000_000,  # 10B tokens (36%)
-        "dclm_edu":      5_000_000_000,  #  5B tokens (18%) — NEW
-        "wikipedia":     2_000_000_000,  #  2B tokens  (7%)
-        "cosmopedia":    2_500_000_000,  # 2.5B tokens (9%)
-    },  # total web: ~19.5B (70%)
+        "fineweb_edu":  17_000_000_000,  # 17B tokens (34%)
+        "wikipedia":     4_500_000_000,  # 4.5B tokens (9%)
+        "cosmopedia":    4_000_000_000,  # 4B tokens (8%)
+    },  # total web: ~25.5B (51%)
     "code": {
-        "starcoderdata": 5_500_000_000,  # 5.5B tokens (20%)
+        "starcoderdata": 15_000_000_000,  # 15B tokens (30%)
     },
     "math": {
-        "openwebmath":   3_000_000_000,  # 3B tokens (11%)
+        "openwebmath":   9_500_000_000,  # 9.5B tokens (19%)
     },
 }
 
@@ -121,7 +119,7 @@ def _download_fineweb_edu(max_tokens):
         if n_chars < max_chars:
             remaining = (max_chars - n_chars) / 1e9
             print(f"  Downloading more from HuggingFace (need {remaining:.1f}B more chars)...")
-            ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT",
+            ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-350BT",
                               split="train", streaming=True)
             t0 = time.time()
             for doc in ds:
@@ -146,46 +144,6 @@ def _download_fineweb_edu(max_tokens):
 
     del seen
     print(f"  FineWeb-Edu total: {n_docs:,} docs, ~{n_chars/3.5/1e9:.2f}B tokens")
-    return out_path
-
-
-def _download_dclm_edu(max_tokens):
-    """Download DCLM-Edu — edu-classified web text from DataComp-LM."""
-    from datasets import load_dataset
-
-    out_path = RAW_DIR / "dclm_edu.jsonl"
-    if out_path.exists():
-        n = sum(1 for _ in open(out_path))
-        est = n * 3000 / 3.5
-        print(f"DCLM-Edu: already have {n:,} docs (~{est/1e9:.1f}B tokens)")
-        if est >= max_tokens * 0.9:
-            return out_path
-
-    print(f"Downloading DCLM-Edu (target: {max_tokens/1e9:.1f}B tokens)...")
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-
-    ds = load_dataset("HuggingFaceTB/dclm-edu", split="train", streaming=True)
-
-    n_docs = 0
-    n_chars = 0
-    max_chars = max_tokens * 3.5
-    t0 = time.time()
-
-    with open(out_path, "w") as f:
-        for doc in ds:
-            text = doc.get("text", "")
-            if len(text) < 100:
-                continue
-            f.write(json.dumps({"text": text, "source": "dclm_edu"}) + "\n")
-            n_docs += 1
-            n_chars += len(text)
-            if n_docs % 100000 == 0:
-                elapsed = time.time() - t0
-                print(f"  {n_docs:,} docs, ~{n_chars/3.5/1e9:.2f}B tokens, {elapsed:.0f}s")
-            if n_chars >= max_chars:
-                break
-
-    print(f"  DCLM-Edu total: {n_docs:,} docs, ~{n_chars/3.5/1e9:.2f}B tokens")
     return out_path
 
 
@@ -594,14 +552,13 @@ def _download_stack_edu(max_tokens):
 def download_main():
     """Download all main dataset sources."""
     print("=" * 60)
-    print("Downloading main dataset sources (target: ~28B tokens)")
+    print("Downloading main dataset sources (target: ~50B tokens)")
     print("=" * 60)
 
     paths = {}
 
     print("\n--- Web text ---")
     paths["fineweb_edu"] = _download_fineweb_edu(TARGETS["web"]["fineweb_edu"])
-    paths["dclm_edu"] = _download_dclm_edu(TARGETS["web"]["dclm_edu"])
     paths["wikipedia"] = _download_wikipedia(TARGETS["web"]["wikipedia"])
     paths["cosmopedia"] = _download_cosmopedia(TARGETS["web"]["cosmopedia"])
 
@@ -818,7 +775,6 @@ def tokenize_main():
     # raw file paths for each source
     source_configs = {
         "fineweb_edu":   (RAW_DIR / "fineweb_edu_v3.jsonl",  TARGETS["web"]["fineweb_edu"]),
-        "dclm_edu":      (RAW_DIR / "dclm_edu.jsonl",        TARGETS["web"]["dclm_edu"]),
         "wikipedia":     (RAW_DIR / "wikipedia_v3.jsonl",     TARGETS["web"]["wikipedia"]),
         "cosmopedia":    (RAW_DIR / "cosmopedia_v3.jsonl",    TARGETS["web"]["cosmopedia"]),
         "starcoderdata": (RAW_DIR / "starcoderdata_v3.jsonl", TARGETS["code"]["starcoderdata"]),

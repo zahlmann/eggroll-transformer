@@ -121,32 +121,30 @@ Skip until we've done much more pretraining.
 
 ### Phase 1: Extended Pretraining (v3 dataset)
 
-**New data mix (~28B unique tokens):**
+**Same distribution as v2, scaled to ~50B unique tokens:**
 
 ```
 Source                  Tokens    Pct    Notes
-FineWeb-Edu (>= 3)     10.0B    36%    Expand from 2.72B, use more of sample-10BT
-DCLM-Edu                5.0B    18%    NEW: quality-filtered web from DataComp
-StarCoder               5.5B    20%    Expand from 2.18B, more languages
-OpenWebMath             3.0B    11%    Expand from 1.47B, use more of full dataset
-Wikipedia               2.0B     7%    Expand from 0.69B, full English wiki
-Cosmopedia v2           2.5B     9%    Expand from 0.62B, synthetic textbooks
+FineWeb-Edu (>= 3)     17.0B    34%    Expand from 2.72B, use sample-350BT
+StarCoder              15.0B    30%    Expand from 2.18B, all 13 languages
+OpenWebMath             9.5B    19%    Expand from 1.47B, use more of full dataset
+Wikipedia               4.5B     9%    Expand from 0.69B, full English wiki
+Cosmopedia v2           4.0B     8%    Expand from 0.62B, synthetic textbooks
 ─────────────────────────────────────
-Total                  28.0B   100%
+Total                  50.0B   100%
 ```
 
-**Why these numbers:**
-- Web (FineWeb-Edu + DCLM-Edu + Wikipedia + Cosmopedia): 70% — matches SmolLM2
-- Code (StarCoder): 20% — between Llama3 (25%) and SmolLM2 (15-20%)
-- Math (OpenWebMath): 11% — reduced from 19% but still above most peers (reasoning focus)
-- 28B tokens = ~91 tokens/param. With 2 epochs = ~183 tokens/param (near MiniCPM's 192x)
+**Why keep the original distribution:**
+- Model targets agentic coding and reasoning — heavy code (30%) and math (19%) is intentional
+- Phi papers validate this: overweighting code + math produces better reasoning than web-heavy mixes
+- 50B tokens = ~163 tokens/param. With 2 epochs = ~327 tokens/param (above MiniCPM's 192x)
 
 **Training schedule:**
 - Use WSD: warmup 2K steps, stable at LR 3e-4, decay last 15%
 - Curriculum: ctx=128 (10%), ctx=256 (20%), ctx=512 (70%)
-- 2 epochs on v3 dataset = ~56B tokens total
-- Estimated time: 2 epochs × ~28B tokens / 28.4K tok/s ≈ 548h on RTX 4080 Super
-  (or ~40h on B200)
+- 2 epochs on v3 dataset = ~100B tokens total
+- Estimated time: 2 epochs × ~50B tokens / 28.4K tok/s ≈ 977h on RTX 4080 Super
+  (or ~82h on B200)
 
 ### Phase 2: Annealing (high-quality cooldown)
 
@@ -174,8 +172,7 @@ Stack-Edu                 0.7B    23%
 
 | Source | HF Path | Size | Notes |
 |--------|---------|------|-------|
-| FineWeb-Edu | `HuggingFaceFW/fineweb-edu` sample-10BT | ~10B tok | score >= 3, quality web |
-| DCLM-Edu | `HuggingFaceTB/dclm-edu` | 100B+ tok | NEW: edu-filtered DCLM |
+| FineWeb-Edu | `HuggingFaceFW/fineweb-edu` sample-350BT | ~350B tok | score >= 3, quality web |
 | StarCoder | `bigcode/starcoderdata` | 250B+ tok | 13 languages, deduplicated |
 | OpenWebMath | `open-web-math/open-web-math` | ~14.7B tok | math with LaTeX |
 | Wikipedia | `wikimedia/wikipedia` 20231101.en | ~3-4B tok | full English |
@@ -187,8 +184,8 @@ Stack-Edu                 0.7B    23%
 
 ## What Changes in the Pipeline
 
-1. **New script:** `prepare_data_v3.py` — downloads expanded sources + DCLM-Edu
-2. **Output:** `data/tokens_v3/train.bin` + `val.npy` (~28B tokens, ~112GB)
+1. **New script:** `prepare_data_v3.py` — downloads expanded sources (same 5 as v2)
+2. **Output:** `data/tokens_v3/train.bin` + `val.npy` (~50B tokens, ~200GB)
 3. **Existing data preserved:** `data/tokens_v2/` untouched
 4. **Tokenizer:** same 32K BPE (no change)
 5. **Annealing data:** separate `data/tokens_v3_anneal/` for phase 2

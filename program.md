@@ -517,12 +517,12 @@ Research complete. See `data_research.md` for full findings and rationale.
 **Key findings:**
 - Tokens/param ratio (25.6x unique) is extremely low vs peers (SmolLM2-360M: 11,000x)
 - 3 epochs on current data is fine (up to 4 safe), but more unique data is the lever
-- Data mix was too heavy on code (29%) and math (19%) vs general-purpose models (70%+ web)
+- Original data mix (30% code, 19% math) is well-suited for agentic coding/reasoning model
 - Annealing on high-quality data is standard practice (Llama 3, SmolLM2, MiniCPM)
 - Instruction tuning degrades quality at 306M scale — skip it
 
-**Implemented:** `prepare_data_v3.py` creates expanded v3 dataset + annealing dataset.
-Run `uv run prepare_data_v3.py` to download and prepare.
+**Implemented:** `prepare_data_v3.py` creates expanded v3 dataset (~50B tokens, same
+distribution) + annealing dataset (~3B tokens). Run `uv run prepare_data_v3.py` to download.
 
 ---
 
@@ -574,20 +574,19 @@ uv run python -u train.py \
   2>&1 | tee training_ctx1024.log
 ```
 
-### v3 Data Mix (~28B unique tokens)
+### v3 Data Mix (~50B unique tokens, same ratios as v2)
 
 ```
 Source                  Tokens    Pct    HuggingFace Path
-FineWeb-Edu (>= 3)     10.0B    36%    HuggingFaceFW/fineweb-edu sample-10BT
-DCLM-Edu                5.0B    18%    HuggingFaceTB/dclm-edu
-StarCoder               5.5B    20%    bigcode/starcoderdata
-OpenWebMath             3.0B    11%    open-web-math/open-web-math
-Wikipedia               2.0B     7%    wikimedia/wikipedia
-Cosmopedia v2           2.5B     9%    HuggingFaceTB/smollm-corpus cosmopedia-v2
+FineWeb-Edu (>= 3)     17.0B    34%    HuggingFaceFW/fineweb-edu sample-350BT
+StarCoder              15.0B    30%    bigcode/starcoderdata
+OpenWebMath             9.5B    19%    open-web-math/open-web-math
+Wikipedia               4.5B     9%    wikimedia/wikipedia
+Cosmopedia v2           4.0B     8%    HuggingFaceTB/smollm-corpus cosmopedia-v2
 ─────────────────────────────────────
-Total                  28.0B   100%
+Total                  50.0B   100%
 
-Web: 70% | Code: 20% | Math: 11%
+Web: 51% | Code: 30% | Math: 19%  (optimized for coding/reasoning agents)
 ```
 
 ### Annealing Data Mix (~3B tokens)
