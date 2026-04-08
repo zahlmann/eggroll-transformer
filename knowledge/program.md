@@ -666,3 +666,55 @@ uv run python -u prepare_data_v2.py
 Downloads all 5 sources from HuggingFace, tokenizes with 32K BPE, shuffles, and
 combines into `data/tokens_v2/train.bin` (31.4GB). Idempotent — re-run to resume
 interrupted downloads. Takes 1-2 hours depending on network speed.
+
+---
+
+## Current Task: Rewrite inference_explained.md
+
+Rewrite `knowledge/inference_explained.md` from scratch as a comprehensive, first-principles
+explanation of all inference code and kernels. Every line of code should be explained.
+
+### Requirements
+
+1. **Assume only Python knowledge** — no prior knowledge of GPUs, Triton, JAX, transformers,
+   or any special syntax. Explain everything from first principles.
+2. **Cover every line of code** in the inference files:
+   - `kernels/multi_sm_decode.py` — the fused multi-SM decode kernel (all 24 layers in one launch)
+   - `kernels/fused_decode_nlayer.py` — weight/KV packing utilities + single-SM decode kernel
+   - `generate.py` — streaming text generation CLI
+   - `profile_kernels.py` — decode kernel profiling
+3. **Read like a good book** — skimmable, with clear section headers, progressive complexity,
+   concrete examples, and numerical illustrations
+4. **Cover these concepts** (all actually used in the code):
+   - How GPUs work (SMs, warps, threads, tensor cores)
+   - Memory hierarchy (registers, shared memory, L2 cache, HBM) and why it matters
+   - The memory wall: why decode is bandwidth-bound
+   - Triton basics (tl.load, tl.store, tl.dot, tl.arange, grid, num_warps, constexpr)
+   - What prefill and decode are, and why they have different bottlenecks
+   - KV cache: what it stores, why it exists, how it's packed into flat buffers
+   - Weight packing: all 24 layers' weights into one flat bf16 buffer
+   - RMSNorm in-kernel (h * rsqrt(mean(h²)) * scale)
+   - RoPE: cos/sin rotation on Q and K for position encoding
+   - GQA: mapping query heads to shared KV heads (head_id // GQA_GROUP)
+   - Online softmax / FlashAttention-style tiled attention (m_i, l_i, o_i accumulation)
+   - SwiGLU FFN: gate * sigmoid(gate) * up, tiled over hidden dimension
+   - Tied embeddings: output projection = token_emb.T
+   - D_BLOCK padding for non-power-of-2 D_MODEL (d_mask)
+   - Projection tiling (PROJ_TILE) to fit within shared memory
+   - Multi-SM parallelism: grid = N_HEADS, atomic barriers, memory fences (membar.gl)
+   - Separate workspace buffers for attention and FFN (race condition avoidance)
+   - Distributed FFN: each SM handles d_ff/total_blocks hidden units
+   - In-kernel argmax: local per-block max, block 0 reduces globally
+   - bf16 computation with f32 accumulation
+   - L2 cache eviction hints (evict_last, evict_first)
+   - Sampling strategies: temperature, top-p, repetition penalty
+   - The generation loop: JAX prefill → pack weights → Triton decode loop
+   - Roofline analysis: bytes per step, theoretical bandwidth, utilization %
+5. **Don't cover** things not in the code:
+   - No batched decode (deleted)
+   - No persistent decode (deleted)
+   - No paged KV cache (deleted)
+   - No serve.py (deleted)
+   - No Triton prefill (we use JAX prefill)
+6. **Reference actual code** — use real variable names, real line numbers, real function
+   signatures from the current files. Don't invent simplified examples.
