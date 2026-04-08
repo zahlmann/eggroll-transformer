@@ -51,8 +51,6 @@ def main():
     # data — streaming memmap dataset (v2 or v3)
     data = load_data(context_len=args.context_len, data_dir=args.data_dir)
     vocab_size = data["vocab_size"]
-    assert data.get("streaming", False), "expected v2 streaming dataset"
-
     train_tokens = data["train_tokens"]  # memmap, not in RAM
     n_train_seqs = (len(train_tokens) - 1) // args.context_len
     n_batches = n_train_seqs // args.batch_size
