@@ -610,8 +610,13 @@ def _tokenize_source(source_name, raw_path, tok_path, target_tokens, out_dir):
         with open(cache_meta) as f:
             meta = json.load(f)
         n = meta["total_tokens"]
-        print(f"  {source_name}: cached, {n/1e9:.2f}B tokens")
-        return source_name, n
+        if n > 0:
+            print(f"  {source_name}: cached, {n/1e9:.2f}B tokens")
+            return source_name, n
+        # stale empty cache — delete and re-tokenize
+        cache_bin.unlink()
+        cache_meta.unlink()
+        print(f"  {source_name}: stale empty cache, re-tokenizing...")
 
     tok = Tokenizer.from_file(str(tok_path))
     out_dir.mkdir(parents=True, exist_ok=True)
