@@ -1,6 +1,6 @@
 # Single-GPU Transformer
 
-Training and inference for a 306M parameter transformer on a single RTX 4080 Super. Custom Triton kernels for inference, JAX + cuDNN for training.
+Training and inference for a 306M parameter transformer on a single GPU. Custom Triton kernels for inference, JAX + cuDNN for training.
 
 Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style autonomous development — a coding agent is pointed at `knowledge/program.md` repeatedly. The human steers direction; the agent handles implementation, debugging, benchmarking, and documentation.
 
