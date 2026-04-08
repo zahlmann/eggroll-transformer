@@ -25,29 +25,20 @@ Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-st
      8% Cosmopedia     — synthetic textbooks
 ```
 
-## Inference Performance (RTX 4080 Super)
+## Performance (RTX 4080 Super)
 
 ```
-306M param model (d=1024, l=24, kv_splits=1)
+Inference:
+  Decode:    235 tok/s  (4.2 ms/tok, Triton multi-SM kernel)
+  Prefill:   156 ms for 128 tokens (JAX)
+  Weights:   607 MB bf16 (9.5x L2 — HBM-bound)
 
-  Multi-SM sync:       235 tok/s  (4.2 ms/tok, 17% BW util)
-  Pipelined:           263 tok/s  (3.8 ms/tok, 1.12x)
-  Persistent:          265 tok/s  (3.8 ms/tok, 1.13x)
-  Prefill (128 tok):   36.9 ms   (3469 tok/s, Triton)
-  Weight buffer:       607 MB (9.5x L2 — HBM-bound)
+Training:
+  28.4K tok/s (bs=16, cuDNN FlashAttention + fused cross-entropy)
+  ~83h per epoch, 3 epochs x 7.85B tokens = 23.5B total
 ```
 
 The entire decode step — embedding, attention, FFN, output projection — runs in a single GPU kernel call across all 24 layers.
-
-## Training Performance
-
-```
-RTX 4080 Super (bs=16):  ~26K tok/s
-NVIDIA B200 (bs=256):   ~341K tok/s
-
-3 epochs x 7.85B tokens = 23.5B total
-~6h per epoch on B200, ~83h per epoch on 4080 Super
-```
 
 ## Quick Start
 
@@ -60,10 +51,7 @@ uv run generate.py --prompt "Once upon a time" --temp 0.7 --top-p 0.95 --rep-pen
 # greedy decoding
 uv run generate.py --prompt "The capital of France is"
 
-# code generation (low temperature)
-uv run generate.py --prompt "def fibonacci(n):" --temp 0.3 --top-p 0.9 --rep-penalty 1.1
-
-# profile decode kernels
+# profile decode kernel
 uv run profile_kernels.py
 
 # prepare training data (download + tokenize 7.85B tokens from 5 sources)
