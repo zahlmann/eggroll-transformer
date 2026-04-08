@@ -669,7 +669,7 @@ interrupted downloads. Takes 1-2 hours depending on network speed.
 
 ---
 
-## Current Task: Rewrite inference_explained.md
+## Completed: Rewrite inference_explained.md
 
 Rewrite `knowledge/inference_explained.md` from scratch as a comprehensive, first-principles
 explanation of all inference code and kernels. Every line of code should be explained.
