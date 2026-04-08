@@ -1528,43 +1528,13 @@ Kernels:
   kernels/persistent_batched_decode.py — persistent batched (B seq × N steps)
   kernels/paged_kv.py               — paged KV cache memory management (PagePool)
 
-Inference:
-  generate.py                        — streaming text generation + sampling (temp, top-p, rep penalty)
-  serve.py                           — variable-length batched inference server
-
-Data:
-  prepare_data.py                    — multi-source data download + tokenization (epoch 1 & 2)
-  sweep_sampling.py                  — automated parameter sweep across domains
+Serving:
+  generate.py                        — streaming text generation CLI
+  serve.py                           — batched server + continuous batching
 
 Benchmarking:
   profile_kernels.py                 — primary profiling tool
-  baseline_metrics.txt               — current performance numbers
 ```
 
-```
-Core:
-  model.py                           — JAX transformer model
-  data.py                            — Shakespeare + TinyStories + BPE tokenizer
-  train.py                  — AdamW training with LR schedule
-
-Kernels:
-  kernels/fused_prefill.py           — fused prefill (d_model <= 64, one kernel call)
-  kernels/fused_decode.py            — fused decode (d_model <= 64, one kernel call)
-  kernels/block_prefill.py           — multi-block prefill + FlashAttention + GQA (d_model >= 128)
-  kernels/block_decode.py            — per-layer decode orchestrator (d_model >= 128)
-  kernels/fused_decode_nlayer.py     — fused N-layer decode (packed weights/caches)
-  kernels/multi_sm_decode.py         — multi-SM decode with atomic barriers + KV-split
-  kernels/batched_decode.py          — batched multi-SM decode (B sequences, tensor core projections)
-  kernels/persistent_decode.py       — persistent decode (single launch, all steps)
-  kernels/persistent_batched_decode.py — persistent batched (B seq × N steps)
-  kernels/paged_kv.py               — paged KV cache memory management (PagePool)
-
-Inference:
-  generate.py                        — streaming text generation API + CLI
-  serve.py                           — variable-length batched inference server
-
-Benchmarking:
-  profile_kernels.py                 — primary profiling tool
-  inference_benchmark.py             — quick throughput + text generation demo
-  baseline_metrics.txt               — current performance numbers
-```
+For the training pipeline (data preparation, model architecture, training loop),
+see [`training_explained.md`](training_explained.md).

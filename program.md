@@ -306,7 +306,7 @@ Variants:
 Training:
   model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
   train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
-  data.py                              streaming data loading (v2/v3 memmap, legacy datasets)
+  data.py                              streaming data loading (v2/v3 memmap, 8B+ tokens)
   prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle, combine
   prepare_data_v3.py                   v3 data pipeline: 6 sources (28B) + annealing (3B)
 
@@ -318,8 +318,6 @@ Inference kernels:
   kernels/block_prefill.py             multi-block prefill + FlashAttention + GQA
   kernels/fused_decode_nlayer.py       weight/KV packing for all decode kernels
   kernels/paged_kv.py                  paged KV cache (GPU gather/scatter)
-  kernels/fused_prefill.py             legacy fused prefill (d<=64)
-  kernels/fused_decode.py              legacy fused decode (d<=64)
 
 Serving:
   generate.py                          streaming text generation CLI
@@ -327,14 +325,13 @@ Serving:
 
 Benchmarking:
   profile_kernels.py                   primary profiling tool
-  profile_vram.py                      VRAM profiling for model scaling
 
 Documentation:
   program.md                           this file (read first)
-  data_research.md                     training data research findings and recommendations
-  repo_explained_from_zero.md          ground-up GPU kernel explanation
-  README.md                            project overview
-  H100_TRAINING.md                     cloud GPU training setup guide
+  inference_explained.md               ground-up GPU kernel explanation
+  training_explained.md                first-principles training pipeline explanation
+  data_research.md                     training data research findings
+  gpu_server_training_instructions.md  cloud GPU training setup guide
 ```
 
 ---

@@ -1,10 +1,15 @@
 # Single-GPU Transformer
 
-Training and inference for a decoder-only transformer, built from scratch. Custom Triton kernels for decode. JAX for training. No frameworks, no shortcuts.
+Training and inference for a 306M parameter transformer on a single RTX 4080 Super. Custom Triton kernels for inference, JAX + cuDNN for training.
 
 Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style autonomous development — a coding agent is pointed at `program.md` repeatedly. The human steers direction; the agent handles implementation, debugging, benchmarking, and documentation.
 
-See [`repo_explained_from_zero.md`](repo_explained_from_zero.md) for a ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all techniques used.
+## Documentation
+
+- [`inference_explained.md`](inference_explained.md) — ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all inference techniques used
+- [`training_explained.md`](training_explained.md) — first-principles explanation of the training pipeline (data, model, training loop)
+- [`program.md`](program.md) — full development log and agent program
+- [`data_research.md`](data_research.md) — training data research and rationale
 
 ## Current Model
 
@@ -40,11 +45,13 @@ The entire decode step — embedding, attention, FFN, output projection — runs
 RTX 4080 Super (bs=16):  ~26K tok/s
 NVIDIA B200 (bs=256):   ~341K tok/s
 
-3 epochs × 7.85B tokens = 23.5B total
+3 epochs x 7.85B tokens = 23.5B total
 ~6h per epoch on B200, ~83h per epoch on 4080 Super
 ```
 
 ## Quick Start
+
+Requires `weights.pkl` in the repo root (not included — too large for git).
 
 ```bash
 # generate text (streaming, with sampling)
@@ -68,7 +75,7 @@ uv run profile_kernels.py
 # prepare training data (download + tokenize 7.85B tokens from 5 sources)
 uv run prepare_data_v2.py
 
-# train (see H100_TRAINING.md for cloud GPU setup)
+# train (see gpu_server_training_instructions.md for cloud GPU setup)
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 3 \
@@ -77,7 +84,7 @@ uv run python -u train.py \
 
 ## What's In Here
 
-**Training**: JAX model with cuDNN FlashAttention, AdamW with cosine LR schedule, curriculum training (ctx warmup 128→256→512). Fused cross-entropy for 32K vocab without OOM. Multi-source data pipeline with 32K BPE tokenizer.
+**Training**: JAX model with cuDNN FlashAttention, AdamW with cosine LR schedule, curriculum training (ctx warmup 128->256->512). Fused cross-entropy for 32K vocab without OOM. Multi-source data pipeline with 32K BPE tokenizer.
 
 **Inference kernels**: 7 Triton kernel files covering single-sequence, batched, persistent, and pipelined decode. Multi-SM parallelism with atomic barriers, KV-split attention (FlashDecoding-style), weight-amortized FFN. Projection tiling for D_HEAD=64 shared memory constraints.
 
@@ -87,30 +94,32 @@ uv run python -u train.py \
 
 ```
 Training:
-  model.py                          JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
-  train.py                          AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
-  data.py                           streaming data loading (v2 memmap for 8B tokens)
-  prepare_data_v2.py                v2 data pipeline: 5-source download, tokenize, shuffle, combine
+  model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
+  train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
+  data.py                              streaming data loading (v2/v3 memmap, 8B+ tokens)
+  prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle, combine
+  prepare_data_v3.py                   v3 data pipeline: 6 sources (28B) + annealing (3B)
 
 Inference kernels:
-  kernels/multi_sm_decode.py        multi-SM decode with atomic barriers + KV-split
-  kernels/batched_decode.py         batched multi-SM decode (B sequences)
-  kernels/persistent_decode.py      persistent decode (single launch, all steps)
-  kernels/persistent_batched_decode.py  persistent batched (B x N steps)
-  kernels/block_prefill.py          multi-block prefill + FlashAttention + GQA
-  kernels/fused_decode_nlayer.py    weight/KV packing for all decode kernels
-  kernels/paged_kv.py               paged KV cache (GPU gather/scatter)
+  kernels/multi_sm_decode.py           multi-SM decode with atomic barriers + KV-split
+  kernels/batched_decode.py            batched multi-SM decode (B sequences, tensor core projections)
+  kernels/persistent_decode.py         persistent decode (single launch, all steps)
+  kernels/persistent_batched_decode.py persistent batched (B x N steps)
+  kernels/block_prefill.py             multi-block prefill + FlashAttention + GQA
+  kernels/fused_decode_nlayer.py       weight/KV packing for all decode kernels
+  kernels/paged_kv.py                  paged KV cache (GPU gather/scatter)
 
 Serving:
-  generate.py                       streaming text generation CLI
-  serve.py                          batched server + continuous batching
+  generate.py                          streaming text generation CLI
+  serve.py                             batched server + continuous batching
 
 Benchmarking:
-  profile_kernels.py                primary profiling tool
-  profile_vram.py                   VRAM profiling for model scaling
+  profile_kernels.py                   primary profiling tool
 
 Documentation:
-  program.md                        agent program / development log
-  H100_TRAINING.md                  cloud GPU training setup guide
-  repo_explained_from_zero.md       ground-up GPU kernel explanation
+  program.md                           agent program / development log
+  inference_explained.md               ground-up GPU kernel explanation
+  training_explained.md                first-principles training pipeline explanation
+  data_research.md                     training data research findings
+  gpu_server_training_instructions.md                     cloud GPU training setup guide
 ```
