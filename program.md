@@ -526,35 +526,17 @@ distribution) + annealing dataset (~3B tokens). Run `uv run prepare_data_v3.py` 
 
 ---
 
-## Current Task: Simplify and Clean Up Code
+## Completed: Simplify and Clean Up Code
 
-Rewrite `data.py`, `prepare_data_v3.py`, and `train.py` to be extremely clean,
-simple, and skimmable. Apply these rules strictly:
-
-### Code Style Rules
-
-1. **Write extremely simple code** — it should be "skimmable" and still understandable
-2. **Minimize possible states** — reduce number of arguments, remove or narrow any state
-3. **Use discriminated unions** to reduce number of states the code can be in
-4. **Exhaustively handle** any objects with multiple different types, fail on unknown type
-5. **Don't write defensive code** — assume values are always what types tell you they are
-6. **Use asserts when loading data** — be highly opinionated about parameters you pass around.
-   Don't let things be optional if not strictly required
-7. **Remove any code that is not strictly required**
-8. **Bias for fewer lines of code**
-9. **No complex or clever code**
-10. **Don't break out into too many functions** — that's hard to read
-11. **Early returns are great**
-12. **Use asserts instead of try/except or default values** when you expect something to exist
-13. **Never pass overrides except when strictly necessary** — keep argument count low
-14. **Don't make arguments optional if they are actually required**
-
-### Files to clean up
-
-- `data.py` — streaming data loading
-- `prepare_data_v3.py` — v3 data pipeline (download, tokenize, combine)
-- `prepare_data_v2.py` — v2 data pipeline
-- `train.py` — training loop
+Cleaned up training files for readability and reduced line count:
+- `data.py`: 86 → 67 lines. Removed unused return fields (decode_fn, tokenizer,
+  streaming, train_x/y=None), inlined _make_sequences, store absolute tokenizer path.
+- `train.py`: 273 → 254 lines. Precomputed curriculum phase boundaries (13→4 lines),
+  removed dead streaming assert.
+- `prepare_data_v2.py`: 662 → 446 lines. Unified 4 download functions into one
+  parameterized _download_source (StarCoder kept separate for multi-lang handling).
+- `prepare_data_v3.py`: 886 → 517 lines. Unified 8 download functions (5 main + 3
+  annealing) into 2 generic ones (_download_source + _download_multilang) with config tables.
 - `model.py` — JAX transformer model
 
 ### What NOT to change
