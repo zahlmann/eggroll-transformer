@@ -27,23 +27,23 @@ No GPU experience required — just Python and a rough idea of what neural nets 
 
 13. [Scaling the Model](#13-scaling-the-model)
 14. [Multi-SM Decode: Using the Whole GPU](#14-multi-sm-decode-using-the-whole-gpu)
-15. [Batched Decode: Multiple Sequences at Once](#15-batched-decode-multiple-sequences-at-once)
-16. [Persistent Decode: Eliminating Host Sync](#16-persistent-decode-eliminating-host-sync)
-17. [What Didn't Work](#17-what-didnt-work)
-18. [Key Lessons](#18-key-lessons)
+15. [What Didn't Work](#15-what-didnt-work)
+16. [Key Lessons](#16-key-lessons)
 
-**Part III: Production Scale (d=768, 12 layers, 81M params)**
+**Part III: Production Scale (d=768+, 12-24 layers)**
 
-19. [GQA: Grouped Query Attention](#19-gqa-grouped-query-attention)
-20. [Non-Power-of-2 D_MODEL (D_BLOCK Padding)](#20-non-power-of-2-d_model-d_block-padding)
-21. [L2 Cache Hints and Bandwidth Optimization](#21-l2-cache-hints-and-bandwidth-optimization)
-22. [Tensor Core Batched Projections](#22-tensor-core-batched-projections)
-23. [Streaming and Serving APIs](#23-streaming-and-serving-apis)
-24. [Paged KV Cache](#24-paged-kv-cache)
-25. [Sampling and Decoding Strategies](#25-sampling-and-decoding-strategies)
-26. [Training at Scale: Multi-Epoch on Fresh Data](#26-training-at-scale-multi-epoch-on-fresh-data)
+17. [GQA: Grouped Query Attention](#17-gqa-grouped-query-attention)
+18. [Non-Power-of-2 D_MODEL (D_BLOCK Padding)](#18-non-power-of-2-d_model-d_block-padding)
+19. [L2 Cache Hints and Bandwidth Optimization](#19-l2-cache-hints-and-bandwidth-optimization)
+20. [Tensor Core Batched Projections](#20-tensor-core-batched-projections)
+21. [Sampling and Decoding Strategies](#21-sampling-and-decoding-strategies)
 
 ---
+
+*Note: Part I walks through small kernels (d=64, 1 layer) that were stepping stones
+toward the current production kernel (`kernels/multi_sm_decode.py`). Those small kernel
+files have been removed from the repo, but the concepts they teach — register-level data
+flow, fused operations, KV caching — are exactly what the production kernel uses at scale.*
 
 ## 1. The Problem
 
@@ -985,105 +985,7 @@ GPU→CPU sync (`int()` per token) costs 34% of total time — addressed in sect
 
 ---
 
-## 15. Batched Decode: Multiple Sequences at Once
-
-### The idea
-
-In production, you're often generating for multiple users simultaneously. Instead of
-running B separate decode calls, run one kernel that processes B sequences in parallel.
-Weight loads are shared across the batch — loaded once, used B times.
-
-### Implementation
-
-Same grid as single-sequence, but each block processes B sequences. The kernel loads each
-weight tile once, then loops over B sequences applying it. KV caches are independent per
-sequence.
-
-### Race conditions (the hard part)
-
-Two critical race conditions emerged:
-
-**1. h_buf read-write race.** All blocks read h, compute `h_new = h + residual`, and write
-back. A fast block can overwrite h before a slow block reads the original, causing
-`h + 2 × residual` instead of `h + residual`. Fix: **double-buffered h_buf** — even layers
-read buf_a/write buf_b, odd layers read buf_b/write buf_a.
-
-**2. Partial buffer merge/FFN race.** After the phase 1 barrier, all blocks read attention
-o_proj from the partial buffer while also writing FFN results to the same buffer. A fast
-block can overwrite o_proj before a slow block reads it. Fix: **separate ffn_buf** for FFN
-accumulation.
-
-### Weight-amortized FFN
-
-The initial batched kernel loaded FFN weights B times per tile (once per batch element in
-a fused merge+LN+FFN loop). De-fusing into separate passes — merge+LN for all B first,
-then FFN with outer k-loop / inner b-loop — loads weights once per tile regardless of B.
-
-Result: B=4 +14%, B=8 +22%, B=16 +19%.
-
-### Results
-
-```
-Single-sequence:        1935 tok/s
-Batched B=4 (sync):     4205 tok/s  (2.17x)
-Batched B=4 (pipe):     6691 tok/s  (3.46x)
-Batched B=8 (pipe):     7339 tok/s  (3.79x)
-Batched B=16 (sync):    6064 tok/s  (3.13x)
-```
-
-Why not 4x at B=4? Per-sequence compute (attention over 512 KV positions) adds ~0.17 ms
-per additional sequence regardless of weight sharing. The theoretical 4x assumed weights
-dominated kernel time, but attention is a significant fixed cost per sequence.
-
----
-
-## 16. Persistent Decode: Eliminating Host Sync
-
-### The GPU→CPU sync bottleneck
-
-After multi-SM optimization, the kernel itself runs in 0.32 ms per token. But `int(next_token)`
-forces a GPU→CPU transfer each step, adding 0.15-0.20 ms. **Sync accounts for 30-60% of
-wall time.**
-
-### Persistent kernel: one launch for all tokens
-
-Instead of one kernel call per token, launch a single kernel that runs all N decode steps
-internally. Block 0 computes argmax in-kernel and writes the next token to a workspace buffer.
-A step-sync barrier ensures all blocks see it before the next step's embedding lookup.
-
-```
-Normal decode (N kernel launches):
-  Host: launch → sync → read token → launch → sync → read token → ...
-
-Persistent decode (1 kernel launch):
-  Host: launch ──────────────────────────────────→ read all N tokens
-  GPU:  [step 0 → step 1 → step 2 → ... → step N]
-         └── all tokens stay on GPU, no host sync ──┘
-```
-
-Fresh barrier slots per step (`step * BARRIERS_PER_STEP + barrier_idx`) avoid reusing
-counters. The initial KV copy (input → output buffer) is done cooperatively by all blocks
-before the step loop, protected by a barrier.
-
-### Pipelined batched decode
-
-For batched inference, a lighter-weight alternative: tokens stay on GPU as JAX arrays, and
-JAX overlaps dispatch of the next step with execution of the current one. Not as fast as
-a true persistent kernel, but much simpler.
-
-### Results
-
-```
-Single-seq sync'd:      1869 tok/s  (0.535 ms/tok)
-Single-seq pipelined:   2624 tok/s  (0.381 ms/tok)
-Persistent kernel:      4777 tok/s  (0.209 ms/tok)  ← 2.56x vs sync'd
-Batched B=4 sync'd:     4205 tok/s
-Batched B=4 pipelined:  6691 tok/s                   ← 1.59x vs sync'd
-```
-
----
-
-## 17. What Didn't Work
+## 15. What Didn't Work
 
 Not everything we tried improved performance. Documenting failures is as important as
 documenting successes — they reveal what the actual bottlenecks are.
@@ -1106,7 +1008,7 @@ tok/s) are fast. The speed ratio is only ~2x, not the ~10x needed. Acceptance ra
 
 ---
 
-## 18. Key Lessons
+## 16. Key Lessons
 
 ### Fundamentals
 
@@ -1168,24 +1070,20 @@ doesn't matter. GQA helps when KV cache is the memory bottleneck (batched, long-
 ## Running It Yourself
 
 ```bash
-# train the model (d=512, 8 layers, ~4 hours on TinyStories)
-uv run train.py --d-model 512 --n-heads 16 --n-layers 8 \
-  --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
+# generate text
+uv run generate.py --prompt "Once upon a time" --temp 0.7 --top-p 0.95
 
-# profile kernels (primary benchmark)
+# profile decode kernel
 uv run profile_kernels.py
-
-# quick inference demo
-uv run inference_benchmark.py
 ```
 
 ---
 
-## Part III: Production Scale (d=768, 12 layers, 81M params)
+## Part III: Production Scale (d=768+, 12-24 layers)
 
 ---
 
-## 19. GQA: Grouped Query Attention
+## 17. GQA: Grouped Query Attention
 
 Standard multi-head attention uses N_HEADS separate K/V heads. GQA (Grouped Query
 Attention) shares K/V across groups of Q heads, reducing KV cache size.
@@ -1206,7 +1104,7 @@ is (N_KV_HEADS, SEQ, D_HEAD) instead of (N_HEADS, SEQ, D_HEAD).
 
 ---
 
-## 20. Non-Power-of-2 D_MODEL (D_BLOCK Padding)
+## 18. Non-Power-of-2 D_MODEL (D_BLOCK Padding)
 
 Triton's `tl.arange` requires power-of-2 dimensions. For d_model=768, we use D_BLOCK=1024
 (next power of 2) with masking:
@@ -1231,7 +1129,7 @@ fails at d=768 — the double-buffered tiles at (1024, 32) exceed shared memory.
 
 ---
 
-## 21. L2 Cache Hints and Bandwidth Optimization
+## 19. L2 Cache Hints and Bandwidth Optimization
 
 At d=768, the weight buffer (162 MB) exceeds the L2 cache (~64 MB). Every decode step
 re-fetches all weights from HBM — the "terminal bandwidth bottleneck."
@@ -1260,7 +1158,7 @@ argmax reduction inline before signaling, we merge them into 1 barrier. Saves ~2
 
 ---
 
-## 22. Tensor Core Batched Projections
+## 20. Tensor Core Batched Projections
 
 With batched inference, each block processes B sequences. Previously, Q/K/V projections
 looped over sequences:
@@ -1291,61 +1189,7 @@ pattern still reduces loop overhead.
 
 ---
 
-## 23. Streaming and Serving APIs
-
-**Streaming generation** (`generate.py`): A Python generator that yields tokens one at
-a time using pipelined multi-SM decode (one kernel call per token):
-
-```python
-for token_id in stream_tokens(params, config, prompt_ids, max_tokens=128):
-    print(decode_fn([token_id]), end='', flush=True)
-```
-
-Each token requires a GPU→CPU sync (`int(tok)`), giving ~966 tok/s at d=768 (vs ~1503
-tok/s for batch-synced pipelined where all tokens stay on GPU until the end).
-
-**Variable-length batched serving** (`serve.py`): The `BatchedServer` class manages
-multiple sequences at different generation stages. The batched decode kernel already
-supports per-sequence positions via `positions_ptr` — each sequence has its own `pos_b`
-for attention masking. The server handles:
-- Adding/removing sequences from the batch
-- Per-sequence position tracking and stopping conditions
-- Building batched inputs from heterogeneous sequence states
-
----
-
-## 24. Paged KV Cache
-
-Standard KV cache pre-allocates `max_seq × d_head` per sequence per layer per head.
-For short sequences, most of this is wasted. Paged KV cache allocates memory in pages
-(blocks of PAGE_SIZE=64 positions) on demand.
-
-**Page pool:** A pre-allocated buffer of physical pages. Each page stores 64 positions
-of KV data for all layers and all KV heads. `PagePool` manages allocation and freeing.
-
-**Page table:** Maps `(sequence_id, logical_page_index)` → `physical_page_id`.
-When a sequence grows past a page boundary, a new page is allocated from the pool.
-When a sequence completes, its pages are freed for reuse.
-
-**Memory savings:** 4 short prompts (4-7 tokens) use 1 page each = 2.4 MB total,
-vs 4 × 4.7 MB = 18.8 MB with contiguous allocation (87% reduction).
-
-**Current limitation:** This implementation does page management in Python and converts
-between paged and contiguous representations before each kernel call. The conversion
-adds overhead (~2x slower for short sequences). The next step is kernel-level paging:
-passing the page table to the attention loop so it does per-tile page lookups directly,
-eliminating the copy.
-
-```python
-# Future kernel-level paging (not yet implemented):
-logical_page = t // PAGE_SIZE
-phys_page = tl.load(page_table_ptr + b * MAX_PAGES + logical_page)
-K_tile = tl.load(page_pool_ptr + phys_page * PAGE_ELEMS + local_offset)
-```
-
----
-
-## 25. Sampling and Decoding Strategies
+## 21. Sampling and Decoding Strategies
 
 Greedy decoding (always pick the highest-probability token) is simple but causes
 **repetition collapse**: once the model assigns slightly higher probability to a phrase
@@ -1442,98 +1286,16 @@ uv run generate.py --prompt "your text" --temp 0.7 --top-p 0.95 --rep-penalty 1.
 
 ---
 
-## 26. Training at Scale: Multi-Epoch on Fresh Data
-
-Training a language model on the same data repeatedly (multiple epochs over the same
-tokens) causes overfitting — the model memorizes the training set instead of learning
-general patterns. The alternative: use fresh tokens each epoch.
-
-### Data pipeline design
-
-The model was trained in two epochs, each on entirely fresh data:
-
-**Epoch 1** (1.77B tokens):
-- 60% FineWeb-Edu (educational web text, quality score $\ge 3$)
-- 20% Cosmopedia v2 (synthetic textbook content)
-- 15% Wikipedia
-- 5% code_search_net (function-level code snippets)
-
-**Epoch 2** (1.72B fresh tokens, zero overlap):
-- 50% FineWeb-Edu (new documents, skipped epoch 1 docs)
-- 20% StarCoder (file-level code, much higher quality than code_search_net)
-- 15% Wikipedia (new articles)
-- 15% Cosmopedia v2 (new documents)
-
-The "skip epoch 1 docs" approach works because HuggingFace streaming datasets are
-deterministic — documents arrive in the same order every time. By counting how many
-qualifying documents epoch 1 consumed, epoch 2 simply skips that many before collecting
-new ones.
-
-### Resume from checkpoint
-
-Training resumes from epoch 1's weights with a fresh optimizer state:
-```bash
-uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 16 \
-  --context-len 512 --epochs 1 --batch-size 16 --lr 1e-4 --warmup-steps 500 \
-  --dataset combined_epoch2 --resume weights.pkl
-```
-
-The learning rate is lower than epoch 1 ($10^{-4}$ vs $3 \times 10^{-4}$) and warmup
-is shorter (500 vs 2000 steps). This is standard for continued training: the model is
-already in a good region of the loss landscape, so large learning rates would push it
-out before it can refine.
-
-### Results
-
-```
-                    Train loss    Val loss    Val ppl    Time
-Epoch 1 (1.77B):    3.04          3.04       20.91      13.7h
-Epoch 2 (1.72B):    2.70          3.34       28.16      13.4h
-Total: 3.49B unique tokens seen
-```
-
-Train loss improved significantly (3.04 → 2.70), but validation perplexity got worse
-(20.91 → 28.16). This isn't overfitting in the traditional sense — it's a
-**distribution shift** problem.
-
-The validation set was drawn from epoch 1's data mix (60% educational web, 5% code).
-Epoch 2's mix is different (50% web, 20% StarCoder code). The model genuinely improved
-on its new training distribution (which includes much more code), but the old validation
-set doesn't measure that improvement. A fairer evaluation would use a validation set
-drawn from epoch 2's data mix, or evaluate on downstream tasks that test code ability.
-
-This is a general lesson: **validation metrics are only meaningful when the validation
-set matches the distribution you care about.** When the training mix changes, the
-validation set must change too.
-
 ---
 
-### File overview
+### Files
 
 ```
-Core:
-  model.py                           — JAX transformer model
-  data.py                            — Shakespeare + TinyStories + BPE tokenizer
-  train.py                  — AdamW training with LR schedule + --resume
-
-Kernels:
-  kernels/fused_prefill.py           — fused prefill (d_model <= 64, one kernel call)
-  kernels/fused_decode.py            — fused decode (d_model <= 64, one kernel call)
-  kernels/block_prefill.py           — multi-block prefill + FlashAttention + GQA (d_model >= 128)
-  kernels/block_decode.py            — per-layer decode orchestrator (d_model >= 128)
-  kernels/fused_decode_nlayer.py     — fused N-layer decode (packed weights/caches)
-  kernels/multi_sm_decode.py         — multi-SM decode with atomic barriers + KV-split
-  kernels/batched_decode.py          — batched multi-SM decode (B sequences, tensor core projections)
-  kernels/persistent_decode.py       — persistent decode (single launch, all steps)
-  kernels/persistent_batched_decode.py — persistent batched (B seq × N steps)
-  kernels/paged_kv.py               — paged KV cache memory management (PagePool)
-
-Serving:
+Inference:
+  kernels/multi_sm_decode.py         — fused multi-SM decode (all 24 layers in one kernel)
+  kernels/fused_decode_nlayer.py     — weight/KV packing utilities
   generate.py                        — streaming text generation CLI
-  serve.py                           — batched server + continuous batching
-
-Benchmarking:
-  profile_kernels.py                 — primary profiling tool
+  profile_kernels.py                 — decode kernel profiling
 ```
 
 For the training pipeline (data preparation, model architecture, training loop),
