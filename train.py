@@ -122,26 +122,25 @@ def main():
         params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
         return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
 
-    # curriculum schedule: phases with (fraction_of_training, ctx, bs_multiplier)
+    # curriculum: short sequences first, then grow to full context
     if args.curriculum and args.context_len >= 256:
         phases = [
-            {"frac": 0.10, "ctx": args.context_len // 4, "bs_mult": 4},
-            {"frac": 0.20, "ctx": args.context_len // 2, "bs_mult": 2},
-            {"frac": 0.70, "ctx": args.context_len,      "bs_mult": 1},
+            {"ctx": args.context_len // 4, "bs_mult": 4, "end": int(0.10 * total_steps)},
+            {"ctx": args.context_len // 2, "bs_mult": 2, "end": int(0.30 * total_steps)},
+            {"ctx": args.context_len,      "bs_mult": 1, "end": total_steps},
         ]
         print(f"Curriculum: {' -> '.join(f'ctx={p['ctx']}(bs×{p['bs_mult']})' for p in phases)}")
     else:
-        phases = [{"frac": 1.0, "ctx": args.context_len, "bs_mult": 1}]
+        phases = [{"ctx": args.context_len, "bs_mult": 1, "end": total_steps}]
 
-    # pre-compile train steps for each unique context length
+    # pre-compile train steps for each context length
     phase_steps = {}
     for p in phases:
         if p["ctx"] not in phase_steps:
             phase_steps[p["ctx"]] = make_train_step(p)
 
     print(f"d={args.d_model} h={args.n_heads} kv_h={args.n_kv_heads} l={args.n_layers} "
-          f"ctx={args.context_len} bs={args.batch_size}")
-    print(f"combined_v2 trained_bpe vocab={vocab_size}")
+          f"ctx={args.context_len} bs={args.batch_size} vocab={vocab_size}")
     print(f"{count_params(params):,} params, {n_batches} steps/epoch, {total_steps} total")
 
     def _get_batch_streaming(seq_indices, ctx, bs, offset):
@@ -190,28 +189,12 @@ def main():
         if bi > 0:
             print(f"  resuming epoch {epoch+1} from batch {bi}/{n_batches}")
         while bi < n_batches:
-            # determine current phase
-            progress = global_step / total_steps
-            cur_phase = phases[-1]
-            cumfrac = 0.0
-            for p in phases:
-                cumfrac += p["frac"]
-                if progress < cumfrac:
-                    cur_phase = p
-                    break
-
+            # find current curriculum phase
+            cur_phase = next(p for p in phases if global_step < p["end"])
             ctx = cur_phase["ctx"]
             bs = args.batch_size * cur_phase["bs_mult"]
             train_step = phase_steps[ctx]
-
-            next_frac = 0.0
-            for p in phases:
-                next_frac += p["frac"]
-                if p is cur_phase:
-                    break
-            steps_until_phase_end = max(1, int(next_frac * total_steps) - global_step)
-            steps_in_epoch = n_batches - bi
-            chunk_steps = min(steps_until_phase_end, steps_in_epoch)
+            chunk_steps = min(cur_phase["end"] - global_step, n_batches - bi)
 
             # prefetch first batch
             s = bi * args.batch_size
@@ -235,7 +218,7 @@ def main():
                 steps_this_epoch += 1
 
                 step_in_epoch = bi + ci
-                if steps_this_epoch > 0 and step_in_epoch % 1000 == 0:
+                if step_in_epoch % 1000 == 0:
                     avg = eloss / steps_this_epoch
                     sps = steps_this_epoch / (time.perf_counter() - t_epoch)
                     eta = (n_batches - step_in_epoch) / sps / 60
