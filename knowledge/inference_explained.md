@@ -40,11 +40,6 @@ No GPU experience required — just Python and a rough idea of what neural nets 
 
 ---
 
-*Note: Part I walks through small kernels (d=64, 1 layer) that were stepping stones
-toward the current production kernel (`kernels/multi_sm_decode.py`). Those small kernel
-files have been removed from the repo, but the concepts they teach — register-level data
-flow, fused operations, KV caching — are exactly what the production kernel uses at scale.*
-
 ## 1. The Problem
 
 You have a trained transformer model. You want to generate text with it — feed in a prompt,
@@ -145,83 +140,88 @@ The math takes nanoseconds. The memory transfers take microseconds. The kernel l
 
 ---
 
-## 4. Our Transformer (the Tiny One)
+## 4. Our Transformer
 
 Before diving into the kernel code, let's understand exactly what our model computes.
-It's a decoder-only transformer trained on character-level Shakespeare.
 
 ### Architecture
 
 ```
-vocab_size:   65  (a-z, A-Z, punctuation, newline, space)
-d_model:      64  (dimension of token representations)
-n_heads:      2   (number of attention heads)
-d_head:       32  (= d_model / n_heads)
-d_ff:        256  (= 4 × d_model, FFN hidden dimension)
-context_len: 128  (maximum sequence length)
-parameters: 66,368
+vocab_size:    32000  (BPE tokenizer trained on corpus)
+d_model:        1024  (dimension of token representations)
+n_heads:          16  (number of query attention heads)
+n_kv_heads:        4  (number of key/value heads — GQA)
+d_head:           64  (= d_model / n_heads)
+d_ff:           2816  (SwiGLU FFN hidden dimension)
+n_layers:         24  (transformer layers)
+context_len:     512  (maximum sequence length)
+parameters: 306M
 ```
 
 ### The forward pass
 
 Given a sequence of token IDs like `[14, 27, 51, 3, ...]`, the model:
 
-**Step 1: Embedding.** Look up each token in a (65 × 64) table. Token 14 becomes a
-64-dimensional vector. Add a positional embedding from a (128 × 64) table — position 0
-gets one vector, position 1 gets another. Result: `h` with shape (128, 64).
+**Step 1: Embedding.** Look up each token in a (32000 × 1024) table. Token 14 becomes a
+1024-dimensional vector. No positional embedding — position is encoded via RoPE in step 3.
+Result: `h` with shape (512, 1024).
 
-**Step 2: Layer Norm 1.** For each position independently, normalize the 64 values to
-have zero mean and unit variance, then scale and shift by learned parameters.
-This stabilizes training. The formula:
-
-```
-mean = average of 64 values
-var  = average of (value - mean)²
-h_norm = scale * (h - mean) / sqrt(var + 1e-5) + bias
-```
-
-**Step 3: Multi-Head Attention.** This is where tokens "talk to each other." Split into
-2 heads of 32 dimensions each. For each head:
+**Step 2: RMSNorm.** For each position independently, normalize the 1024 values by their
+root-mean-square, then scale by learned parameters. Simpler than LayerNorm (no mean
+subtraction, no bias):
 
 ```
-Q = h_norm @ Wq    # "what am I looking for?" — shape (128, 32)
-K = h_norm @ Wk    # "what do I contain?"     — shape (128, 32)
-V = h_norm @ Wv    # "what do I offer?"        — shape (128, 32)
-
-scores = Q @ K^T / sqrt(32)  # how relevant is each position to each other — (128, 128)
-scores = mask_future(scores)  # position 5 can't see position 6 (causal)
-attn = softmax(scores)        # normalize to probabilities
-out = attn @ V                # weighted combination of values — (128, 32)
+rms = sqrt(mean(h²) + 1e-5)
+h_norm = scale * h / rms
 ```
 
-Project back: `h = h + concat(head0_out, head1_out) @ Wo`
-
-The causal mask is crucial: position `i` can only attend to positions `0..i`. This is what
-makes it "autoregressive" — each position only sees the past.
-
-**Step 4: Layer Norm 2.** Same as step 2, different learned parameters.
-
-**Step 5: Feed-Forward Network (FFN).** Two matrix multiplications with a nonlinearity:
+**Step 3: Multi-Head Attention with GQA and RoPE.** This is where tokens "talk to each
+other." 16 query heads, but only 4 KV heads (each shared by 4 query heads — GQA).
 
 ```
-up   = h_norm @ W_up               # (128, 64) @ (64, 256) = (128, 256) — expand
-act  = gelu(up)                     # element-wise nonlinearity
-down = act @ W_down                 # (128, 256) @ (256, 64) = (128, 64) — compress
-h = h + down                        # residual connection
+Q = h_norm @ Wq    # (512, 1024) — 16 heads × 64 dims
+K = h_norm @ Wk    # (512, 256)  — 4 KV heads × 64 dims
+V = h_norm @ Wv    # (512, 256)  — 4 KV heads × 64 dims
+
+Q, K = apply_rope(Q, K, position)  # rotate by position-dependent angles
+
+scores = Q @ K^T / sqrt(64)  # attention scores
+scores = mask_future(scores)  # causal: position i only sees 0..i
+attn = softmax(scores)
+out = attn @ V
 ```
 
-GELU is like ReLU but smooth: `gelu(x) ≈ x · sigmoid(1.702x)`.
+RoPE (Rotary Position Embeddings) encodes position by rotating Q and K vectors. The dot
+product Q·K then depends on relative position, not absolute — better generalization.
 
-**Step 6: Final Layer Norm + Output Projection.**
+Project back: `h = h + out @ Wo`
+
+**Step 4: RMSNorm + SwiGLU FFN.** Three weight matrices with a gating mechanism:
 
 ```
-h = layer_norm(h)
-logits = h @ W_out    # (128, 64) @ (64, 65) = (128, 65) — one score per vocab token
+h_norm = rms_norm(h)
+gate = h_norm @ W_gate          # (512, 2816)
+up   = h_norm @ W_up            # (512, 2816)
+act  = silu(gate) * up          # gated activation
+down = act @ W_down             # (2816, 1024) → back to model dim
+h = h + down                    # residual connection
+```
+
+SiLU: `silu(x) = x * sigmoid(x)`. SwiGLU uses the gate output to control how much of
+each hidden dimension passes through — consistently better quality than standard ReLU FFN.
+
+**Repeat** steps 2-4 for all 24 layers.
+
+**Step 5: Final RMSNorm + Output Projection.**
+
+```
+h = rms_norm(h)
+logits = h @ token_emb.T    # (512, 32000) — tied weights (reuse embedding table)
 ```
 
 The logits at position `i` are scores for what token should come at position `i+1`.
-To generate text, we look at the logits of the **last** position, pick the highest
-(greedy) or sample from the distribution.
+To generate text, look at the last position's logits and pick the highest (greedy)
+or sample from the distribution.
 
 ---
 
@@ -371,229 +371,23 @@ result = jt.triton_call(
 
 ---
 
-## 8. The Prefill Kernel, Line by Line
+## 8. Prefill: Processing the Prompt
 
-"Prefill" processes the entire input prompt at once. All 128 positions are computed in
-parallel. This is the same as a normal forward pass — the only difference from the JAX
-version is that everything happens in one kernel with data in registers.
+"Prefill" processes the entire input prompt at once — all positions computed in parallel.
+It produces the KV cache that the decode kernel reads from.
 
-The kernel is in `kernels/fused_prefill.py`. Let's walk through it.
+In our system, prefill runs in **JAX** (`model.py: prefill_with_kv`), not in a custom
+Triton kernel. This is because:
 
-### Setup
+1. Prefill only runs **once** per generation (processing the prompt). Decode runs hundreds
+   of times (one call per generated token). Optimizing decode has 100x more impact.
+2. Prefill is **compute-bound** (large matrix multiplications), not memory-bound. JAX/XLA
+   already handles compute-bound operations efficiently via cuDNN.
+3. The prefill code in `model.py` is straightforward JAX: run all layers, save K/V from
+   each layer into cache arrays, return logits + caches.
 
-```python
-@triton.jit
-def _prefill_kernel(
-    token_emb_ptr, pos_emb_ptr,           # embedding tables
-    ln1_scale_ptr, ln1_bias_ptr,           # layer norm 1
-    wq_ptr, wk_ptr, wv_ptr, wo_ptr,       # attention weights
-    ln2_scale_ptr, ln2_bias_ptr,           # layer norm 2
-    ffn_up_ptr, ffn_down_ptr,              # FFN
-    ln_final_scale_ptr, ln_final_bias_ptr, # final layer norm
-    output_proj_ptr,                       # output projection
-    x_ptr,                                 # input token IDs
-    logits_ptr, k_cache_ptr, v_cache_ptr,  # outputs
-):
-```
-
-Every argument is a pointer to GPU memory. Inputs are the weight matrices (in bf16)
-and the token IDs. Outputs are logits, K cache, and V cache.
-
-```python
-    pos = tl.arange(0, 128)     # [0, 1, 2, ..., 127] — position indices
-    d = tl.arange(0, 64)        # [0, 1, 2, ..., 63]  — model dimension indices
-```
-
-These index vectors live in registers. Every subsequent load uses them to compute memory
-addresses.
-
-### Embedding
-
-```python
-    tokens = tl.load(x_ptr + pos)  # load 128 token IDs from HBM
-    h = (tl.load(token_emb_ptr + tokens[:, None] * 64 + d[None, :]).to(tl.float32)
-       + tl.load(pos_emb_ptr + pos[:, None] * 64 + d[None, :]).to(tl.float32))
-```
-
-`tokens[:, None] * 64 + d[None, :]` computes a (128, 64) grid of memory offsets.
-For token ID 14 at position 0, it reads row 14 of the embedding table (64 values).
-The positional embedding is simpler — row 0 for position 0, row 1 for position 1.
-
-Result: `h` is a (128, 64) matrix in registers. Each of the 128 rows is one token's
-64-dimensional representation. **This matrix never touches HBM again until the final
-logits.**
-
-### Layer Norm 1
-
-```python
-    ln1_s = tl.load(ln1_scale_ptr + d).to(tl.float32)   # (64,) scale
-    ln1_b = tl.load(ln1_bias_ptr + d).to(tl.float32)    # (64,) bias
-    mean = tl.sum(h, axis=1)[:, None] / 64               # mean per position
-    hc = h - mean                                         # center
-    h_norm = ln1_s[None, :] * hc * tl.math.rsqrt(        # normalize + scale + shift
-        tl.sum(hc * hc, axis=1)[:, None] / 64 + 1e-5
-    ) + ln1_b[None, :]
-```
-
-`tl.sum(h, axis=1)` sums each row (each position's 64 values), giving a (128,) vector.
-`[:, None]` makes it (128, 1) for broadcasting. `rsqrt` is 1/sqrt — faster than
-dividing by sqrt.
-
-In JAX, this layer norm would be a separate kernel. Here it's just a few lines that
-operate on data already in registers.
-
-### Multi-Head Attention
-
-This is the most complex part. We loop over 2 heads:
-
-```python
-    scale = 0.17677669529663689  # 1/sqrt(32) precomputed
-    dh = tl.arange(0, 32)       # head dimension indices
-
-    for head in tl.range(2):
-        hd = head * 32 + dh      # column offsets for this head
-```
-
-`tl.range(2)` is a **dynamic loop** — Triton doesn't unroll it, which saves registers.
-`hd` selects columns 0-31 for head 0, columns 32-63 for head 1.
-
-**Q/K/V projections:**
-
-```python
-        K = tl.dot(h_norm.to(tl.bfloat16),
-                   tl.load(wk_ptr + d[:, None] * 64 + hd[None, :]).to(tl.bfloat16)
-            ).to(tl.float32)
-```
-
-This loads a (64, 32) slice of the Wk weight matrix and multiplies: (128, 64) @ (64, 32)
-= (128, 32). The `.to(tl.bfloat16)` before `tl.dot` enables tensor cores.
-Same pattern for Q and V.
-
-**Saving the KV cache:**
-
-```python
-        tl.store(k_cache_ptr + head * 128 * 32 + pos[:, None] * 32 + dh[None, :],
-                 K.to(tl.bfloat16))
-```
-
-This writes K to HBM for the decode phase to use later. It's the one place during
-prefill where intermediate data goes to HBM on purpose — because the decode kernel
-needs it.
-
-**Causal attention:**
-
-```python
-        scores = tl.dot(Q.to(tl.bfloat16), tl.trans(K.to(tl.bfloat16))
-                 ).to(tl.float32) * scale
-        scores = tl.where(pos[:, None] >= pos[None, :], scores, -1e9)
-```
-
-`Q @ K^T` gives a (128, 128) attention matrix. `pos[:, None] >= pos[None, :]` creates
-the causal mask: position 5 can see positions 0-5 (True) but not 6-127 (False).
-The `-1e9` values become effectively 0 after softmax.
-
-This (128, 128) matrix = 16,384 float32 values = 64 KB is the **largest tensor in the
-kernel**. It's the reason we need enough registers — and why 4 warps (128 threads) is
-the sweet spot. More warps = fewer registers per thread = this matrix wouldn't fit.
-
-**Softmax:**
-
-```python
-        exp_s = tl.exp(scores - tl.max(scores, axis=1)[:, None])
-        attn = exp_s / tl.sum(exp_s, axis=1)[:, None]
-```
-
-Subtract the max before exponentiating for numerical stability (standard trick).
-Then normalize each row to sum to 1.
-
-**Attention output → O projection → residual:**
-
-```python
-        attn_out = tl.dot(attn.to(tl.bfloat16), V.to(tl.bfloat16)).to(tl.float32)
-        h += tl.dot(attn_out.to(tl.bfloat16),
-                    tl.load(wo_ptr + hd[:, None] * 64 + d[None, :]).to(tl.bfloat16)
-             ).to(tl.float32)
-```
-
-Multiply attention weights by V: (128, 128) @ (128, 32) = (128, 32). Then project back:
-(128, 32) @ (32, 64) = (128, 64). Add to `h` (residual connection). Both heads contribute
-to the same `h`.
-
-### FFN
-
-The FFN has a (64, 256) up-projection and a (256, 64) down-projection. The intermediate
-(128, 256) tensor is too big to hold all at once (128 × 256 = 32K values = 128 KB).
-So we tile it:
-
-```python
-    ffn_out = tl.zeros((128, 64), dtype=tl.float32)
-    for k in tl.range(0, 256, 32):
-        kk = k + tl.arange(0, 32)
-        up = tl.dot(...)         # (128, 64) @ (64, 32) = (128, 32) — a tile of the FFN
-        act = up * tl.sigmoid(1.702 * up)  # GELU on just this tile
-        ffn_out += tl.dot(...)   # (128, 32) @ (32, 64) = (128, 64) — accumulate
-```
-
-We process 32 FFN hidden units at a time (8 iterations). Each iteration loads a
-(64, 32) tile of W_up and a (32, 64) tile of W_down. The intermediate activation
-is only (128, 32) = 4K values — small enough for registers.
-
-`tl.range` (not `tl.static_range`) tells Triton to use a dynamic loop. If Triton
-unrolled all 8 iterations, it would need registers for all 8 tiles simultaneously,
-causing spilling to slow local memory. Dynamic loops reuse registers.
-
-### Final Layer Norm + Output Projection
-
-```python
-    # Layer norm (same pattern as before)
-    # ...
-
-    # Output projection
-    v = tl.arange(0, 128)  # padded vocab indices
-    logits = tl.dot(h_final.to(tl.bfloat16),
-                    tl.load(output_proj_ptr + d[:, None] * 128 + v[None, :]).to(tl.bfloat16)
-             ).to(tl.float32)
-    logits = tl.where(v[None, :] < 65, logits, -1e9)  # mask padding
-    tl.store(logits_ptr + pos[:, None] * 128 + v[None, :], logits)
-```
-
-The vocab has 65 tokens but `tl.dot` needs power-of-2 dimensions, so we pad to 128
-and mask the padding to -infinity (which becomes 0 probability after softmax).
-
-The `tl.store` at the end is the only write to HBM in the entire forward pass
-(besides the KV cache stores). Everything else happened in registers.
-
-### The Python wrapper
-
-```python
-def fused_prefill(params, x):
-    assert x.shape == (128,)
-
-    def bf(key):
-        return params[key].astype(jnp.bfloat16)
-
-    logits_pad, k_cache, v_cache = jt.triton_call(
-        bf("token_emb"), bf("pos_emb"),
-        bf("layer0.ln1.scale"), bf("layer0.ln1.bias"),
-        bf("layer0.attn.q"), bf("layer0.attn.k"),
-        bf("layer0.attn.v"), bf("layer0.attn.o"),
-        bf("layer0.ln2.scale"), bf("layer0.ln2.bias"),
-        bf("layer0.ffn.up"), bf("layer0.ffn.down"),
-        bf("ln_final.scale"), bf("ln_final.bias"),
-        jnp.pad(params["output_proj"], [(0, 0), (0, 63)]).astype(jnp.bfloat16),
-        x.astype(jnp.int32),
-        kernel=_prefill_kernel,
-        out_shape=[...],
-        grid=(1,),        # one thread block — processes all 128 positions
-        num_warps=4,      # 128 threads = sweet spot for registers
-        num_stages=1,
-    )
-    return logits_pad[:, :65], k_cache, v_cache
-```
-
-`grid=(1,)` means we launch exactly one thread block. That single block of 128 threads
-processes all 128 positions through the entire transformer. `num_warps=4` gives 4 × 32
-= 128 threads, which maximizes registers per thread (255 registers, 0 spill).
+After prefill, the KV caches are packed into a flat buffer with `pack_kv_caches()`
+(`kernels/fused_decode_nlayer.py`) for the Triton decode kernel to read.
 
 ---
 
@@ -636,149 +430,146 @@ from it and outputs new K/V vectors, which the JAX wrapper inserts at the right 
 
 ---
 
-## 10. The Decode Kernel, Line by Line
+## 10. The Decode Kernel: Processing One Token
 
-The decode kernel (`kernels/fused_decode.py`) processes **one token** instead of 128.
-This changes the computational profile dramatically:
+The decode kernel (`kernels/fused_decode_nlayer.py: _fused_decode_nlayer`) processes
+**one token** through all 24 layers in a single kernel launch. This is the simpler
+single-SM version; section 14 covers the multi-SM version that we actually use.
+
+Decode is fundamentally different from prefill:
 
 | | Prefill | Decode |
 |---|---|---|
 | Tokens processed | 128 | 1 |
-| Matmul shape | (128, 64) @ (64, 64) | (1, 64) @ (64, 64) |
-| Can use tensor cores? | Yes (M=128) | No (M=1, too small) |
-| Attention shape | (128, 128) | (1, pos) |
-| Bottleneck | Compute | Memory (loading KV cache) |
+| Matmul shape | (128, 1024) @ (1024, 64) | (1, 1024) @ (1024, 64) |
+| Attention | (128, 128) — compute-bound | (1, pos) — memory-bound |
+| Bottleneck | Compute (matmuls) | Memory (loading 607MB of weights) |
 
-Because we're processing a single token, `tl.dot` can't use tensor cores (they need
-at least 16×16 tiles). So the decode kernel uses **element-wise operations** instead:
+### The layer loop
 
-### Element-wise matmul
-
-Instead of `tl.dot(h[None, :], W)` which would be a (1, 64) @ (64, 32) matmul,
-we do:
+The kernel processes all 24 layers in a `tl.range` loop. All weights for all layers
+are packed into one flat buffer, with offsets computed per layer:
 
 ```python
-Q = tl.sum(h_norm[:, None] * Wq, axis=0)    # (64,) * (64, 32) → sum axis 0 → (32,)
+for layer in tl.range(N_LAYERS):
+    w_base = layer * LAYER_W_SIZE   # offset into packed weight buffer
+    kv_base = layer * LAYER_KV_SIZE # offset into packed KV cache
 ```
 
-`h_norm[:, None]` broadcasts (64,) to (64, 1). Multiply element-wise with (64, 32).
-Sum across the 64 dimension. Result: (32,) — the Q vector for this single position.
+`tl.range` (not `tl.static_range`) means Triton compiles the loop body **once** and
+reuses it. With 24 layers, `tl.static_range` would unroll into 24 copies, causing
+10+ minute compilation and register spilling.
 
-This is mathematically identical to a matrix multiply but uses scalar operations instead
-of tensor cores. For M=1, this is actually faster because tensor core setup has overhead.
+### Projections via tl.dot
 
-### Attention with the KV cache
-
-The decode kernel attends to all cached positions plus the current one:
+At d=1024, the representation vector `h` has 1024 elements. Projecting it to a
+64-dimensional head via element-wise `h[:, None] * W` would need a `(1024, 64)` tensor
+in registers — 65,536 values, far exceeding the 255-register limit. Instead we use
+`tl.dot`:
 
 ```python
-    mask = seq <= pos  # True for positions 0..pos
-
-    for head in tl.range(2):
-        # Compute Q, K_new, V_new for this position
-        Q = tl.sum(h_norm[:, None] * Wq, axis=0)
-        K_new = tl.sum(h_norm[:, None] * Wk, axis=0)
-        V_new = tl.sum(h_norm[:, None] * Wv, axis=0)
-
-        # Store K_new, V_new for output (cache update)
-        tl.store(k_new_ptr + ..., K_new.to(tl.bfloat16))
-        tl.store(v_new_ptr + ..., V_new.to(tl.bfloat16))
-
-        # Load K cache and insert K_new at current position
-        K = tl.load(k_cache_ptr + ..., mask=mask[:, None], other=0.0)
-        K = tl.where(seq[:, None] == pos, K_new[None, :], K)
+Q = tl.dot(h_norm_2d, wq_tile).to(tl.float32).sum(axis=0)
 ```
 
-`tl.where(seq[:, None] == pos, K_new, K)` inserts the newly computed K vector into
-the loaded cache at position `pos`. This avoids writing to the input cache (which is
-read-only in jax_triton).
+`h_norm_2d` is `h_norm[None, :]` reshaped to `(1, 1024)`. `tl.dot` tiles the reduction
+internally, never materializing the full outer product. This uses tensor cores despite
+M=1 because we reshape h to be a 2D matrix.
 
-**Attention scores:**
+### Online softmax attention over the KV cache
+
+The KV cache can hold up to 512 positions. We can't load all 512 K vectors at once
+(too much memory), so we tile in chunks of `KV_TILE=64` positions and use **online
+softmax** to accumulate the result:
 
 ```python
-        scores = tl.sum(Q[None, :] * K, axis=1) * scale  # (128,)
-        scores = tl.where(mask, scores, -1e9)
+m_i = tl.full((1,), value=-1e9, dtype=tl.float32)  # running max
+l_i = tl.zeros((1,), dtype=tl.float32)              # running sum of exp
+o_i = tl.zeros((D_HEAD,), dtype=tl.float32)         # running weighted output
+
+for t in tl.range(0, MAX_SEQ, KV_TILE):
+    tile_pos = t + tl.arange(0, KV_TILE)
+    tile_mask = tile_pos <= pos    # only attend to positions 0..pos
+
+    K_tile = tl.load(kv_in_ptr + ..., mask=tile_mask[:, None], other=0.0)
+    V_tile = tl.load(kv_in_ptr + ..., mask=tile_mask[:, None], other=0.0)
+
+    # Insert new K/V at current position
+    K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
+    V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
+
+    s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
+    s = tl.where(tile_mask, s, -1e9)
+
+    # Online softmax update
+    m_ij = tl.max(s)
+    m_new = tl.maximum(m_i, m_ij)
+    alpha = tl.exp(m_i - m_new)     # rescale previous accumulation
+    p = tl.exp(s - m_new)           # current tile's softmax weights
+    l_i = l_i * alpha + tl.sum(p)
+    o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)
+    m_i = m_new
+
+attn_out = o_i / l_i
 ```
 
-`Q[None, :]` is (1, 32), `K` is (128, 32). Element-wise multiply and sum over the
-32 dimension gives (128,) scores — one per cached position. Mask out future positions.
+The key insight: standard softmax needs the max across ALL positions before computing
+any exponentials. Online softmax tracks a running max and rescales previous results
+when a new max is found. This is the same trick FlashAttention uses — process tiles
+sequentially without ever materializing the full attention matrix.
 
-**Weighted sum of V:**
+### SwiGLU FFN with tiled weights
+
+The FFN has three weight matrices (gate, up, down) with d_ff=2816 hidden units.
+We tile over the hidden dimension in chunks of `BLOCK_K=32`:
 
 ```python
-        attn_out = tl.sum(attn_w[:, None] * V, axis=0)  # (32,)
+for k in tl.range(0, D_FF, BLOCK_K):
+    kk = k + tl.arange(0, BLOCK_K)
+    gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
+    up   = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
+    act  = (gate * tl.sigmoid(gate)) * up    # SwiGLU activation
+    ffn_accum += tl.dot(act_2d, down_w).to(tl.float32).sum(axis=0)
 ```
 
-`attn_w` is (128,) attention weights. Multiply each V row by its weight, sum
-across the 128 positions. Result: a single (32,) vector.
-
-### Why the decode kernel is different
-
-Notice the kernel outputs **new K/V vectors**, not an updated cache:
-
-```python
-    logits_pad, k_new, v_new = jt.triton_call(
-        ...,
-        out_shape=[
-            jax.ShapeDtypeStruct((128,), jnp.float32),  # logits (padded)
-            jax.ShapeDtypeStruct((2, 32), jnp.bfloat16), # new K per head
-            jax.ShapeDtypeStruct((2, 32), jnp.bfloat16), # new V per head
-        ],
-    )
-```
-
-The JAX wrapper then updates the cache:
-
-```python
-    return logits_pad[:65], k_cache.at[:, pos, :].set(k_new), v_cache.at[:, pos, :].set(v_new)
-```
-
-Why not update the cache inside the kernel? Because `jax_triton` passes inputs as
-read-only buffers. The kernel would have to copy the entire cache (16 KB) to a new
-output buffer. Instead, we output just 128 bytes of new K/V and let JAX do the
-scatter update efficiently.
+Each iteration processes 32 hidden units. The activation `gate * sigmoid(gate) * up`
+is SwiGLU — a gated variant that consistently outperforms standard ReLU.
 
 ---
 
 ## 11. The Generation Loop
 
-The complete generation pipeline:
+The complete generation pipeline (simplified from `generate.py`):
 
 ```python
-def generate_triton(params, prompt, n_tokens):
-    # 1. Pad prompt to 128 tokens (causal mask makes padding harmless for early positions)
-    x = jnp.pad(prompt, (0, 128 - len(prompt))).astype(jnp.int32)
+def generate(params, config, prompt_ids, n_tokens, vocab_size):
+    # 1. Prefill: JAX processes entire prompt, produces KV caches
+    x = jnp.pad(prompt_ids, (0, ctx_len - len(prompt_ids)))
+    logits, k_caches, v_caches = prefill_with_kv(params, config, x)
 
-    # 2. Prefill: one kernel call processes entire prompt
-    logits, k_cache, v_cache = fused_prefill(params, x)
+    # 2. Pack weights and KV caches for the Triton decode kernel
+    w = prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=1)
+    kv_packed = pack_kv_caches(k_caches, v_caches)
 
-    # 3. Sample first generated token from last prompt position's logits
-    token = jnp.argmax(logits[len(prompt) - 1])
-    tokens = [int(token)]
+    # 3. First token from prefill logits
+    token = jnp.argmax(logits[len(prompt_ids) - 1])
 
-    # 4. Decode loop: one kernel call per token
-    for i in range(n_tokens - 1):
-        logits, k_cache, v_cache = fused_decode(
-            params, token, len(prompt) + i, k_cache, v_cache
-        )
-        token = jnp.argmax(logits)
-        tokens.append(int(token))
-
-    return tokens
+    # 4. Decode loop: one Triton kernel call per token
+    for i in range(n_tokens):
+        token, _, kv_packed = multi_sm_decode_nlayer(
+            w, config, token, len(prompt_ids) + i, kv_packed, vocab_size, kv_splits=1)
+        print(decode_fn([int(token)]), end='', flush=True)
 ```
 
-**Step 1:** The prompt is padded to 128 tokens. Due to the causal mask, position 63
-(the last real token) only attends to positions 0-63, which are all real. The padding
-at positions 64-127 can't contaminate positions 0-63.
+**Step 1:** JAX prefill runs the prompt through all 24 layers, saving K/V at each layer.
 
-**Step 2:** One kernel call. In registers: embedding → LN → attention → FFN → LN → logits.
-Side effect: KV cache written to HBM.
+**Step 2:** `prepare_decode_weights_nlayer` packs all weights into a single flat bf16
+buffer. `pack_kv_caches` does the same for KV caches. This is done once before decoding.
 
-**Step 3:** `argmax` picks the most probable next token (greedy decoding). You could also
-sample with temperature for more creative text.
+**Step 3:** `argmax` picks the most probable next token (greedy decoding).
 
-**Step 4:** Each iteration does one decode kernel call, updates the KV cache in JAX,
-and picks the next token. The KV cache grows by one entry per step.
+**Step 4:** Each iteration calls the Triton multi-SM decode kernel. The kernel returns
+the next token (via in-kernel argmax) and the updated KV cache. The KV cache grows by
+one entry per step — the kernel writes the new K/V at the current position.
 
 ---
 
