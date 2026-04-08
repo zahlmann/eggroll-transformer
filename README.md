@@ -63,12 +63,6 @@ uv run generate.py --prompt "The capital of France is"
 # code generation (low temperature)
 uv run generate.py --prompt "def fibonacci(n):" --temp 0.3 --top-p 0.9 --rep-penalty 1.1
 
-# batched inference with paged KV cache
-uv run serve.py --paged --prompts "Once upon a time" "The cat sat"
-
-# continuous batching (more prompts than batch slots)
-uv run serve.py --continuous --batch-size 2 --prompts "A" "B" "C" "D"
-
 # profile decode kernels
 uv run profile_kernels.py
 
@@ -86,40 +80,28 @@ uv run python -u train.py \
 
 **Training**: JAX model with cuDNN FlashAttention, AdamW with cosine LR schedule, curriculum training (ctx warmup 128->256->512). Fused cross-entropy for 32K vocab without OOM. Multi-source data pipeline with 32K BPE tokenizer.
 
-**Inference kernels**: 7 Triton kernel files covering single-sequence, batched, persistent, and pipelined decode. Multi-SM parallelism with atomic barriers, KV-split attention (FlashDecoding-style), weight-amortized FFN. Projection tiling for D_HEAD=64 shared memory constraints.
-
-**Serving**: Variable-length batched inference server with GPU-accelerated paged KV cache (JIT gather/scatter) and continuous batching.
+**Inference kernel**: Custom Triton kernel fuses the entire 24-layer forward pass (embedding, RMSNorm, RoPE, GQA attention, SwiGLU FFN, output projection, argmax) into a single GPU kernel launch. Multi-SM parallelism with atomic barriers across 16 SMs.
 
 ## Files
 
 ```
 Training:
-  model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
-  train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
+  model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE)
+  train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum)
   data.py                              streaming data loading (v2/v3 memmap, 8B+ tokens)
-  prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle, combine
+  prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle
   prepare_data_v3.py                   v3 data pipeline: 6 sources (28B) + annealing (3B)
 
-Inference kernels:
-  kernels/multi_sm_decode.py           multi-SM decode with atomic barriers + KV-split
-  kernels/batched_decode.py            batched multi-SM decode (B sequences, tensor core projections)
-  kernels/persistent_decode.py         persistent decode (single launch, all steps)
-  kernels/persistent_batched_decode.py persistent batched (B x N steps)
-  kernels/block_prefill.py             multi-block prefill + FlashAttention + GQA
-  kernels/fused_decode_nlayer.py       weight/KV packing for all decode kernels
-  kernels/paged_kv.py                  paged KV cache (GPU gather/scatter)
-
-Serving:
+Inference:
+  kernels/multi_sm_decode.py           fused multi-SM decode (all 24 layers in one kernel)
+  kernels/fused_decode_nlayer.py       weight/KV packing utilities
   generate.py                          streaming text generation CLI
-  serve.py                             batched server + continuous batching
-
-Benchmarking:
-  profile_kernels.py                   primary profiling tool
+  profile_kernels.py                   decode kernel profiling
 
 Documentation:
   program.md                           agent program / development log
   inference_explained.md               ground-up GPU kernel explanation
   training_explained.md                first-principles training pipeline explanation
   data_research.md                     training data research findings
-  gpu_server_training_instructions.md                     cloud GPU training setup guide
+  gpu_server_training_instructions.md  cloud GPU training setup guide
 ```
