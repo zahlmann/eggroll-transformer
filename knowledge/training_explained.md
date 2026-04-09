@@ -106,9 +106,14 @@ jax.checkpoint(f)             # recompute f's intermediates during backward pass
 
 **Number types (dtypes)**:
 
-- `float32` (f32): 32-bit float, standard precision. Used for parameter updates.
+- `float32` (f32): 32-bit float, standard precision. Used for parameter storage
+  and optimizer updates (the "master weights").
 - `bfloat16` (bf16): 16-bit float, half the memory, slightly less precise. Used
-  for forward pass to save GPU memory and run faster.
+  for the forward and backward pass to save GPU memory and run faster. bfloat16
+  was designed by Google Brain specifically for deep learning — it has the same
+  exponent range as float32 (so it handles the same range of magnitudes) but fewer
+  mantissa bits (7 vs 23). This "mixed precision" approach — bf16 compute, f32
+  master weights — is universal in LLM training since GPT-3 (2020).
 - `int32`: 32-bit integer. Used for token IDs.
 
 ### Optax (`import optax`)
@@ -180,6 +185,19 @@ VOCAB_SIZE = 32000                   # our tokenizer has 32K tokens
 VAL_FRACTION = 0.005                 # 0.5% of data reserved for validation
 EOS_TOKEN_ID = 1                     # special token marking end of document
 ```
+
+**Why this specific data mix?** The training data composition is one of the most
+important decisions in LLM training. Our mix — 34% quality-filtered web text
+(FineWeb-Edu), 30% code (StarCoder), 19% math (OpenWebMath), 9% Wikipedia, 8%
+synthetic textbooks (Cosmopedia) — is optimized for a coding/reasoning-capable
+model. The heavy code and math allocation (49% combined) is unusual compared to
+general-purpose LLMs like Llama (which use ~5-10% code), but is intentional:
+this model is designed to power agentic coding and mathematical reasoning tasks.
+
+The Llama 3 technical report (2024) showed that data mix matters more than model
+architecture at small scales. SmolLM2 (HuggingFace 2024) demonstrated that
+quality-filtered data with high code/math ratios dramatically improves reasoning
+in models under 1B parameters.
 
 The **data mix** is specified as a dict mapping source names to target token counts:
 
@@ -415,6 +433,25 @@ The `decode_fn` takes a list of token IDs and returns the text they represent.
 
 This is the core — the mathematical function that maps input tokens to predictions.
 
+Our architecture is not the original 2017 transformer — it's the modern "Llama-style"
+architecture that has become the standard recipe for decoder-only models since 2023.
+Every component is a deliberate choice with a specific reason:
+
+| Component | Replaces | Why |
+|-----------|----------|-----|
+| RMSNorm | LayerNorm | 10-15% faster, same quality |
+| Pre-norm | Post-norm | Stable training in deep models |
+| RoPE | Learned pos embeddings | Relative positions, length generalization |
+| GQA (4 KV heads) | MHA (16 KV heads) | 4x smaller KV cache, <1% quality loss |
+| SwiGLU | ReLU/GELU FFN | ~15% better quality per FLOP |
+| No biases | Biases everywhere | Simpler, no quality impact |
+| Tied embeddings | Separate output head | Fewer params, regularizer at small scale |
+
+These choices are not experimental — they are the converged standard used by
+Llama 1/2/3/4, Mistral, Qwen, DeepSeek, Gemma, and every other major LLM
+as of 2026. Each subsection below explains what the component does and why it
+was chosen.
+
 ### 5.1 High-Level Structure
 
 A decoder-only transformer processes a sequence of tokens in three stages:
@@ -525,8 +562,24 @@ params[f"{prefix}.attn.o"] = jax.random.normal(k, (d_model, d_model)) * (d_model
 
 Why is K/V only 256 wide? That's `n_kv_heads * d_head = 4 * 64 = 256`. This is
 **Grouped Query Attention (GQA)** — instead of 16 separate K/V heads, we use only
-4 and share each one across 4 query heads. This cuts memory by 4x with minimal
-quality loss.
+4 and share each one across 4 query heads. This cuts KV cache memory by 4x with
+minimal quality loss.
+
+**Why GQA instead of standard multi-head attention (MHA)?** During inference, every
+past token's K and V vectors must be stored in the KV cache. With MHA (16 KV heads),
+the cache is 4x larger than with GQA (4 KV heads). This matters for serving —
+the KV cache often dominates GPU memory at long context lengths, and reducing it
+allows either longer sequences or more concurrent users.
+
+GQA (Ainslie et al. 2023) is a middle ground between MHA (every head has its own
+K/V — maximum quality but expensive) and MQA (Multi-Query Attention: all heads
+share a single K/V — maximum efficiency but measurable quality loss). GQA with 4
+KV heads for 16 query heads loses <1% quality versus MHA.
+
+GQA has been the standard since Llama 2 (2023). Llama 3/4, Mistral, Qwen 2/3,
+and Gemma all use it. DeepSeek V2/V3 introduced MLA (Multi-head Latent Attention),
+a more aggressive KV cache compression using low-rank projections — but MLA is
+specific to DeepSeek and GQA remains the default choice for new models.
 
 The `* (d_model ** -0.5)` scaling (= `* 0.03125`) initializes weights small
 enough that initial attention scores don't blow up.
@@ -581,8 +634,21 @@ Line by line:
    multiply by a learned scale vector. This lets the model learn what magnitude
    each dimension should have.
 
-**Why RMS, not LayerNorm?** Standard LayerNorm subtracts the mean then divides by
-std. RMSNorm skips the mean subtraction — it's 10-15% faster and works just as well.
+**Why RMSNorm instead of LayerNorm?** The original transformer (Vaswani et al. 2017)
+used LayerNorm, which subtracts the mean and divides by the standard deviation.
+RMSNorm (Zhang & Sennrich 2019) skips the mean subtraction — it only divides by
+the root mean square. This removes one reduction operation per normalization, making
+it ~10-15% faster.
+
+The insight was that the re-centering (mean subtraction) in LayerNorm doesn't
+contribute meaningfully to training stability — it's the re-scaling (division by
+spread) that matters. Empirically, models trained with RMSNorm match LayerNorm
+quality across all tested scales.
+
+RMSNorm became the universal standard after Meta's Llama 1 (2023) adopted it.
+Every major LLM since has followed: Llama 2/3/4, Mistral, Qwen, DeepSeek V2/V3,
+Gemma, and others. As of 2026, there is no serious alternative — RMSNorm is the
+default choice for new transformer models at every scale.
 
 ### 5.4 Rotary Position Embeddings (RoPE)
 
@@ -593,6 +659,29 @@ mechanism itself is position-agnostic.
 **Solution**: Rotate each token's query and key vectors by an angle that depends
 on their position. Tokens at similar positions get similar rotations, so their dot
 products (attention scores) are higher.
+
+**Why RoPE instead of other position encodings?** There have been three main
+approaches to position encoding:
+
+1. **Sinusoidal (original transformer, 2017):** Fixed sine/cosine patterns added
+   to embeddings. No learned parameters, but the position information gets diluted
+   as it passes through layers — it's added once at the input and can be
+   forgotten.
+
+2. **Learned position embeddings (GPT-2, 2019):** A separate embedding table
+   indexed by position. Simple, but hard-caps the context length (the model can't
+   generalize to positions beyond what it trained on) and adds parameters.
+
+3. **RoPE (Su et al. 2021):** Rotation applied directly to Q and K at every layer.
+   No additional parameters. The key advantage: attention scores depend only on
+   *relative* distance between tokens, not absolute positions. This means a model
+   trained on context length 512 can often generalize to longer contexts with
+   minor modifications (like NTK-aware scaling or YaRN).
+
+RoPE was adopted by Meta's Llama 1 (2023) and became the universal standard for
+decoder-only transformers. As of 2026, virtually every major LLM uses RoPE or a
+direct variant of it (like the extended-context modifications in Llama 3's 128K
+context window). No competitive alternative has emerged.
 
 #### Building the rotation table
 
@@ -635,7 +724,7 @@ def apply_rope(x, cos, sin):
 
 This is a 2D rotation applied to pairs of dimensions. For each pair `(even, odd)`:
 
-$$\begin{pmatrix} \text{even'} \\ \text{odd'} \end{pmatrix} = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix} \begin{pmatrix} \text{even} \\ \text{odd} \end{pmatrix}$$
+$$\begin{pmatrix} \text{even'} \\\ \text{odd'} \end{pmatrix} = \begin{pmatrix} \cos\theta & -\sin\theta \\\ \sin\theta & \cos\theta \end{pmatrix} \begin{pmatrix} \text{even} \\\ \text{odd} \end{pmatrix}$$
 
 The key insight: when we compute the dot product of a rotated query at position
 $i$ with a rotated key at position $j$, the result depends only on the *relative*
@@ -671,7 +760,7 @@ K and V only have 4 heads (GQA): each of the 4 K/V heads is shared by 4 query he
 
 **Intuition**: Q asks "what am I looking for?", K says "what do I contain?", V says
 "here is my information." The attention score between position $i$ and position $j$
-is the dot product $Q_i \cdot K_j$ — high when position $i$'s query matches position
+is the dot product $Q\_i \cdot K\_j$ — high when position $i$'s query matches position
 $j$'s key.
 
 #### Step 2: Apply RoPE
@@ -692,28 +781,38 @@ only the attention scores need position information, not the values being gather
 
 This single call does all of the following:
 
-1. **Attention scores**: For each query head $h$ and position $i$, compute the dot
-   product with every key at positions $j \le i$ (causal: can't look at future tokens):
+**Attention scores.** For each query head $h$ and position $i$, compute the dot
+product with every key at positions $j \le i$ (causal: can't look at future tokens):
 
-   $$\text{score}_{i,j} = \frac{Q_i^h \cdot K_j^h}{\sqrt{d_\text{head}}}$$
+$$\text{score}\_{i,j} = \frac{Q\_i^h \cdot K\_j^h}{\sqrt{d\_{\text{head}}}}$$
 
-   The $\sqrt{64} = 8$ scaling prevents dot products from getting too large.
+The $\sqrt{64} = 8$ scaling prevents dot products from getting too large.
 
-2. **Masking**: Set scores where $j > i$ to $-\infty$. After softmax, these
-   become 0 — the model cannot cheat by looking at future tokens.
+**Masking.** Set scores where $j > i$ to $-\infty$. After softmax, these
+become 0 — the model cannot cheat by looking at future tokens.
 
-3. **Softmax**: Convert scores to probabilities that sum to 1 across all previous
-   positions:
+**Softmax.** Convert scores to probabilities that sum to 1 across all previous
+positions:
 
-   $$\alpha_{i,j} = \frac{e^{\text{score}_{i,j}}}{\sum_{k \le i} e^{\text{score}_{i,k}}}$$
+$$\alpha\_{i,j} = \frac{e^{\text{score}\_{i,j}}}{\sum\_{k \le i} e^{\text{score}\_{i,k}}}$$
 
-4. **Weighted sum**: Compute the output as the weighted sum of value vectors:
+**Weighted sum.** Compute the output as the weighted sum of value vectors:
 
-   $$\text{out}_i^h = \sum_{j \le i} \alpha_{i,j} \cdot V_j^h$$
+$$\text{out}\_i^h = \sum\_{j \le i} \alpha\_{i,j} \cdot V\_j^h$$
 
 `is_causal=True` enables the future-masking. `implementation='cudnn'` uses
 NVIDIA's FlashAttention implementation, which is much faster because it avoids
 materializing the full `(512, 512)` attention matrix.
+
+**Why cuDNN FlashAttention?** Standard attention computes the full
+$(n \times n)$ attention matrix, which uses $O(n^2)$ memory and is slow for
+long sequences. FlashAttention (Dao et al. 2022) tiles the attention computation
+and uses the online softmax algorithm (the same trick we use in our Triton decode
+kernel) to avoid ever materializing the full matrix. Memory drops from $O(n^2)$ to
+$O(n)$, and speed improves by 2-4x due to better GPU memory access patterns.
+We get a +38% training throughput boost from using `implementation='cudnn'` instead
+of the default XLA attention. FlashAttention is now the default in virtually every
+training framework.
 
 **GQA detail**: When there are 16 query heads but only 4 KV heads, query heads
 0-3 share KV head 0, query heads 4-7 share KV head 1, etc. `dot_product_attention`
@@ -751,10 +850,26 @@ Breaking this down:
    passes through.
 5. `... @ ffn_down` — Project back from 2816 to 1024 dimensions.
 
-**Why SwiGLU instead of a standard FFN?** A standard FFN does
-`relu(x @ W1) @ W2` — one up-projection plus an activation. SwiGLU uses two
-up-projections with a multiplicative gate, which consistently produces better
-model quality per parameter.
+**Why SwiGLU instead of a standard ReLU or GELU FFN?** The original transformer
+used ReLU: `relu(x @ W1) @ W2` — one up-projection, one activation, one
+down-projection. GPT-2/3 switched to GELU (a smoother version of ReLU). Both use
+2 weight matrices.
+
+SwiGLU (Shazeer 2020, "GLU Variants Improve Transformer") adds a third weight
+matrix and uses the SiLU-gated linear unit: `silu(x @ W_gate) * (x @ W_up) @ W_down`.
+The multiplicative gate lets the network learn to selectively pass information
+through each hidden dimension, rather than applying a uniform activation. This
+consistently gives ~15% better quality per FLOP across all tested model sizes.
+
+The cost is 50% more FFN parameters (3 matrices instead of 2), but `d_ff` is
+reduced to compensate: `d_ff = 8d/3` instead of `4d`, keeping total parameter
+count similar.
+
+SwiGLU was adopted by PaLM (Google 2022) and Llama 1 (Meta 2023), and is now
+universal. Every major LLM as of 2026 uses SwiGLU or a close variant (GeGLU uses
+GELU instead of SiLU for the gate — the difference is negligible). There's no
+serious competitor — the empirical advantage is consistent and the implementation
+cost is minimal.
 
 ### 5.7 A Full Transformer Layer (`_attn_layer`)
 
@@ -790,6 +905,14 @@ multiplications, and the signal would vanish. The residual connection provides a
 **Pre-norm**: We normalize *before* each sub-layer (attention, FFN), not after.
 This is more stable during training than post-norm (the original transformer design).
 
+**Why pre-norm instead of post-norm?** The original transformer (2017) applied
+normalization after each sub-layer: `h = norm(h + sublayer(h))`. This causes
+training instability in deep models — gradients can explode in the early layers.
+Pre-norm (Xiong et al. 2020, adopted by GPT-2) moves normalization before the
+sub-layer: `h = h + sublayer(norm(h))`. The residual connection now carries the
+raw signal, and the sub-layer operates on a normalized input, keeping gradients
+well-behaved even at 24+ layers. Every major LLM since GPT-2 uses pre-norm.
+
 ### 5.8 The Full Forward Pass
 
 ```python
@@ -812,11 +935,14 @@ def _transformer_trunk(params, config, x):
 
 `maybe_checkpoint = jax.checkpoint if use_checkpoint else lambda f, **kw: f`
 
-**Gradient checkpointing**: During training, the backward pass needs intermediate
-values from the forward pass. Normally these are stored in memory, but with 24
-layers that requires a lot of GPU memory. `jax.checkpoint` tells JAX to *not*
-store intermediates — instead, it recomputes them on the fly during the backward
-pass. This trades time for memory (roughly 33% slower but uses much less VRAM).
+**Gradient checkpointing** (Chen et al. 2016): During training, the backward
+pass needs intermediate values from the forward pass. Normally these are stored
+in memory, but with 24 layers that requires a lot of GPU memory. `jax.checkpoint`
+tells JAX to *not* store intermediates — instead, it recomputes them on the fly
+during the backward pass. This trades time for memory (roughly 33% slower but
+uses much less VRAM). On our RTX 4080 Super (16GB), checkpointing is necessary
+at batch size 16. On the RTX 4090 (24GB), we can disable it with `--no-checkpoint`
+for +12% throughput.
 
 #### Output projection
 
@@ -838,6 +964,21 @@ softmax (which we do inside the loss function).
 embedding should capture token similarity — tokens with similar embeddings should
 be predicted in similar contexts.
 
+**Why tie embeddings?** Tying (Press & Wolf 2017) acts as a regularizer — it forces
+the input and output embeddings to agree on what tokens mean. For small-to-medium
+models (<1B parameters), this consistently helps quality. Larger models like
+Llama 2/3 do NOT tie embeddings — at that scale, having separate input/output
+matrices gives the model more capacity. At our 306M scale, tying is clearly the
+right choice.
+
+**Why no biases anywhere?** Biases are additive terms in linear projections:
+`y = x @ W + b`. Our model removes them entirely — every projection is just
+`y = x @ W`. This was popularized by PaLM (Google 2022) and adopted by Llama.
+The reasoning: biases add a tiny number of parameters but create implementation
+complexity (every kernel and optimization must account for them). Removing them
+has no measurable quality impact. As of 2026, no biases is the default for all
+major LLMs.
+
 ### 5.9 The Loss Function
 
 The loss measures how wrong the model's predictions are.
@@ -852,8 +993,8 @@ def cross_entropy_loss(logits, targets):
 ```
 
 1. `log_softmax`: Convert logits to log-probabilities.
-   Softmax: $P(\text{token}_i) = \frac{e^{\text{logit}_i}}{\sum_j e^{\text{logit}_j}}$.
-   Log-softmax computes $\log P(\text{token}_i)$ directly (more numerically stable
+   Softmax: $P(\text{token}\_i) = e^{\text{logit}\_i} / \sum\_j e^{\text{logit}\_j}$.
+   Log-softmax computes $\log P(\text{token}\_i)$ directly (more numerically stable
    than computing softmax then taking log).
 
 2. `take_along_axis`: For each position, extract the log-probability of the
@@ -877,8 +1018,9 @@ With a vocabulary of 32,000 tokens and a batch of 16 sequences of 512 tokens,
 the full logits tensor would be `(16 * 512, 32000)` = 1 billion float values =
 4 GB. That doesn't fit in our 16 GB GPU memory alongside the model.
 
-The solution: **never materialize the full logits tensor**. Instead, compute the
-loss in chunks of 4096 tokens at a time:
+The solution: **never materialize the full logits tensor**. This technique, called
+fused cross-entropy (used by Liger Kernel, Cut Cross-Entropy, and built into
+frameworks like GPT-NeoX), computes the loss in chunks of 4096 tokens at a time:
 
 ```python
 def _chunked_ce_fwd(h, weight, targets, chunk_size):
@@ -902,7 +1044,7 @@ def _chunked_ce_fwd(h, weight, targets, chunk_size):
 Instead of computing all 32,000 logits at once, we compute 4,096 at a time and
 accumulate the softmax denominator (logsumexp) using the **online logsumexp trick**:
 
-The trick: $\log \sum_i e^{x_i}$ can be computed incrementally. After processing
+The trick: $\log \sum\_i e^{x\_i}$ can be computed incrementally. After processing
 each chunk, we maintain `max_logit` (the largest logit seen so far) and `sum_exp`
 (the accumulated exponential sum). When a new chunk has a larger maximum, we
 rescale the running sum: `sum_exp * exp(old_max - new_max)`.
@@ -931,7 +1073,7 @@ and `weight` (embedding matrix) using the same chunked approach — it recompute
 the softmax probabilities one chunk at a time and accumulates gradients.
 
 The gradient of cross-entropy loss with respect to logits has a beautiful form:
-$\text{grad}_i = \text{softmax}_i - \mathbb{1}[\text{target} = i]$. That is,
+$\text{grad}\_i = \text{softmax}\_i - \mathbb{1}[\text{target} = i]$. That is,
 subtract 1 from the correct token's probability and keep the rest. This is what
 the backward pass computes, chunk by chunk.
 
@@ -1057,14 +1199,31 @@ The **learning rate schedule** controls how much we adjust parameters at each st
    following a cosine curve. The idea: large updates early for fast progress, small
    updates later for fine-tuning.
 
-**AdamW** is the optimizer algorithm. It maintains two running averages for each
-parameter:
+**Why AdamW?** AdamW (Loshchilov & Hutter 2019) is an improved version of Adam
+that decouples weight decay from the gradient update. The original Adam applied
+weight decay as L2 regularization inside the gradient, which interacts poorly with
+the adaptive learning rates — parameters with small gradients get insufficient decay,
+while parameters with large gradients get too much. AdamW applies decay separately,
+after the gradient update.
+
+AdamW is the universal optimizer for LLM training. Every major model since GPT-2
+has used it. Some recent alternatives have emerged — Muon (2025) and SOAP (2025) —
+that claim faster convergence, but AdamW remains the proven, well-understood default.
+
+AdamW maintains two running averages for each parameter:
 - **First moment** (mean gradient): smooths out noisy gradients
 - **Second moment** (mean squared gradient): adapts learning rate per parameter —
   parameters with consistently large gradients get smaller updates
 
 **Weight decay** (0.1): Each step, multiply all parameters by 0.999... This gently
 pushes unused parameters toward zero, acting as a regularizer to prevent overfitting.
+
+**Why cosine decay?** The learning rate schedule — linear warmup then cosine decay
+— is another universal choice. Warmup (Goyal et al. 2017) prevents training
+instability in the first few steps when Adam's moment estimates are unreliable.
+Cosine decay (Loshchilov & Hutter 2017) smoothly reduces the learning rate to near
+zero, avoiding the sharp drops of step decay schedules. This has been the standard
+schedule since GPT-3 (2020).
 
 ### 6.6 Training Step
 
@@ -1133,9 +1292,16 @@ uses shorter sequences initially:
 - Next 20%: 256-token sequences, batch size × 2
 - Final 70%: 512-token sequences, normal batch size
 
-Shorter sequences train faster because attention is cheaper ($O(n^2)$ in sequence
-length). The model learns basic patterns on short context first, then learns to use
+Shorter sequences train faster because attention is $O(n^2)$ in sequence length.
+The model learns basic patterns on short context first, then learns to use
 longer context later. The `bs_mult` keeps the total tokens per batch constant.
+
+**Why curriculum?** Curriculum learning (Bengio et al. 2009) presents easier
+examples first and harder examples later. For language models, shorter sequences
+are "easier" — less context to manage, cheaper attention, and the model can focus
+on learning basic token-to-token patterns. This was used in practice by MiniCPM
+(2024) and others. Our curriculum saves ~20% wall-clock time versus training at
+full context length from the start, with no measurable quality loss.
 
 Each context length requires a separately compiled train step (because `@jax.jit`
 compiles for specific input shapes), so we pre-compile them:
@@ -1319,13 +1485,13 @@ not for inference).
 | **BPE** | Byte Pair Encoding — a tokenization algorithm that learns common subword units from data |
 | **Causal** | Each position can only attend to previous positions, not future ones (enforced by masking) |
 | **Context length** | Maximum number of tokens the model can process at once (512 in our case) |
-| **Cross-entropy** | Loss function: $-\log P(\text{correct token})$. Lower = better predictions |
+| **Cross-entropy** | Loss function: $-\log P(\text{correct token})$, lower = better predictions |
 | **d_model** | Dimension of token representations (1024). Every vector in the model has this size |
 | **d_head** | Dimension per attention head (64 = 1024 / 16 heads) |
 | **Decoder-only** | A transformer that only generates tokens left-to-right (vs encoder-decoder which also reads input bidirectionally) |
 | **Embedding** | A learned vector representation for a discrete item (like a token). The embedding matrix has one row per vocabulary item |
 | **Epoch** | One complete pass through the training dataset |
-| **FlashAttention** | An optimized attention algorithm that avoids materializing the full attention matrix, reducing memory from $O(n^2)$ to $O(n)$ |
+| **FlashAttention** | An optimized attention algorithm that avoids materializing the full attention matrix, reducing memory from $O(n^2)$ to $O(n)$  |
 | **Forward pass** | Running the model on input data to produce predictions |
 | **Fused** | Combining multiple operations into one to reduce memory traffic and kernel launch overhead |
 | **GQA** | Grouped Query Attention: multiple query heads share one key/value head, reducing memory |
@@ -1337,8 +1503,8 @@ not for inference).
 | **Residual connection** | Adding a layer's input to its output: `h = h + layer(h)`. Helps gradients flow through deep networks |
 | **RMSNorm** | Normalization: divide by root-mean-square, then scale. Stabilizes training |
 | **RoPE** | Rotary Position Embeddings: encode position by rotating Q/K vectors. Enables relative position awareness |
-| **Softmax** | Converts logits to probabilities: $P_i = e^{x_i} / \sum_j e^{x_j}$. Output is non-negative and sums to 1 |
-| **SwiGLU** | A feed-forward network variant with a gated mechanism: $\text{SiLU}(xW_g) \odot (xW_u)$. Better quality than standard ReLU FFN |
+| **Softmax** | Converts logits to probabilities: $P\_i = e^{x\_i} / \sum\_j e^{x\_j}$, output is non-negative and sums to 1 |
+| **SwiGLU** | A feed-forward network variant with a gated mechanism: $\text{SiLU}(xW\_g) \odot (xW\_u)$, better quality than standard ReLU FFN |
 | **Tied embeddings** | Using the same matrix for input token lookup and output logit computation |
 | **Token** | A subword unit (could be a whole word like "the", a part like "ing", or a single character). Our vocab has 32,000 tokens |
 | **Transformer** | Neural network architecture based on self-attention. Currently the dominant architecture for language models |
