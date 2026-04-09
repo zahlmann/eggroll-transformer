@@ -396,23 +396,38 @@ def _combine_tokenized(source_cfgs, out_dir, dataset_name):
             print(f"  wrote {name}: {written/1e9:.2f}B train tokens")
             del src
 
-    # shuffle via memmap
+    # shuffle via memmap — inverse permutation for sequential reads
     print("Shuffling...")
     src = np.memmap(train_bin, dtype=np.int32, mode="r")
     n_chunks = len(src) // 512
     usable = n_chunks * 512
     perm = np.random.default_rng(42).permutation(n_chunks)
 
+    # inv_perm[i] = destination index for source chunk i
+    # this lets us read src sequentially (fast) and write to random dst positions
+    inv_perm = np.empty(n_chunks, dtype=np.int64)
+    inv_perm[perm] = np.arange(n_chunks)
+
     shuffled_bin = out_dir / "train_shuffled.bin"
     dst = np.memmap(shuffled_bin, dtype=np.int32, mode="w+", shape=(usable,))
-    batch = 100000
-    for i in range(0, n_chunks, batch):
-        end = min(i + batch, n_chunks)
-        for j, ci in enumerate(perm[i:end]):
-            dst[(i+j)*512:(i+j+1)*512] = src[ci*512:(ci+1)*512]
-        if (i // batch) % 10 == 0:
-            print(f"  shuffled {end}/{n_chunks} chunks ({end*512/1e9:.2f}B tokens)")
-    dst.flush()
+    buf_chunks = 500_000  # ~1GB buffer
+    t0 = time.time()
+    for i in range(0, n_chunks, buf_chunks):
+        end = min(i + buf_chunks, n_chunks)
+        # sequential read into RAM (OS prefetch works perfectly)
+        block = np.array(src[i * 512 : end * 512]).reshape(end - i, 512)
+        dests = inv_perm[i:end]
+        # sort destinations to reduce seeking on writes
+        order = np.argsort(dests)
+        for k in range(len(order)):
+            di = dests[order[k]]
+            dst[di * 512 : (di + 1) * 512] = block[order[k]]
+        dst.flush()
+        elapsed = time.time() - t0
+        rate = end / elapsed if elapsed > 0 else 0
+        eta = (n_chunks - end) / rate if rate > 0 else 0
+        print(f"  shuffled {end}/{n_chunks} chunks ({end*512/1e9:.2f}B tokens)"
+              f"  [{elapsed:.0f}s elapsed, ETA {eta:.0f}s]")
     del src, dst
 
     train_bin.unlink()
