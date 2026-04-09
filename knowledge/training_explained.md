@@ -578,8 +578,10 @@ KV heads for 16 query heads loses <1% quality versus MHA.
 
 GQA has been the standard since Llama 2 (2023). Llama 3/4, Mistral, Qwen 2/3,
 and Gemma all use it. DeepSeek V2/V3 introduced MLA (Multi-head Latent Attention),
-a more aggressive KV cache compression using low-rank projections — but MLA is
-specific to DeepSeek and GQA remains the default choice for new models.
+which compresses the KV cache via low-rank projections before storage. MLA is
+gaining traction in frontier models (Kimi K2.5, GLM-5) but GQA remains the
+default choice for new models, especially at smaller scales where the added
+complexity of MLA doesn't pay off.
 
 The `* (d_model ** -0.5)` scaling (= `* 0.03125`) initializes weights small
 enough that initial attention scores don't blow up.
@@ -680,8 +682,9 @@ approaches to position encoding:
 
 RoPE was adopted by Meta's Llama 1 (2023) and became the universal standard for
 decoder-only transformers. As of 2026, virtually every major LLM uses RoPE or a
-direct variant of it (like the extended-context modifications in Llama 3's 128K
-context window). No competitive alternative has emerged.
+direct variant. For long-context models (128K+ tokens), RoPE is extended with
+techniques like NTK-aware scaling or YaRN (Yet Another RoPE Extension) that
+modify the frequency bases to generalize beyond the training context length.
 
 #### Building the rotation table
 
@@ -1207,8 +1210,11 @@ while parameters with large gradients get too much. AdamW applies decay separate
 after the gradient update.
 
 AdamW is the universal optimizer for LLM training. Every major model since GPT-2
-has used it. Some recent alternatives have emerged — Muon (2025) and SOAP (2025) —
-that claim faster convergence, but AdamW remains the proven, well-understood default.
+has used it. Recent alternatives are emerging — Muon (2025, based on Newton-Schulz
+orthogonalization) shows 1.4x speedup at 130M params but the advantage shrinks
+with scale (1.1x at 1.2B). Kimi-2 uses a variant called MuonClip. SOAP (2025)
+shows 18% lower final loss vs AdamW in some settings. But AdamW remains the
+proven, well-understood default for most practitioners.
 
 AdamW maintains two running averages for each parameter:
 - **First moment** (mean gradient): smooths out noisy gradients
