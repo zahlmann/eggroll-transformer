@@ -20,8 +20,8 @@ def _swiglu_d_ff(d_model):
     return ((8 * d_model // 3 + 127) // 128) * 128
 
 
-def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context_len=128,
-                     n_kv_heads=2, n_mtp_heads=0):
+def init_transformer(key, vocab_size, d_model, n_heads, n_layers, context_len,
+                     n_kv_heads, n_mtp_heads=0):
     """Initialize a decoder-only transformer. Returns (params dict, config dict).
 
     n_kv_heads: number of KV heads for GQA.
@@ -168,7 +168,6 @@ def _transformer_trunk(params, config, x):
     d_head = config["d_head"]
     context_len = config["context_len"]
     use_checkpoint = config.get("gradient_checkpoint", True)
-
     maybe_checkpoint = jax.checkpoint if use_checkpoint else lambda f, **kw: f
 
     for layer in range(config["n_layers"]):

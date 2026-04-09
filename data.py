@@ -62,8 +62,7 @@ def load_bpe_vocab():
     if not os.path.isabs(tok_path):
         tok_path = os.path.join(os.path.dirname(__file__), tok_path)
     tok = Tokenizer.from_file(tok_path)
-    vocab_size = saved.get("vocab_size", saved.get("bpe_vocab_size"))
-    assert vocab_size is not None, "bpe_vocab.pkl missing vocab_size"
+    vocab_size = saved["vocab_size"]
     return {
         "tokenizer_path": tok_path,
         "vocab_size": vocab_size,

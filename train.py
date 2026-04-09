@@ -232,7 +232,7 @@ def main():
             bi += chunk_steps
 
         vl = float(eval_loss(params, val_x, val_y))
-        avg_train = eloss / steps_this_epoch if steps_this_epoch > 0 else 0
+        avg_train = eloss / steps_this_epoch
         print(f"  epoch {epoch+1}/{args.epochs}  train={avg_train:.4f}  "
               f"val={vl:.4f}  ppl={np.exp(vl):.2f}")
         save_checkpoint(params, opt_state, config, global_step, epoch + 1, 0)

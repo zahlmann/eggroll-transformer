@@ -25,20 +25,8 @@ from kernels.multi_sm_decode import multi_sm_decode_nlayer
 from model import prefill_with_kv
 
 
-def sample_token(logits, temperature=1.0, top_p=1.0, rep_penalty=1.0,
-                 generated_ids=None, rng_key=None):
-    """Sample a token from logits with temperature, top-p, and repetition penalty.
-
-    Args:
-        logits: (vocab_size,) raw logits
-        temperature: >0, lower = more deterministic, 1.0 = neutral
-        top_p: nucleus sampling threshold (1.0 = disabled)
-        rep_penalty: >1.0 penalizes already-generated tokens
-        generated_ids: list of previously generated token IDs
-        rng_key: JAX PRNG key for sampling
-    Returns:
-        token_id (int)
-    """
+def sample_token(logits, temperature, top_p, rep_penalty, generated_ids):
+    """Sample a token from logits with temperature, top-p, and repetition penalty."""
     logits = np.array(logits, dtype=np.float32)
 
     # repetition penalty: reduce logits of already-seen tokens
@@ -50,9 +38,7 @@ def sample_token(logits, temperature=1.0, top_p=1.0, rep_penalty=1.0,
             else:
                 logits[tid] *= rep_penalty
 
-    # greedy fast path
-    if temperature == 0.0 or (temperature == 1.0 and top_p == 1.0 and rep_penalty == 1.0
-                               and not generated_ids):
+    if temperature == 0.0:
         return int(np.argmax(logits))
 
     # temperature scaling
@@ -79,7 +65,7 @@ def sample_token(logits, temperature=1.0, top_p=1.0, rep_penalty=1.0,
     return int(np.random.choice(len(probs), p=probs))
 
 
-def _prefill(params, config, prompt_ids, vocab_size):
+def _prefill(params, config, prompt_ids):
     """Run prefill and return (weights, first_logits, start_pos, kv_packed).
 
     Includes a warmup decode step to trigger Triton JIT compilation.
@@ -91,14 +77,13 @@ def _prefill(params, config, prompt_ids, vocab_size):
     logits, k_caches, v_caches = prefill_with_kv(params, config, x)
     _ = logits.block_until_ready()
 
-    w = prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=1)
+    w = prepare_decode_weights_nlayer(params, config)
     kv_packed = pack_kv_caches(k_caches, v_caches)
     first_logits = logits[prompt_len - 1]
 
     # Warmup decode step to trigger Triton JIT compilation
     warmup_tok = jnp.argmax(first_logits)
-    _tok, _, _kv = multi_sm_decode_nlayer(
-        w, config, warmup_tok, prompt_len, kv_packed, vocab_size, kv_splits=1)
+    _tok, _, _kv = multi_sm_decode_nlayer(w, config, warmup_tok, prompt_len, kv_packed)
     _ = int(_tok)
 
     return w, first_logits, prompt_len, kv_packed
@@ -109,9 +94,7 @@ def stream_tokens(params, config, prompt_ids, max_tokens=128,
     """Yield token IDs one at a time with optional sampling."""
     if seed is not None:
         np.random.seed(seed)
-    vocab_size = config["vocab_size"]
-    w, first_logits, start_pos, kv_packed = _prefill(
-        params, config, prompt_ids, vocab_size)
+    w, first_logits, start_pos, kv_packed = _prefill(params, config, prompt_ids)
 
     generated = []
 
@@ -127,7 +110,7 @@ def stream_tokens(params, config, prompt_ids, max_tokens=128,
     tok = jnp.int32(first_id)
     for i in range(max_tokens - 1):
         tok_out, logits, kv_packed = multi_sm_decode_nlayer(
-            w, config, tok, start_pos + i, kv_packed, vocab_size, kv_splits=1)
+            w, config, tok, start_pos + i, kv_packed)
 
         if temperature == 0.0 and rep_penalty == 1.0:
             token_id = int(tok_out)
@@ -179,8 +162,6 @@ def main():
         saved = pickle.load(f)
     params = {k: jnp.array(v) for k, v in saved["params"].items()}
     config = saved["config"]
-    vocab_size = config["vocab_size"]
-
     d = config["d_model"]
     n_heads = config["n_heads"]
     n_layers = config["n_layers"]

@@ -296,8 +296,9 @@ def unpack_kv_caches(packed, n_layers, n_kv_heads, max_seq, d_head):
     return k_caches, v_caches
 
 
-def prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=2):
+def prepare_decode_weights_nlayer(params, config, kv_splits=1):
     """Precompute packed weights, bf16 embeddings, RoPE tables, tied output proj."""
+    vocab_size = config["vocab_size"]
     n_heads = config["n_heads"]
     d_head = config["d_head"]
     output_vtile = 32
@@ -320,22 +321,13 @@ def prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=2):
     }
 
 
-def fused_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
+def fused_decode_nlayer(w, config, token_id, pos, kv_packed):
     """Fully fused N-layer decode: one kernel call per token.
 
     Takes and returns packed KV caches to avoid per-step pack/unpack overhead.
     Use pack_kv_caches() once after prefill, then feed the packed buffer through.
-
-    Args:
-        w: precomputed weights from prepare_decode_weights_nlayer()
-        config: model config
-        token_id: scalar token
-        pos: scalar position
-        kv_packed: flat bf16 buffer from pack_kv_caches() or previous decode call
-        vocab_size: actual vocabulary size
-
-    Returns: logits (vocab_size,), kv_packed (flat bf16 buffer)
     """
+    vocab_size = config["vocab_size"]
     d_model = config["d_model"]
     d_head = config["d_head"]
     n_heads = config["n_heads"]

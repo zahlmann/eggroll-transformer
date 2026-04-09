@@ -366,8 +366,9 @@ def _next_power_of_2(n):
 
 # ──────────────────────────────────────────────────────────────────────
 
-def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_splits=2):
+def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, kv_splits=1):
     """Multi-SM fused N-layer decode with KV-split parallelism and split barriers."""
+    vocab_size = config["vocab_size"]
     d_model = config["d_model"]
     d_block = _next_power_of_2(d_model)
     d_head = config["d_head"]

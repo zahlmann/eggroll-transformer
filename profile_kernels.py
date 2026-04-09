@@ -41,12 +41,12 @@ def measure_prefill(params, config, prompt, n_runs=20):
     return np.median(times) * 1000, logits, kc, vc
 
 
-def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10):
+def measure_decode(w, config, tok, start_pos, kv_packed, n_tokens=128, n_runs=10):
     """Measure multi-SM decode throughput."""
     kv_tmp = kv_packed
     t = tok
     for i in range(5):
-        t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size, kv_splits=1)
+        t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp)
         _ = int(t)
 
     times = []
@@ -57,7 +57,7 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
         tokens = []
         t0 = time.perf_counter()
         for i in range(n_tokens):
-            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size, kv_splits=1)
+            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp)
             tokens.append(int(t))
         times.append(time.perf_counter() - t0)
         all_tokens = tokens
@@ -94,7 +94,6 @@ def main():
     args = parser.parse_args()
 
     params, config = load_params()
-    vocab_size = config["vocab_size"]
     d = config["d_model"]
     n_layers = config["n_layers"]
     n_heads = config["n_heads"]
@@ -142,11 +141,11 @@ def main():
 
     # Decode (Triton multi-SM)
     kv_packed = pack_kv_caches(kc, vc)
-    w = prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=1)
+    w = prepare_decode_weights_nlayer(params, config)
     tok = jnp.argmax(logits[PROMPT_LEN - 1])
 
     print(f"--- Decode ({GEN_LEN} tokens, Triton multi-SM, grid={n_heads}) ---")
-    decode_ms, tokens = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
+    decode_ms, tokens = measure_decode(w, config, tok, PROMPT_LEN, kv_packed,
                                        n_tokens=GEN_LEN, n_runs=args.n_runs)
     tok_per_s = GEN_LEN / decode_ms * 1000
     ms_per_tok = decode_ms / GEN_LEN
