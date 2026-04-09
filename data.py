@@ -36,7 +36,7 @@ def load_data(context_len, data_dir=None):
     print(f"Dataset: {token_dir} ({meta['total_train_tokens']/1e9:.2f}B tokens, vocab={vocab_size})")
     print(f"  {n_train:,} train seqs (streamed), {n_val:,} val seqs")
 
-    # save tokenizer ref for inference (generate.py, serve.py)
+    # save tokenizer ref for inference (generate.py)
     tok_path = meta["tokenizer_path"]
     if not os.path.isabs(tok_path):
         tok_path = os.path.join(os.path.dirname(__file__), tok_path)

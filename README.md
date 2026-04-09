@@ -29,7 +29,7 @@ Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-st
 
 ```
 Inference:
-  Decode:    232 tok/s  (4.3 ms/tok, Triton multi-SM kernel)
+  Decode:    235 tok/s  (4.2 ms/tok, Triton multi-SM kernel)
   Prefill:   170 ms for 128 tokens (JAX)
   Weights:   607 MB bf16 (9.5x L2 — HBM-bound)
 
@@ -79,11 +79,11 @@ Training:
   train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum)
   data.py                              streaming data loading (v2/v3 memmap, 8B+ tokens)
   prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle
-  prepare_data_v3.py                   v3 data pipeline: 6 sources (28B) + annealing (3B)
+  prepare_data_v3.py                   v3 data pipeline: 5 sources (~50B) + annealing (3B)
 
 Inference:
   kernels/multi_sm_decode.py           fused multi-SM decode (all 24 layers in one kernel)
-  kernels/fused_decode_nlayer.py       weight/KV packing utilities
+  kernels/fused_decode_nlayer.py       weight/KV packing + single-SM decode kernel
   generate.py                          streaming text generation CLI
   profile_kernels.py                   decode kernel profiling
 
