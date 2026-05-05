@@ -1,5 +1,10 @@
 # Agentic SFT Data Generation Plan
 
+Status note: this is an earlier planning document. For the current project
+direction, start with `knowledge/pretrained_transformer_guide.md`. Before using
+any DeepSeek model name, pricing estimate, or API feature from this file, verify
+it against the current DeepSeek API docs.
+
 Generate tool-use training traces from DeepSeek V3.2 via its API, then fine-tune
 our 303M model to become an agentic coding/math assistant.
 

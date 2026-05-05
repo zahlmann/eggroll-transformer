@@ -129,7 +129,11 @@ def main():
             {"ctx": args.context_len // 2, "bs_mult": 2, "end": int(0.30 * total_steps)},
             {"ctx": args.context_len,      "bs_mult": 1, "end": total_steps},
         ]
-        print(f"Curriculum: {' -> '.join(f'ctx={p['ctx']}(bs×{p['bs_mult']})' for p in phases)}")
+        phase_summary = " -> ".join(
+            f"ctx={phase['ctx']}(bs x {phase['bs_mult']})"
+            for phase in phases
+        )
+        print(f"Curriculum: {phase_summary}")
     else:
         phases = [{"ctx": args.context_len, "bs_mult": 1, "end": total_steps}]
 

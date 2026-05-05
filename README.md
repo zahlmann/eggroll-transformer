@@ -1,96 +1,167 @@
-# 306M Transformer
+# 303M JAX Transformer
 
-Training and inference for a 306M parameter transformer on a single GPU. Custom Triton kernels for inference, JAX + cuDNN for training.
+This repository contains a pretrained decoder-only transformer and the code used
+to train it. The current focus is understanding the trained base model clearly
+and using it as the starting point for small, controlled supervised fine-tuning
+experiments.
 
-Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style autonomous development — a coding agent is pointed at `knowledge/program.md` repeatedly. The human steers direction; the agent handles implementation, debugging, benchmarking, and documentation. The agent provides insights about findings that the human then studies to build deep understanding.
-
-## Documentation
-
-- [`program.md`](knowledge/program.md) — the agent program that drove development, with full architecture decisions and optimization history
-- [`inference_explained.md`](knowledge/inference_explained.md) — ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all inference techniques used
-- [`training_explained.md`](knowledge/training_explained.md) — first-principles explanation of the training pipeline (data, model, training loop)
-- [`data_research.md`](knowledge/data_research.md) — training data research and rationale
+The model is not instruction-tuned yet. It has been pretrained with next-token
+prediction on a mix of web text, code, math, Wikipedia, and synthetic textbook
+data.
 
 ## Current Model
 
-```
-306M params (d=1024, h=16, kv=4, l=24, ctx=512)
-  RMSNorm, RoPE, SwiGLU (d_ff=2816), GQA, no biases, tied embeddings
-  Vocab: 32K BPE trained on corpus
-  Training data: 7.85B tokens (5 sources)
-    34% FineWeb-Edu    — quality-filtered web (score >= 3)
-    30% StarCoder      — code (13 languages)
-    19% OpenWebMath    — math with LaTeX
-     9% Wikipedia
-     8% Cosmopedia     — synthetic textbooks
-```
-
-## Performance (RTX 4080 Super)
-
-```
-Inference:
-  Decode:    231 tok/s  (4.3 ms/tok, Triton multi-SM kernel)
-  Prefill:   157 ms for 128 tokens (JAX)
-  Weights:   607 MB bf16 (9.5x L2 — HBM-bound)
-
-Training:
-  RTX 4080 Super:  28.4K tok/s (bs=16), ~83h per epoch
-  NVIDIA B200:     ~341K tok/s (bs=256), ~6h per epoch
-  3 epochs x 7.85B tokens = 23.5B total
+```text
+303,350,784 parameters
+d_model:      1024
+layers:       24
+query heads:  16
+kv heads:     4
+head dim:     64
+ffn dim:      2816
+context:      512 tokens
+vocab:        32,000 BPE tokens
 ```
 
-The entire decode step — embedding, attention, FFN, output projection — runs in a single GPU kernel call across all 24 layers.
+Architecture:
 
-## Quick Start
+```text
+decoder-only transformer
+RMSNorm
+RoPE
+grouped-query attention
+SwiGLU feed-forward layers
+no biases
+tied input/output embeddings
+fused chunked cross-entropy for large-vocab training
+```
 
-Requires `weights.pkl` in the repo root (not included — too large for git).
+The latest training log in this checkout shows:
+
+```text
+dataset: data/tokens_v3
+train tokens: 42.24B
+final shown validation loss: 2.6865
+final shown perplexity: 14.68
+```
+
+## Start Here
+
+- [`knowledge/pretrained_transformer_guide.md`](knowledge/pretrained_transformer_guide.md) explains the current model and training loop from first principles.
+- [`model.py`](model.py) defines the transformer architecture and loss.
+- [`train.py`](train.py) contains the pretraining loop.
+- [`data.py`](data.py) loads tokenized training and validation data.
+
+The guide is the main document. It explains the math, the shapes, the training
+logic, and the simplest next step.
+
+## Local Model Artifacts
+
+Large model files are intentionally not tracked by git, but this checkout may
+contain:
+
+```text
+weights.pkl
+weights_v2.pkl
+checkpoint.pkl
+checkpoint_v2.pkl
+```
+
+Keep these files. The `weights*.pkl` files are weights-only exports. The
+`checkpoint*.pkl` files also include optimizer state and training progress.
+
+## Training
+
+The pretraining entry point is:
 
 ```bash
-# generate text (streaming, with sampling)
-uv run generate.py --prompt "Once upon a time" --temp 0.7 --top-p 0.95 --rep-penalty 1.2
-
-# greedy decoding
-uv run generate.py --prompt "The capital of France is"
-
-# profile decode kernel
-uv run profile_kernels.py
-
-# prepare training data (download + tokenize 7.85B tokens from 5 sources)
-uv run prepare_data_v2.py
-
-# train (see knowledge/gpu_server_training_instructions.md for cloud GPU setup)
 uv run python -u train.py \
-  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
-  --context-len 512 --batch-size 16 --epochs 3 \
-  --curriculum --lr 3e-4 --no-checkpoint
+  --d-model 1024 \
+  --n-heads 16 \
+  --n-kv-heads 4 \
+  --n-layers 24 \
+  --context-len 512 \
+  --batch-size 256 \
+  --epochs 2 \
+  --curriculum \
+  --lr 3e-4 \
+  --no-checkpoint \
+  --data-dir data/tokens_v3
 ```
 
-## What's In Here
+The large batch size above is for a large GPU. Smaller GPUs need a smaller batch
+size and may need gradient checkpointing enabled.
 
-**Training**: JAX model with cuDNN FlashAttention, AdamW with cosine LR schedule, curriculum training (ctx warmup 128->256->512). Fused cross-entropy for 32K vocab without OOM. Multi-source data pipeline with 32K BPE tokenizer.
+## Data
 
-**Inference kernel**: Custom Triton kernel fuses the entire 24-layer forward pass (embedding, RMSNorm, RoPE, GQA attention, SwiGLU FFN, output projection, argmax) into a single GPU kernel launch. Multi-SM parallelism with atomic barriers across 16 SMs.
+The data preparation scripts are:
 
-## Files
-
+```text
+prepare_data_v2.py
+prepare_data_v3.py
 ```
-Training:
-  model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE)
-  train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum)
-  data.py                              streaming data loading (v2/v3 memmap, 8B+ tokens)
-  prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle
-  prepare_data_v3.py                   v3 data pipeline: 5 sources (~50B) + annealing (3B)
 
-Inference:
-  kernels/multi_sm_decode.py           fused multi-SM decode (all 24 layers in one kernel)
-  kernels/fused_decode_nlayer.py       weight/KV packing + single-SM decode kernel
-  generate.py                          streaming text generation CLI
-  profile_kernels.py                   decode kernel profiling
+The later training run used `tokens_v3`, which expands the dataset beyond the
+earlier `tokens_v2` run. Tokenized data is too large for git and is ignored.
 
-Documentation (knowledge/):
-  program.md                           agent program / development log
-  inference_explained.md               ground-up GPU kernel explanation
-  training_explained.md                first-principles training pipeline explanation
-  data_research.md                     training data research findings
-  gpu_server_training_instructions.md  cloud GPU training setup guide
+## Next Step
+
+The simplest useful next step is supervised fine-tuning with a tiny bash-agent
+trace dataset:
+
+```text
+1. Keep the pretrained checkpoint fixed as the base model.
+2. Generate or hand-write 10 to 50 short, verified bash-agent traces.
+3. Build `train_sft.py`.
+4. Tokenize traces with plain text markers like `User:`, `Assistant:`, `[BASH]`,
+   and `[BASH_RESULT]`.
+5. Use a loss mask so the model trains only on assistant/tool-call tokens.
+6. First prove the code can overfit the tiny dataset.
+7. Only then scale trace generation with DeepSeek.
+```
+
+Do not start with reinforcement learning. Do not start with a huge synthetic
+dataset. The first milestone is a boring masked-SFT loop that works.
+
+## Optional Background
+
+The repo also contains earlier inference optimization experiments:
+
+```text
+generate.py
+profile_kernels.py
+kernels/
+knowledge/inference_explained.md
+```
+
+Those files are useful background, but they are not the main path right now. The
+main path is understanding the pretrained model and adding a small SFT stage.
+
+## File Map
+
+```text
+model.py
+  JAX transformer architecture, forward pass, and fused cross-entropy loss.
+
+train.py
+  Pretraining loop with AdamW, curriculum sequence lengths, checkpointing, and
+  bfloat16 forward/loss computation.
+
+data.py
+  Tokenized dataset loader using memory-mapped training tokens.
+
+prepare_data_v2.py, prepare_data_v3.py
+  Dataset download, tokenizer, and tokenization scripts.
+
+knowledge/pretrained_transformer_guide.md
+  Main learning guide for the current project state.
+
+knowledge/training_explained.md
+  Older broader training explanation.
+
+knowledge/agentic_sft_plan.md
+  Earlier SFT planning notes.
+
+knowledge/inference_explained.md
+  Inference-kernel explanation kept as optional background.
 ```
